@@ -1,0 +1,271 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark-dimmed.css";
+
+@theme {
+  --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+}
+
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #27272a; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+.scrollbar-none { scrollbar-width: none; -ms-overflow-style: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 0.8; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* Resize handle */
+.resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background 0.15s;
+}
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 1px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.resize-handle:hover::after,
+.resize-handle:active::after {
+  background: #3b82f6;
+}
+.resize-handle:active {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+/* Horizontal resize handle (for bottom panel) */
+.resize-handle-h {
+  height: 4px;
+  cursor: row-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background 0.15s;
+}
+.resize-handle-h::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 1px;
+  height: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.resize-handle-h:hover::after,
+.resize-handle-h:active::after {
+  background: #3b82f6;
+}
+.resize-handle-h:active {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+/* Layout isolation — panels don't cause cross-reflow (like VS Code) */
+.panel-contain {
+  contain: layout style paint;
+  will-change: transform;
+}
+
+/* Monaco hover / peek (in body): ensure visible and prevent "collapse to point". */
+.monaco-editor .monaco-hover,
+.monaco-editor .monaco-hover-content,
+.monaco-editor .peekview-widget .body,
+body .monaco-hover,
+body .monaco-hover-content,
+body .peekview-widget .body {
+  min-width: 320px !important;
+  max-width: min(90vw, 680px) !important;
+  min-height: 40px !important;
+  z-index: 10000;
+  flex-shrink: 0 !important;
+  box-sizing: border-box !important;
+}
+body .monaco-hover [class*="hover"],
+body .monaco-hover [class*="content"],
+body .peekview-widget [class*="body"] {
+  min-width: 300px !important;
+  min-height: 24px !important;
+  flex-shrink: 0 !important;
+}
+body .monaco-hover,
+body .monaco-editor-hover {
+  position: fixed;
+  width: max-content !important;
+  max-width: min(90vw, 680px) !important;
+}
+body .peekview-widget,
+body [class*="peekview"] {
+  min-width: 320px !important;
+  min-height: 80px !important;
+  flex-shrink: 0 !important;
+}
+body .peekview-widget .head,
+body .peekview-widget .body,
+body [class*="peekview"] .head,
+body [class*="peekview"] .body {
+  min-width: 300px !important;
+  min-height: 32px !important;
+  flex-shrink: 0 !important;
+}
+body .peekview-widget .body .monaco-list,
+body .peekview-widget .body .monaco-scrollable-element,
+body .peekview-widget .monaco-list,
+body .peekview-widget .monaco-scrollable-element,
+body [class*="peekview"] .monaco-list,
+body [class*="peekview"] .monaco-scrollable-element {
+  min-width: 280px !important;
+  min-height: 60px !important;
+  flex-shrink: 0 !important;
+}
+body .peekview-widget > div,
+body [class*="peekview"] > div {
+  min-width: 300px !important;
+  min-height: 24px !important;
+  flex-shrink: 0 !important;
+}
+body .peekview-widget .body > *,
+body [class*="peekview"] .body > * {
+  min-width: 260px !important;
+  min-height: 20px !important;
+  flex-shrink: 0 !important;
+}
+
+/* Peek References: встроенный превью-редактор в левой панели схлопывается до 5×5px при рендере в body.
+   Принудительно растягиваем контейнер превью и сам редактор (.overflow-guard). */
+body .peekview-widget .split-view-view .preview.inline,
+body [class*="peekview"] .split-view-view .preview.inline {
+  min-width: 200px !important;
+  width: 100% !important;
+  min-height: 120px !important;
+  height: 100% !important;
+}
+body .peekview-widget .preview.inline .monaco-editor,
+body .peekview-widget .preview.inline .overflow-guard,
+body [class*="peekview"] .preview.inline .monaco-editor,
+body [class*="peekview"] .preview.inline .overflow-guard {
+  width: 100% !important;
+  min-width: 200px !important;
+  height: 100% !important;
+  min-height: 120px !important;
+}
+
+/* Off-screen messages skip rendering entirely (massive perf win) */
+.msg-auto-contain {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 60px;
+}
+
+/* Agent response prose — refined typography */
+.agent-prose {
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: #d4d4d8;
+  letter-spacing: 0.01em;
+}
+.agent-prose p { margin: 0.5em 0; }
+.agent-prose p:first-child { margin-top: 0; }
+.agent-prose p:last-child { margin-bottom: 0; }
+
+.agent-prose strong { color: #e4e4e7; font-weight: 600; }
+.agent-prose em { color: #a1a1aa; font-style: italic; }
+
+.agent-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: rgba(63, 63, 70, 0.4);
+  border: 1px solid rgba(63, 63, 70, 0.5);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: #93c5fd;
+}
+
+.agent-prose pre {
+  background: #09090b;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 8px 0;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.agent-prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+.agent-prose h1, .agent-prose h2, .agent-prose h3 {
+  color: #f4f4f5;
+  font-weight: 600;
+  margin: 1em 0 0.4em;
+  letter-spacing: -0.01em;
+}
+.agent-prose h1 { font-size: 1.2em; }
+.agent-prose h2 { font-size: 1.1em; }
+.agent-prose h3 { font-size: 1em; }
+
+.agent-prose ul, .agent-prose ol {
+  padding-left: 1.4em;
+  margin: 0.4em 0;
+}
+.agent-prose li { margin: 0.15em 0; }
+.agent-prose li::marker { color: #52525b; }
+
+.agent-prose a {
+  color: #60a5fa;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.agent-prose blockquote {
+  border-left: 2px solid #3f3f46;
+  padding-left: 12px;
+  margin: 8px 0;
+  color: #a1a1aa;
+  font-style: italic;
+}
+
+.agent-prose hr {
+  border: none;
+  border-top: 1px solid #27272a;
+  margin: 12px 0;
+}
+
+/* Thinking block — soft, low-contrast italic */
+.thinking-text {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: #71717a;
+  font-style: italic;
+  letter-spacing: 0.01em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -1,0 +1,75 @@
+appId: ai.researchim.one-click-research-agent
+productName: One-Click Research Agent
+copyright: Copyright © 2025-2026 researchim-ai
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+
+asar: true
+asarUnpack:
+  - "node_modules/node-pty/**"
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+    - target: tar.gz
+      arch: [x64, arm64]
+  maintainer: researchim-ai <noreply@researchim-ai.github.io>
+  category: Development
+  icon: build/icons
+  synopsis: Local research agent powered by open-source models
+  description: >-
+    Fully local, self-contained research agent.
+    Downloads and serves open-source models via llama.cpp.
+    Investigates files, documents, repos, and reproducible workflows.
+  desktop:
+    StartupWMClass: one-click-research-agent
+
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  icon: build/icons/icon.icns
+  category: public.app-category.developer-tools
+  darkModeSupport: true
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+    - target: portable
+      arch: [x64]
+  icon: build/icons/icon.ico
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowToChangeInstallationDirectory: false
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: One-Click Research Agent
+
+dmg:
+  contents:
+    - x: 410
+      y: 150
+      type: link
+      path: /Applications
+    - x: 130
+      y: 150
+      type: file
+
+publish: null

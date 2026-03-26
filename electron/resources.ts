@@ -1,0 +1,435 @@
+import { execSync } from 'child_process'
+import os from 'os'
+import type { GpuInfo, SystemResources, ServerLaunchArgs, BinarySelection, ModelVariant, ModelVariantInfo } from './types'
+import { readGGUFMetadata, deriveArchInfo, defaultArchInfo, type ModelArchInfo } from './gguf'
+
+export function detectGpus(): GpuInfo[] {
+  try {
+    const out = execSync(
+      'nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits',
+      { timeout: 10000, encoding: 'utf-8' },
+    )
+    return out
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [idx, name, total, free] = line.split(',').map((s) => s.trim())
+        return {
+          index: parseInt(idx),
+          name,
+          vramTotalMb: parseInt(total),
+          vramFreeMb: parseInt(free),
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+function detectCudaVersion(): string | null {
+  try {
+    const out = execSync('nvidia-smi', { timeout: 10000, encoding: 'utf-8' })
+    const match = out.match(/CUDA Version:\s*(\d+\.\d+)/)
+    return match ? match[1] : null
+  } catch {
+    return null
+  }
+}
+
+function detectAmdGpu(): boolean {
+  const plat = process.platform
+  try {
+    if (plat === 'linux') {
+      const out = execSync('lspci 2>/dev/null | grep -iE "VGA|3D|Display"', {
+        timeout: 5000, encoding: 'utf-8',
+      })
+      return /amd|radeon|advanced micro/i.test(out)
+    }
+    if (plat === 'win32') {
+      const out = execSync('wmic path win32_videocontroller get name', {
+        timeout: 5000, encoding: 'utf-8',
+      })
+      return /amd|radeon/i.test(out)
+    }
+  } catch {}
+  return false
+}
+
+export function detect(): SystemResources {
+  const gpus = detectGpus()
+  const cpus = os.cpus()
+  const totalRam = os.totalmem()
+  const freeRam = os.freemem()
+
+  return {
+    gpus,
+    cpuModel: cpus[0]?.model ?? 'Unknown',
+    cpuCores: new Set(cpus.map((_, i) => Math.floor(i / 2))).size || cpus.length,
+    cpuThreads: cpus.length,
+    ramTotalMb: Math.round(totalRam / (1024 * 1024)),
+    ramAvailableMb: Math.round(freeRam / (1024 * 1024)),
+    cudaAvailable: gpus.length > 0,
+    cudaVersion: detectCudaVersion(),
+    hasAmdGpu: detectAmdGpu(),
+    totalVramMb: gpus.reduce((s, g) => s + g.vramTotalMb, 0),
+    platform: process.platform,
+    arch: process.arch,
+  }
+}
+
+export function pickBinaryVariant(res: SystemResources): BinarySelection {
+  const { platform, arch, cudaVersion, hasAmdGpu, gpus } = res
+  const hasNvidia = gpus.length > 0
+
+  if (platform === 'darwin') {
+    const variant = arch === 'arm64' ? 'macos-arm64' : 'macos-x64'
+    return { primary: variant, fallbacks: [], needsCudart: false }
+  }
+
+  if (platform === 'win32') {
+    if (hasNvidia && cudaVersion) {
+      const major = parseFloat(cudaVersion)
+      if (major >= 13) {
+        return {
+          primary: 'win-cuda-13.1-x64',
+          fallbacks: ['win-cuda-12.4-x64', 'win-vulkan-x64', 'win-cpu-x64'],
+          needsCudart: true,
+          cudartAsset: 'cudart-llama-bin-win-cuda-13.1-x64',
+        }
+      }
+      return {
+        primary: 'win-cuda-12.4-x64',
+        fallbacks: ['win-vulkan-x64', 'win-cpu-x64'],
+        needsCudart: true,
+        cudartAsset: 'cudart-llama-bin-win-cuda-12.4-x64',
+      }
+    }
+    if (hasAmdGpu) {
+      return { primary: 'win-vulkan-x64', fallbacks: ['win-cpu-x64'], needsCudart: false }
+    }
+    const cpuVariant = arch === 'arm64' ? 'win-cpu-arm64' : 'win-cpu-x64'
+    return { primary: cpuVariant, fallbacks: [], needsCudart: false }
+  }
+
+  // Linux with GPU: Vulkan works with both NVIDIA and AMD via drivers
+  if (hasNvidia || hasAmdGpu) {
+    return { primary: 'ubuntu-vulkan-x64', fallbacks: ['ubuntu-x64'], needsCudart: false }
+  }
+
+  return { primary: 'ubuntu-x64', fallbacks: [], needsCudart: false }
+}
+
+// ---------------------------------------------------------------------------
+// Model architecture — read dynamically from GGUF file, with fallback to
+// hardcoded defaults for Qwen3.5-35B-A3B when no file is available.
+// ---------------------------------------------------------------------------
+
+let cachedArch: ModelArchInfo | null = null
+
+export function loadModelArch(modelPath: string): ModelArchInfo {
+  try {
+    const meta = readGGUFMetadata(modelPath)
+    cachedArch = deriveArchInfo(meta)
+    return cachedArch
+  } catch {
+    return getArch()
+  }
+}
+
+export function getArch(): ModelArchInfo {
+  if (cachedArch) return cachedArch
+  return defaultArchInfo()
+}
+
+// ---------------------------------------------------------------------------
+// Model variant catalog
+// ---------------------------------------------------------------------------
+
+const REPO_9B = 'unsloth/Qwen3.5-9B-GGUF'
+
+export const MODEL_VARIANTS: ModelVariant[] = [
+  // --- Qwen3.5-9B (dense, fast, fits on 16 GB) ---
+  { quant: '9B-UD-IQ2_XXS',  bits: 2, label: '9B  IQ2_XXS — минимальный', sizeMb: 3266,  quality: 1,  repoId: REPO_9B },
+  { quant: '9B-UD-IQ2_M',    bits: 2, label: '9B  IQ2_M',                 sizeMb: 3738,  quality: 2,  repoId: REPO_9B },
+  { quant: '9B-UD-IQ3_XXS',  bits: 3, label: '9B  IQ3_XXS',              sizeMb: 4116,  quality: 3,  repoId: REPO_9B },
+  { quant: '9B-UD-Q2_K_XL',  bits: 2, label: '9B  Q2_K_XL',              sizeMb: 4219,  quality: 3,  repoId: REPO_9B },
+  { quant: '9B-UD-Q3_K_XL',  bits: 3, label: '9B  Q3_K_XL',              sizeMb: 5171,  quality: 5,  repoId: REPO_9B },
+  { quant: '9B-UD-Q4_K_XL',  bits: 4, label: '9B  Q4_K_XL — рекоменд.',  sizeMb: 6113,  quality: 7,  repoId: REPO_9B },
+  { quant: '9B-UD-Q5_K_XL',  bits: 5, label: '9B  Q5_K_XL',              sizeMb: 6902,  quality: 8,  repoId: REPO_9B },
+  { quant: '9B-UD-Q6_K_XL',  bits: 6, label: '9B  Q6_K_XL — высокое',    sizeMb: 8971,  quality: 9,  repoId: REPO_9B },
+  { quant: '9B-UD-Q8_K_XL',  bits: 8, label: '9B  Q8_K_XL — максимум',   sizeMb: 11500, quality: 10, repoId: REPO_9B },
+
+  // --- Qwen3.5-35B-A3B (MoE, мощнее, нужно больше RAM) ---
+  { quant: 'UD-IQ2_XXS',     bits: 2, label: '35B IQ2_XXS — минимальный', sizeMb: 9994,  quality: 11 },
+  { quant: 'UD-Q2_K_XL',     bits: 2, label: '35B Q2_K_XL',              sizeMb: 13210, quality: 12 },
+  { quant: 'UD-IQ3_XXS',     bits: 3, label: '35B IQ3_XXS',              sizeMb: 14438, quality: 13 },
+  { quant: 'UD-IQ3_S',       bits: 3, label: '35B IQ3_S',                sizeMb: 15565, quality: 14 },
+  { quant: 'UD-Q3_K_M',      bits: 3, label: '35B Q3_K_M',               sizeMb: 17101, quality: 15 },
+  { quant: 'UD-Q3_K_XL',     bits: 3, label: '35B Q3_K_XL',              sizeMb: 17613, quality: 15 },
+  { quant: 'UD-Q4_K_M',      bits: 4, label: '35B Q4_K_M — баланс',      sizeMb: 20378, quality: 17 },
+  { quant: 'UD-Q4_K_XL',     bits: 4, label: '35B Q4_K_XL — рекоменд.',   sizeMb: 21094, quality: 18 },
+  { quant: 'UD-Q5_K_XL',     bits: 5, label: '35B Q5_K_XL — высокое',     sizeMb: 25498, quality: 19 },
+  { quant: 'UD-Q6_K_XL',     bits: 6, label: '35B Q6_K_XL',              sizeMb: 31027, quality: 20 },
+  { quant: 'UD-Q8_K_XL',     bits: 8, label: '35B Q8_K_XL — максимум',    sizeMb: 39629, quality: 21 },
+]
+
+// Per-layer VRAM for weight offloading (scales with model file size)
+// 35B: Q4_K_XL ≈ 21 GB, ~1.2 GB embeddings+output, 40 layers → ~500 MB/layer
+// 9B:  Q4_K_XL ≈ 6 GB, 36 layers → ~150 MB/layer
+const LAYER_REFS: Record<string, { modelMb: number; layerMb: number }> = {
+  '35b': { modelMb: 21094, layerMb: 500 },
+  '9b':  { modelMb: 6113,  layerMb: 150 },
+}
+
+function is9B(variant: ModelVariant): boolean {
+  return variant.quant.startsWith('9B-')
+}
+
+function modelMemoryMb(variant: ModelVariant): number {
+  return Math.round(variant.sizeMb * 1.03)
+}
+
+function layerVramMb(variant: ModelVariant): number {
+  const ref = is9B(variant) ? LAYER_REFS['9b'] : LAYER_REFS['35b']
+  return Math.round(ref.layerMb * (variant.sizeMb / ref.modelMb))
+}
+
+export function evaluateVariants(res: SystemResources): ModelVariantInfo[] {
+  const freeVram = res.gpus.reduce((s, g) => s + g.vramFreeMb, 0)
+  const isLaptop = res.gpus.some((g) => /laptop|mobile/i.test(g.name))
+  const totalMem = res.ramTotalMb + freeVram
+
+  let bestFittingIdx = -1
+
+  const results = MODEL_VARIANTS.map((v) => {
+    const memMb = modelMemoryMb(v)
+    const layerMb = layerVramMb(v)
+
+    // mmap means ~70% of model pages need to be resident; GPU loads fully
+    const minRequired = Math.round(memMb * 0.70) + RAM_OVERHEAD_MB
+    const fits = totalMem >= minRequired
+
+    let mode: 'cpu' | 'hybrid' | 'full_gpu' = 'cpu'
+    let maxCtx = 4096
+
+    if (fits) {
+      const preset = selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layerMb)
+      maxCtx = preset.ctxSize
+      if (freeVram >= memMb + 2000) mode = 'full_gpu'
+      else if (freeVram >= 500) mode = 'hybrid'
+    }
+
+    return { ...v, fits, maxCtx, mode, recommended: false }
+  })
+
+  // On small systems (RAM ≤ 16 GB and VRAM < 16 GB), prefer 9B-UD-Q4_K_XL
+  const smallSystem = res.ramTotalMb <= 17408 && freeVram < 16384
+  if (smallSystem) {
+    const idx9b = results.findIndex((r) => r.quant === '9B-UD-Q4_K_XL' && r.fits)
+    if (idx9b >= 0) { bestFittingIdx = idx9b }
+  }
+
+  // Otherwise pick the highest quality that gives >= 16K context
+  if (bestFittingIdx === -1) {
+    for (let i = results.length - 1; i >= 0; i--) {
+      if (results[i].fits && results[i].maxCtx >= 16384) {
+        bestFittingIdx = i
+        break
+      }
+    }
+  }
+  // Fallback: any fitting variant
+  if (bestFittingIdx === -1) {
+    for (let i = results.length - 1; i >= 0; i--) {
+      if (results[i].fits) { bestFittingIdx = i; break }
+    }
+  }
+  if (bestFittingIdx >= 0) results[bestFittingIdx].recommended = true
+
+  return results
+}
+
+// ---------------------------------------------------------------------------
+// Preset calculation — parameterized by model size and architecture info
+// (read from GGUF or fallback defaults)
+// ---------------------------------------------------------------------------
+
+const RAM_OVERHEAD_MB = 3000
+const KV_SAFETY_FACTOR = 0.80
+
+const CTX_SNAP_TARGETS = [262144, 131072, 65536, 32768, 24576, 16384, 12288, 8192, 6144, 4096]
+
+function kvLayersSplit(gpuLayersCapped: number, arch: ModelArchInfo): { kvOnGpu: number; kvOnCpu: number } {
+  const kvOnGpu = Math.round(arch.kvLayers * Math.min(gpuLayersCapped, arch.blockCount) / arch.blockCount)
+  return { kvOnGpu, kvOnCpu: arch.kvLayers - kvOnGpu }
+}
+
+function calcContextFromMemory(
+  vramForKvMb: number,
+  kvOnGpu: number,
+  ramForKvMb: number,
+  kvOnCpu: number,
+  kvQuantized: boolean,
+  arch: ModelArchInfo,
+): number {
+  const bytesPerLayer = kvQuantized ? arch.kvBytesPerLayerQ8 : arch.kvBytesPerLayerF16
+  let maxTokens = Infinity
+
+  if (kvOnGpu > 0) {
+    if (vramForKvMb <= 0) return 4096
+    const vramBytes = vramForKvMb * 1024 * 1024 * KV_SAFETY_FACTOR
+    maxTokens = Math.min(maxTokens, Math.floor(vramBytes / (kvOnGpu * bytesPerLayer)))
+  }
+
+  if (kvOnCpu > 0) {
+    if (ramForKvMb <= 0) return 4096
+    const ramBytes = ramForKvMb * 1024 * 1024 * KV_SAFETY_FACTOR
+    maxTokens = Math.min(maxTokens, Math.floor(ramBytes / (kvOnCpu * bytesPerLayer)))
+  }
+
+  maxTokens = Math.min(maxTokens, arch.contextLength)
+
+  for (const s of CTX_SNAP_TARGETS) {
+    if (maxTokens >= s) return s
+  }
+  return 4096
+}
+
+interface Preset {
+  nGpuLayers: number
+  ctxSize: number
+  flashAttn: boolean
+  cacheTypeK: string
+  cacheTypeV: string
+}
+
+function selectPresetForSize(
+  ramTotalMb: number,
+  freeVramMb: number,
+  isLaptop: boolean,
+  modelRamMb: number,
+  modelVramMb: number,
+  perLayerVramMb: number,
+): Preset {
+  const arch = getArch()
+  // q8_0 KV cache: good balance of memory vs speed; recommended for long context (less VRAM/RAM for cache, still accurate)
+  const kvType = { cacheTypeK: 'q8_0', cacheTypeV: 'q8_0' }
+  // mmap: only hot pages need physical RAM. For MoE only active experts are
+  // accessed, but we use 85% to ensure stable performance without page thrashing.
+  const perLayerCpuMb = Math.round(perLayerVramMb * 0.85)
+
+  // CPU-only (model loaded via mmap)
+  if (freeVramMb < 500) {
+    const mmapModelMb = Math.round(modelRamMb * 0.85)
+    const ramForModel = ramTotalMb - RAM_OVERHEAD_MB
+    if (ramForModel < mmapModelMb) {
+      return { nGpuLayers: 0, ctxSize: 4096, flashAttn: false, ...kvType }
+    }
+    const ramForKv = ramForModel - mmapModelMb
+    const ctx = calcContextFromMemory(0, 0, ramForKv, arch.kvLayers, true, arch)
+    return { nGpuLayers: 0, ctxSize: ctx, flashAttn: false, ...kvType }
+  }
+
+  // Full GPU
+  const fullGpuThreshold = modelVramMb + 2000
+  if (freeVramMb >= fullGpuThreshold) {
+    const vramForKv = freeVramMb - modelVramMb
+    const ctx = calcContextFromMemory(vramForKv, arch.kvLayers, 0, 0, true, arch)
+    return { nGpuLayers: 999, ctxSize: ctx, flashAttn: true, ...kvType }
+  }
+
+  // Hybrid: search for optimal GPU layer count that maximizes context.
+  let maxLayersOnGpu = Math.min(arch.blockCount, Math.max(0, Math.floor((freeVramMb - 2000) / perLayerVramMb)))
+
+  if (isLaptop) {
+    maxLayersOnGpu = Math.min(maxLayersOnGpu, Math.max(0, Math.floor((freeVramMb - 3500) / (perLayerVramMb * 1.2))))
+  }
+
+  const layerStep = Math.max(1, Math.floor(arch.blockCount / arch.kvLayers))
+  let bestCtx = 0
+  let bestNGpu = 0
+
+  for (let nGpu = maxLayersOnGpu; nGpu >= 0; nGpu -= layerStep) {
+    const gpuCapped = Math.min(nGpu, arch.blockCount)
+    const cpuL = arch.blockCount - gpuCapped
+    const { kvOnGpu, kvOnCpu } = kvLayersSplit(gpuCapped, arch)
+
+    const cpuModelRam = cpuL * perLayerCpuMb
+    const ramKv = ramTotalMb - RAM_OVERHEAD_MB - cpuModelRam
+    const vramKv = freeVramMb - (gpuCapped * perLayerVramMb)
+
+    const ctx = calcContextFromMemory(
+      Math.max(0, vramKv), kvOnGpu,
+      Math.max(0, ramKv), kvOnCpu,
+      true, arch,
+    )
+
+    if (ctx > bestCtx || (ctx === bestCtx && nGpu > bestNGpu)) {
+      bestCtx = ctx
+      bestNGpu = nGpu
+    }
+  }
+
+  return {
+    nGpuLayers: bestNGpu,
+    ctxSize: bestCtx,
+    flashAttn: bestNGpu > 0,
+    ...kvType,
+  }
+}
+
+function selectPreset(ramTotalMb: number, freeVramMb: number, isLaptop: boolean): Preset {
+  const defaultVariant = MODEL_VARIANTS.find((v) => v.quant === 'UD-Q4_K_XL')!
+  const memMb = modelMemoryMb(defaultVariant)
+  const layMb = layerVramMb(defaultVariant)
+  return selectPresetForSize(ramTotalMb, freeVramMb, isLaptop, memMb, memMb, layMb)
+}
+
+export function computeOptimalArgs(
+  res: SystemResources,
+  quant?: string,
+  userCtxSize?: number | null,
+): ServerLaunchArgs {
+  const threads = Math.max(1, Math.floor(res.cpuThreads / 2))
+  const freeVram = res.gpus.reduce((s, g) => s + g.vramFreeMb, 0)
+  const isLaptop = res.gpus.some((g) => /laptop|mobile/i.test(g.name))
+
+  let tensorSplit: string | null = null
+  if (res.gpus.length > 1) {
+    const total = res.gpus.reduce((s, g) => s + g.vramFreeMb, 0)
+    if (total > 0) {
+      tensorSplit = res.gpus.map((g) => (g.vramFreeMb / total).toFixed(2)).join(',')
+    }
+  }
+
+  let preset: Preset
+  if (quant) {
+    const variant = MODEL_VARIANTS.find((v) => v.quant === quant)
+    if (variant) {
+      const memMb = modelMemoryMb(variant)
+      const layMb = layerVramMb(variant)
+      preset = selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layMb)
+    } else {
+      preset = selectPreset(res.ramTotalMb, freeVram, isLaptop)
+    }
+  } else {
+    preset = selectPreset(res.ramTotalMb, freeVram, isLaptop)
+  }
+
+  // Respect user's explicit choice — don't silently clamp to preset.
+  // If the server can't handle it, queryActualCtxSize() will detect the real n_ctx.
+  const ctxSize = (userCtxSize && userCtxSize > 0)
+    ? userCtxSize
+    : preset.ctxSize
+
+  return {
+    nGpuLayers: preset.nGpuLayers,
+    ctxSize,
+    threads,
+    tensorSplit,
+    flashAttn: preset.flashAttn,
+    cacheTypeK: preset.cacheTypeK,
+    cacheTypeV: preset.cacheTypeV,
+  }
+}
