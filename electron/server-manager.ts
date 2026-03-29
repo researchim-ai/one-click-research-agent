@@ -4,7 +4,8 @@ import fs from 'fs'
 import path from 'path'
 import https from 'https'
 import { dataDir } from './model-manager'
-import { detect, computeOptimalArgs, pickBinaryVariant } from './resources'
+import * as config from './config'
+import { detect, computeOptimalArgs, pickBinaryVariant, applyGpuPreferences } from './resources'
 import type { ServerLaunchArgs } from './types'
 
 let lastServerLog: string[] = []
@@ -361,7 +362,11 @@ export function start(
   const bin = findServerBin()
   if (!bin) throw new Error('llama-server not found — run ensureBinary first')
 
-  const la = args ?? computeOptimalArgs(detect(), quant, userCtxSize)
+  const cfg = config.load()
+  const detected = detect()
+  const effectiveResources = applyGpuPreferences(detected, cfg.gpuMode, cfg.gpuIndex)
+  const selectedGpu = effectiveResources.gpus[0] ?? null
+  const la = args ?? computeOptimalArgs(effectiveResources, quant, userCtxSize)
   activeCtxSize = la.ctxSize
   const cmdArgs = [
     '--model', modelPath,
@@ -391,13 +396,26 @@ export function start(
   if (win) {
     emitBuild(win, `Запуск: ${path.basename(bin)}`)
     emitBuild(win, 'GGML_CUDA_DISABLE_GRAPHS=1 (multi-GPU stability)')
+    if (cfg.gpuMode === 'single' && selectedGpu) {
+      emitBuild(win, `GPU mode: single (GPU ${selectedGpu.index}: ${selectedGpu.name})`)
+      emitBuild(win, `Visible GPU env: CUDA_VISIBLE_DEVICES=${selectedGpu.index}, GGML_VK_VISIBLE_DEVICES=${selectedGpu.index}`)
+    } else if (cfg.gpuMode === 'split' && detected.gpus.length > 1) {
+      emitBuild(win, `GPU mode: split (experimental, GPUs: ${detected.gpus.map((gpu) => gpu.index).join(', ')})`)
+    }
     emitBuild(win, `GPU layers: ${la.nGpuLayers}, ctx: ${la.ctxSize}, threads: ${la.threads}` +
       `, kv-cache: ${la.cacheTypeK}` +
       (la.tensorSplit ? `, tensor-split: ${la.tensorSplit}` : '') +
       (la.flashAttn ? ', flash-attn: on' : ''))
   }
 
-  const spawnEnv = { ...process.env, GGML_CUDA_DISABLE_GRAPHS: '1' }
+  const spawnEnv: NodeJS.ProcessEnv = { ...process.env, GGML_CUDA_DISABLE_GRAPHS: '1' }
+  if (cfg.gpuMode === 'single' && selectedGpu) {
+    spawnEnv.CUDA_VISIBLE_DEVICES = String(selectedGpu.index)
+    spawnEnv.GGML_VK_VISIBLE_DEVICES = String(selectedGpu.index)
+  } else {
+    delete spawnEnv.CUDA_VISIBLE_DEVICES
+    delete spawnEnv.GGML_VK_VISIBLE_DEVICES
+  }
   serverProcess = spawn(bin, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'], detached: false, env: spawnEnv })
 
   const handleOutput = (data: Buffer) => {

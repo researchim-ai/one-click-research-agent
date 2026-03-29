@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import type { AppStatus, DownloadProgress, ModelVariantInfo } from '../../electron/types'
+import type { AppStatus, DownloadProgress, GpuMode, ModelVariantInfo, SystemResources } from '../../electron/types'
 
 interface Props {
   status: AppStatus | null
@@ -40,6 +40,18 @@ const BITS_COLOR: Record<number, string> = {
   8: 'text-cyan-400',
 }
 
+function pickQuantForVariants(variants: ModelVariantInfo[], preferredQuant: string): string {
+  const preferred = variants.find((variant) => variant.quant === preferredQuant && variant.fits)
+  if (preferred) return preferred.quant
+  return variants.find((variant) => variant.recommended)?.quant
+    ?? variants.find((variant) => variant.fits)?.quant
+    ?? preferredQuant
+}
+
+function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): boolean {
+  return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
+}
+
 export function SetupWizard({ status, downloadProgress, buildStatus, onComplete }: Props) {
   const [phase, setPhase] = useState<Phase>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -48,8 +60,11 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   const logRef = useRef<HTMLDivElement>(null)
 
   const [variants, setVariants] = useState<ModelVariantInfo[]>([])
+  const [resources, setResources] = useState<SystemResources | null>(null)
   const [selectedQuant, setSelectedQuant] = useState(DEFAULT_QUANT)
   const [selectedCtx, setSelectedCtx] = useState<number>(32768)
+  const [selectedGpuMode, setSelectedGpuMode] = useState<GpuMode>('single')
+  const [selectedGpuIndex, setSelectedGpuIndex] = useState<number>(0)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [ctxDropdownOpen, setCtxDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
@@ -57,19 +72,22 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
 
   useEffect(() => {
     Promise.all([
-      window.api.getModelVariants(),
       window.api.getConfig(),
-    ]).then(([v, cfg]) => {
+      window.api.detectResources(),
+    ]).then(async ([cfg, detected]) => {
+      const gpuMode = cfg.gpuMode ?? 'single'
+      const gpuIndex = cfg.gpuIndex ?? detected.gpus[0]?.index ?? 0
+      const v = await window.api.getModelVariants({ gpuMode, gpuIndex })
+
+      setResources(detected)
       setVariants(v)
-      const recommended = v.find((vi: ModelVariantInfo) => vi.recommended)
-      let quant = recommended?.quant ?? DEFAULT_QUANT
-      if (cfg.lastQuant && v.some((vi: ModelVariantInfo) => vi.quant === cfg.lastQuant && vi.fits)) {
-        quant = cfg.lastQuant
-      }
+      setSelectedGpuMode(gpuMode)
+      setSelectedGpuIndex(gpuIndex)
+      const quant = pickQuantForVariants(v, cfg.lastQuant || DEFAULT_QUANT)
       setSelectedQuant(quant)
       window.api.selectModelVariant(quant).catch(() => {})
       const variant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
-      const max = variant?.maxCtx ?? 32768
+      const max = variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768
       if (cfg.ctxSize && cfg.ctxSize > 0) {
         setSelectedCtx(Math.min(cfg.ctxSize, max))
       } else {
@@ -93,12 +111,38 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   }, [])
 
   const selected = variants.find((v) => v.quant === selectedQuant)
+  const availableGpus = resources?.gpus ?? []
+  const hasMultipleGpus = availableGpus.length > 1
+  const selectedGpu = availableGpus.find((gpu) => gpu.index === selectedGpuIndex) ?? availableGpus[0] ?? null
+
+  const refreshVariantsForGpu = async (
+    gpuMode: GpuMode,
+    gpuIndex: number,
+    preferredQuant = selectedQuant,
+    preferredCtx = selectedCtx,
+  ) => {
+    const nextVariants = await window.api.getModelVariants({ gpuMode, gpuIndex })
+    setVariants(nextVariants)
+    const nextQuant = pickQuantForVariants(nextVariants, preferredQuant)
+    setSelectedQuant(nextQuant)
+    window.api.selectModelVariant(nextQuant).catch(() => {})
+    const nextVariant = nextVariants.find((variant) => variant.quant === nextQuant)
+    const nextMaxCtx = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
+    const nextCtx = Math.min(preferredCtx, nextMaxCtx)
+    setSelectedCtx(nextCtx)
+    await window.api.saveConfig({
+      lastQuant: nextQuant,
+      ctxSize: nextCtx,
+      gpuMode,
+      gpuIndex,
+    }).catch(() => {})
+  }
 
   const handleSelectVariant = async (quant: string) => {
     setSelectedQuant(quant)
     setDropdownOpen(false)
     const v = variants.find((vi) => vi.quant === quant)
-    const newMax = v?.maxCtx ?? 32768
+    const newMax = v?.selectableMaxCtx ?? v?.maxCtx ?? 32768
     const newCtx = Math.min(selectedCtx, newMax)
     setSelectedCtx(newCtx)
     await window.api.selectModelVariant(quant).catch(() => {})
@@ -140,6 +184,13 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
     setStartTime(Date.now())
 
     try {
+      await window.api.saveConfig({
+        lastQuant: selectedQuant,
+        ctxSize: selectedCtx,
+        gpuMode: selectedGpuMode,
+        gpuIndex: selectedGpuIndex,
+      })
+
       if (!status?.llamaReady) {
         addLog('\u{1F50D} Определение оптимального бинарника для вашей системы…')
         await window.api.ensureLlama()
@@ -176,8 +227,18 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
 
   const selectedSize = selected ? formatSize(selected.sizeMb) : '~20 ГБ'
   const maxCtx = selected?.maxCtx ?? 262144
+  const selectableMaxCtx = selected?.selectableMaxCtx ?? maxCtx
   const displayCtx = formatCtx(selectedCtx)
-  const availableCtxOptions = CTX_OPTIONS.filter((o) => o.value <= maxCtx)
+  const availableCtxOptions = CTX_OPTIONS.filter((o) => o.value <= selectableMaxCtx)
+  const gpuSummary = hasMultipleGpus
+    ? selectedGpuMode === 'split'
+      ? 'все GPU'
+      : selectedGpu
+        ? `GPU ${selectedGpu.index}`
+        : 'GPU'
+    : selectedGpu
+      ? `GPU ${selectedGpu.index}`
+      : null
 
   const steps = [
     {
@@ -222,7 +283,8 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
             <span className="text-zinc-500">{'·'}</span>{' '}
             {selectedQuant.startsWith('9B-') ? '9B' : '35B-A3B'}{' '}
             <span className="text-zinc-500">{'·'}</span>{' '}
-            ctx {displayCtx}{' '}
+            ctx {displayCtx}
+            {gpuSummary && <><span className="text-zinc-500">{' · '}</span>{gpuSummary}</>}
             <span className="text-zinc-500">{'·'}</span> локально через llama.cpp
           </p>
         </div>
@@ -337,6 +399,88 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
         {/* Action: variant picker + launch button */}
         {phase === 'idle' && (
           <div>
+            {(availableGpus.length > 0) && (
+              <div className="mb-4 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <div>
+                    <div className="text-sm font-medium text-zinc-200">Запуск на GPU</div>
+                    <div className="text-[11px] text-zinc-500 mt-0.5">
+                      Выбери, на какой видеокарте запускать `llama.cpp`
+                    </div>
+                  </div>
+                  <div className="text-[10px] px-2 py-1 rounded-lg bg-zinc-800 text-zinc-400">
+                    {availableGpus.length} GPU
+                  </div>
+                </div>
+
+                {hasMultipleGpus && (
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    <button
+                      onClick={async () => {
+                        const gpuIndex = availableGpus.some((gpu) => gpu.index === selectedGpuIndex)
+                          ? selectedGpuIndex
+                          : (availableGpus[0]?.index ?? 0)
+                        setSelectedGpuMode('single')
+                        setSelectedGpuIndex(gpuIndex)
+                        await refreshVariantsForGpu('single', gpuIndex)
+                      }}
+                      className={`px-3 py-2 text-sm rounded-lg border transition-colors cursor-pointer ${
+                        selectedGpuMode === 'single'
+                          ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
+                          : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+                      }`}
+                    >
+                      Одна GPU
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setSelectedGpuMode('split')
+                        await refreshVariantsForGpu('split', selectedGpuIndex)
+                      }}
+                      className={`px-3 py-2 text-sm rounded-lg border transition-colors cursor-pointer ${
+                        selectedGpuMode === 'split'
+                          ? 'border-amber-500/50 bg-amber-500/10 text-amber-400'
+                          : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+                      }`}
+                    >
+                      Все GPU
+                    </button>
+                  </div>
+                )}
+
+                {selectedGpuMode === 'single' ? (
+                  <div className="space-y-2">
+                    {availableGpus.map((gpu) => (
+                      <button
+                        key={gpu.index}
+                        onClick={async () => {
+                          setSelectedGpuIndex(gpu.index)
+                          await refreshVariantsForGpu('single', gpu.index)
+                        }}
+                        className={`w-full text-left px-3 py-2.5 rounded-xl border transition-colors cursor-pointer ${
+                          selectedGpuIndex === gpu.index
+                            ? 'border-blue-500/30 bg-blue-500/10'
+                            : 'border-zinc-800 hover:bg-zinc-800/80'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm text-zinc-200">GPU {gpu.index}: {gpu.name}</span>
+                          {selectedGpuIndex === gpu.index && <span className="text-blue-400 text-sm">✓</span>}
+                        </div>
+                        <div className="text-[11px] text-zinc-500 mt-1">
+                          Свободно {formatSize(gpu.vramFreeMb)} из {formatSize(gpu.vramTotalMb)}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
+                    Будут использованы все доступные GPU. Этот режим может быть быстрее, но стабильность зависит от драйвера и backend `llama.cpp`.
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="flex gap-3 items-stretch">
               {/* Variant dropdown */}
               <div ref={dropdownRef} className="relative">
@@ -435,17 +579,48 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                     <div className="px-3 py-2 border-b border-zinc-800">
                       <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">Контекст</span>
                     </div>
+                    {selected && (
+                      <div className="px-3 py-2 border-b border-zinc-800 text-[10px] text-zinc-500">
+                        Рекомендовано: {formatCtx(maxCtx)}
+                        {selectableMaxCtx > maxCtx && (
+                          <>
+                            <span className="text-zinc-600"> · </span>
+                            Доступно с offload: {formatCtx(selectableMaxCtx)}
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {selected && selected.fullGpuMaxCtx > 0 && selected.fullGpuMaxCtx < selectableMaxCtx && (
+                      <div className="px-3 py-2 border-b border-zinc-800 text-[10px] text-zinc-500">
+                        <span className="text-blue-400">Синий</span> GPU
+                        <span className="text-zinc-600"> · </span>
+                        <span className="text-amber-400">Янтарный</span> GPU+CPU
+                      </div>
+                    )}
                     {availableCtxOptions.map((opt) => (
+                      (() => {
+                        const fullGpu = isFullGpuCtx(opt.value, selected)
+                        const isSelected = selectedCtx === opt.value
+                        return (
                       <button
                         key={opt.value}
                         onClick={() => handleSelectCtx(opt.value)}
                         className={`w-full text-left px-3 py-2 text-sm transition-colors cursor-pointer ${
-                          selectedCtx === opt.value ? 'bg-blue-500/10 text-blue-400' : 'text-zinc-300 hover:bg-zinc-800'
+                          isSelected
+                            ? fullGpu
+                              ? 'bg-blue-500/10 text-blue-400'
+                              : 'bg-amber-500/10 text-amber-400'
+                            : fullGpu
+                              ? 'text-zinc-300 hover:bg-zinc-800'
+                              : 'text-amber-300 hover:bg-zinc-800'
                         }`}
                       >
                         {opt.label}
-                        {selectedCtx === opt.value && <span className="ml-2 text-blue-400">{'\u2713'}</span>}
+                        {!fullGpu && <span className="ml-2 text-[10px] opacity-80">GPU+CPU</span>}
+                        {isSelected && <span className={`ml-2 ${fullGpu ? 'text-blue-400' : 'text-amber-400'}`}>{'\u2713'}</span>}
                       </button>
+                        )
+                      })()
                     ))}
                   </div>
                 )}

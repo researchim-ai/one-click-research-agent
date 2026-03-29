@@ -4,7 +4,8 @@ import type { AgentEvent, AppStatus, DownloadProgress, SystemResources } from '.
 contextBridge.exposeInMainWorld('api', {
   getStatus: (): Promise<AppStatus> => ipcRenderer.invoke('get-status'),
   detectResources: (): Promise<SystemResources> => ipcRenderer.invoke('detect-resources'),
-  getModelVariants: (): Promise<any[]> => ipcRenderer.invoke('get-model-variants'),
+  getModelVariants: (override?: { gpuMode?: import('./types').GpuMode; gpuIndex?: number | null }): Promise<any[]> =>
+    ipcRenderer.invoke('get-model-variants', override),
   selectModelVariant: (quant: string): Promise<void> => ipcRenderer.invoke('select-model-variant', quant),
   getConfig: (): Promise<any> => ipcRenderer.invoke('get-config'),
   saveConfig: (partial: any): Promise<any> => ipcRenderer.invoke('save-config', partial),

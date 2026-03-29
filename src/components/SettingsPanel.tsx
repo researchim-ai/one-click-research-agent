@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import type { ModelVariantInfo, ToolInfo } from '../../electron/types'
+import type { ModelVariantInfo, ToolInfo, SystemResources, GpuMode } from '../../electron/types'
 import type { AppConfig, CustomTool } from '../../electron/config'
 import { DEFAULT_PRESET_ID, RESEARCH_PRESETS, type ResearchPresetId } from '../../research-presets'
 
@@ -41,13 +41,28 @@ function formatCtx(tokens: number): string {
   return String(tokens)
 }
 
+function pickQuantForVariants(variants: ModelVariantInfo[], preferredQuant: string): string {
+  const preferred = variants.find((variant) => variant.quant === preferredQuant && variant.fits)
+  if (preferred) return preferred.quant
+  return variants.find((variant) => variant.recommended)?.quant
+    ?? variants.find((variant) => variant.fits)?.quant
+    ?? preferredQuant
+}
+
+function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): boolean {
+  return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
+}
+
 export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const [tab, setTab] = useState<Tab>('model')
   const [cfg, setCfg] = useState<AppConfig | null>(null)
   const [variants, setVariants] = useState<ModelVariantInfo[]>([])
+  const [resources, setResources] = useState<SystemResources | null>(null)
   const [tools, setTools] = useState<ToolInfo[]>([])
   const [selectedQuant, setSelectedQuant] = useState('')
   const [selectedCtx, setSelectedCtx] = useState<number>(32768)
+  const [selectedGpuMode, setSelectedGpuMode] = useState<GpuMode>('single')
+  const [selectedGpuIndex, setSelectedGpuIndex] = useState<number>(0)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [editingTool, setEditingTool] = useState<CustomTool | null>(null)
@@ -81,18 +96,23 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
     if (!open) return
     Promise.all([
       window.api.getConfig(),
-      window.api.getModelVariants(),
+      window.api.detectResources(),
       window.api.getTools(),
       window.api.getPrompts(),
-    ]).then(([c, v, t, p]) => {
+    ]).then(async ([c, r, t, p]) => {
+      const gpuMode = c.gpuMode ?? 'single'
+      const gpuIndex = c.gpuIndex ?? r.gpus[0]?.index ?? 0
+      const v = await window.api.getModelVariants({ gpuMode, gpuIndex })
       setCfg(c)
+      setResources(r)
       setVariants(v)
       setTools(t)
-      const recommended = v.find((vi: ModelVariantInfo) => vi.recommended)
-      const quant = c.lastQuant || recommended?.quant || 'UD-Q4_K_XL'
+      setSelectedGpuMode(gpuMode)
+      setSelectedGpuIndex(gpuIndex)
+      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
       setSelectedQuant(quant)
       const variant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
-      const max = variant?.maxCtx ?? 32768
+      const max = variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768
       setSelectedCtx((c.ctxSize && c.ctxSize > 0) ? Math.min(c.ctxSize, max) : max)
       setDirty(false)
 
@@ -126,11 +146,34 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 
   const currentVariant = variants.find((v) => v.quant === selectedQuant)
   const maxCtx = currentVariant?.maxCtx ?? 262144
+  const selectableMaxCtx = currentVariant?.selectableMaxCtx ?? maxCtx
+  const availableGpus = resources?.gpus ?? []
+  const hasMultipleGpus = availableGpus.length > 1
+
+  const refreshVariantsForGpu = async (
+    gpuMode: GpuMode,
+    gpuIndex: number,
+    preferredQuant = selectedQuant,
+    preferredCtx = selectedCtx,
+  ) => {
+    const nextVariants = await window.api.getModelVariants({ gpuMode, gpuIndex })
+    setVariants(nextVariants)
+    const nextQuant = pickQuantForVariants(nextVariants, preferredQuant)
+    setSelectedQuant(nextQuant)
+    const nextVariant = nextVariants.find((variant) => variant.quant === nextQuant)
+    const nextMaxCtx = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
+    setSelectedCtx(Math.min(preferredCtx, nextMaxCtx))
+  }
 
   const handleSave = async () => {
     setSaving(true)
     try {
-      await window.api.saveConfig({ lastQuant: selectedQuant, ctxSize: selectedCtx })
+      await window.api.saveConfig({
+        lastQuant: selectedQuant,
+        ctxSize: selectedCtx,
+        gpuMode: selectedGpuMode,
+        gpuIndex: selectedGpuIndex,
+      })
       await window.api.selectModelVariant(selectedQuant)
       setDirty(false)
     } finally {
@@ -141,7 +184,12 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const handleApplyRestart = async () => {
     setSaving(true)
     try {
-      await window.api.saveConfig({ lastQuant: selectedQuant, ctxSize: selectedCtx })
+      await window.api.saveConfig({
+        lastQuant: selectedQuant,
+        ctxSize: selectedCtx,
+        gpuMode: selectedGpuMode,
+        gpuIndex: selectedGpuIndex,
+      })
       await window.api.selectModelVariant(selectedQuant)
       const result = await window.api.restartServer()
       setDirty(false)
@@ -192,17 +240,25 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
     setSaving(true)
     try {
       await window.api.resetAllDefaults()
-      const [c, v, t, p] = await Promise.all([
+      const [c, r, t, p] = await Promise.all([
         window.api.getConfig(),
-        window.api.getModelVariants(),
+        window.api.detectResources(),
         window.api.getTools(),
         window.api.getPrompts(),
       ])
+      const gpuMode = c.gpuMode ?? 'single'
+      const gpuIndex = c.gpuIndex ?? r.gpus[0]?.index ?? 0
+      const v = await window.api.getModelVariants({ gpuMode, gpuIndex })
       setCfg(c)
+      setResources(r)
       setVariants(v)
       setTools(t)
-      setSelectedQuant(c.lastQuant || 'UD-Q4_K_XL')
-      setSelectedCtx(32768)
+      setSelectedGpuMode(gpuMode)
+      setSelectedGpuIndex(gpuIndex)
+      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
+      setSelectedQuant(quant)
+      const variant = v.find((entry) => entry.quant === quant)
+      setSelectedCtx(Math.min(32768, variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768))
       setSelectedPreset(DEFAULT_PRESET_ID)
       setMaxIterations(c.maxIterations ?? 200)
       setTemperature(c.temperature ?? 0.3)
@@ -269,11 +325,30 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
           {tab === 'model' && (
             <ModelTab
               variants={variants}
+              availableGpus={availableGpus}
+              hasMultipleGpus={hasMultipleGpus}
               selectedQuant={selectedQuant}
               selectedCtx={selectedCtx}
+              selectedGpuMode={selectedGpuMode}
+              selectedGpuIndex={selectedGpuIndex}
               maxCtx={maxCtx}
+              selectableMaxCtx={selectableMaxCtx}
               onQuantChange={(q) => { setSelectedQuant(q); setDirty(true) }}
               onCtxChange={(c: number) => { setSelectedCtx(c); setDirty(true) }}
+              onGpuModeChange={async (gpuMode) => {
+                const nextGpuIndex = availableGpus.some((gpu) => gpu.index === selectedGpuIndex)
+                  ? selectedGpuIndex
+                  : (availableGpus[0]?.index ?? 0)
+                setSelectedGpuMode(gpuMode)
+                setSelectedGpuIndex(nextGpuIndex)
+                await refreshVariantsForGpu(gpuMode, nextGpuIndex)
+                setDirty(true)
+              }}
+              onGpuIndexChange={async (gpuIndex) => {
+                setSelectedGpuIndex(gpuIndex)
+                await refreshVariantsForGpu(selectedGpuMode, gpuIndex)
+                setDirty(true)
+              }}
             />
           )}
           {tab === 'agent' && (
@@ -396,18 +471,82 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 // ---------------------------------------------------------------------------
 
 function ModelTab({
-  variants, selectedQuant, selectedCtx, maxCtx,
-  onQuantChange, onCtxChange,
+  variants, availableGpus, hasMultipleGpus,
+  selectedQuant, selectedCtx, selectedGpuMode, selectedGpuIndex, maxCtx, selectableMaxCtx,
+  onQuantChange, onCtxChange, onGpuModeChange, onGpuIndexChange,
 }: {
   variants: ModelVariantInfo[]
+  availableGpus: SystemResources['gpus']
+  hasMultipleGpus: boolean
   selectedQuant: string
   selectedCtx: number
+  selectedGpuMode: GpuMode
+  selectedGpuIndex: number
   maxCtx: number
+  selectableMaxCtx: number
   onQuantChange: (q: string) => void
   onCtxChange: (c: number) => void
+  onGpuModeChange: (mode: GpuMode) => void | Promise<void>
+  onGpuIndexChange: (index: number) => void | Promise<void>
 }) {
+  const selectedVariant = variants.find((variant) => variant.quant === selectedQuant) ?? null
+
   return (
     <div className="space-y-6">
+      {hasMultipleGpus && (
+        <div>
+          <label className="block text-sm font-medium text-zinc-300 mb-3">Режим GPU</label>
+          <div className="flex gap-2 mb-3">
+            <button
+              onClick={() => onGpuModeChange('single')}
+              className={`px-3 py-2 text-sm rounded-lg border transition-colors cursor-pointer ${
+                selectedGpuMode === 'single'
+                  ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
+                  : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+              }`}
+            >
+              Одна GPU
+            </button>
+            <button
+              onClick={() => onGpuModeChange('split')}
+              className={`px-3 py-2 text-sm rounded-lg border transition-colors cursor-pointer ${
+                selectedGpuMode === 'split'
+                  ? 'border-amber-500/50 bg-amber-500/10 text-amber-400'
+                  : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+              }`}
+            >
+              Все GPU (экспериментально)
+            </button>
+          </div>
+          <p className="text-xs text-zinc-500 mb-3">
+            Для систем с несколькими видеокартами безопаснее запускать `llama.cpp` на одной карте. Multi-GPU может быть нестабилен и приводить к случайным падениям драйвера.
+          </p>
+          {selectedGpuMode === 'single' && (
+            <div className="space-y-2 rounded-xl border border-zinc-800 p-2">
+              {availableGpus.map((gpu) => (
+                <button
+                  key={gpu.index}
+                  onClick={() => onGpuIndexChange(gpu.index)}
+                  className={`w-full text-left px-3 py-2.5 rounded-lg border transition-colors cursor-pointer ${
+                    selectedGpuIndex === gpu.index
+                      ? 'border-blue-500/30 bg-blue-500/10'
+                      : 'border-transparent hover:bg-zinc-800/80'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-zinc-200">GPU {gpu.index}: {gpu.name}</span>
+                    {selectedGpuIndex === gpu.index && <span className="text-blue-400 text-sm">✓</span>}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-1">
+                    Свободно {formatSize(gpu.vramFreeMb)} из {formatSize(gpu.vramTotalMb)}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Quant selection */}
       <div>
         <label className="block text-sm font-medium text-zinc-300 mb-3">Квантизация модели</label>
@@ -471,21 +610,42 @@ function ModelTab({
       <div>
         <label className="block text-sm font-medium text-zinc-300 mb-2">Размер контекста</label>
         <p className="text-xs text-zinc-500 mb-3">
-          Максимум для текущей квантизации: {formatCtx(maxCtx)}
+          Рекомендованный максимум для текущей квантизации: {formatCtx(maxCtx)}
         </p>
+        {selectableMaxCtx > maxCtx && (
+          <p className="text-xs text-zinc-500 mb-3">
+            Доступный максимум с offload в GPU+CPU: {formatCtx(selectableMaxCtx)}
+          </p>
+        )}
+        {selectedVariant && selectedVariant.fullGpuMaxCtx > 0 && selectedVariant.fullGpuMaxCtx < selectableMaxCtx && (
+          <p className="text-xs text-zinc-500 mb-3">
+            <span className="text-blue-400">Синий</span> = полностью в GPU, <span className="text-amber-400">янтарный</span> = часть слоев и/или KV уйдет в CPU/RAM.
+          </p>
+        )}
         <div className="flex flex-wrap gap-2">
-          {CTX_OPTIONS.filter((o) => o.value <= maxCtx).map((opt) => (
+          {CTX_OPTIONS.filter((o) => o.value <= selectableMaxCtx).map((opt) => (
+            (() => {
+              const fullGpu = isFullGpuCtx(opt.value, selectedVariant)
+              const isSelected = selectedCtx === opt.value
+              return (
             <button
               key={opt.value}
               onClick={() => onCtxChange(opt.value)}
               className={`px-3 py-1.5 text-sm rounded-lg border transition-colors cursor-pointer ${
-                selectedCtx === opt.value
-                  ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
-                  : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+                isSelected
+                  ? fullGpu
+                    ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
+                    : 'border-amber-500/50 bg-amber-500/10 text-amber-400'
+                  : fullGpu
+                    ? 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
+                    : 'border-amber-500/20 text-amber-300 hover:border-amber-500/40'
               }`}
             >
               {opt.label}
+              {!fullGpu && <span className="ml-2 text-[10px] opacity-80">GPU+CPU</span>}
             </button>
+              )
+            })()
           ))}
         </div>
       </div>

@@ -1,6 +1,6 @@
 import { execSync } from 'child_process'
 import os from 'os'
-import type { GpuInfo, SystemResources, ServerLaunchArgs, BinarySelection, ModelVariant, ModelVariantInfo } from './types'
+import type { GpuInfo, SystemResources, ServerLaunchArgs, BinarySelection, ModelVariant, ModelVariantInfo, GpuMode } from './types'
 import { readGGUFMetadata, deriveArchInfo, defaultArchInfo, type ModelArchInfo } from './gguf'
 
 export function detectGpus(): GpuInfo[] {
@@ -75,6 +75,24 @@ export function detect(): SystemResources {
     totalVramMb: gpus.reduce((s, g) => s + g.vramTotalMb, 0),
     platform: process.platform,
     arch: process.arch,
+  }
+}
+
+export function applyGpuPreferences(
+  res: SystemResources,
+  gpuMode: GpuMode = 'single',
+  gpuIndex: number | null = 0,
+): SystemResources {
+  if (gpuMode !== 'single' || res.gpus.length === 0) return res
+
+  const selected = res.gpus.find((gpu) => gpu.index === gpuIndex) ?? res.gpus[0]
+  const gpus = selected ? [selected] : []
+
+  return {
+    ...res,
+    gpus,
+    cudaAvailable: gpus.length > 0,
+    totalVramMb: gpus.reduce((sum, gpu) => sum + gpu.vramTotalMb, 0),
   }
 }
 
@@ -199,6 +217,8 @@ export function evaluateVariants(res: SystemResources): ModelVariantInfo[] {
   const freeVram = res.gpus.reduce((s, g) => s + g.vramFreeMb, 0)
   const isLaptop = res.gpus.some((g) => /laptop|mobile/i.test(g.name))
   const totalMem = res.ramTotalMb + freeVram
+  const arch = getArch()
+  const kvType = { cacheTypeK: 'q8_0', cacheTypeV: 'q8_0' }
 
   let bestFittingIdx = -1
 
@@ -212,15 +232,29 @@ export function evaluateVariants(res: SystemResources): ModelVariantInfo[] {
 
     let mode: 'cpu' | 'hybrid' | 'full_gpu' = 'cpu'
     let maxCtx = 4096
+    let selectableMaxCtx = 4096
+    let fullGpuMaxCtx = 0
 
     if (fits) {
-      const preset = selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layerMb)
+      fullGpuMaxCtx = selectFullGpuPreset(freeVram, memMb, arch, kvType, SAFE_CALC_OPTIONS)?.ctxSize ?? 0
+      const preset = selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layerMb, SAFE_CALC_OPTIONS)
+      const selectablePreset = selectPresetForTargetCtx(
+        res.ramTotalMb,
+        freeVram,
+        isLaptop,
+        memMb,
+        memMb,
+        layerMb,
+        arch.contextLength,
+        SELECTABLE_CALC_OPTIONS,
+      )
       maxCtx = preset.ctxSize
-      if (freeVram >= memMb + 2000) mode = 'full_gpu'
+      selectableMaxCtx = Math.max(maxCtx, selectablePreset.ctxSize)
+      if (fullGpuMaxCtx > 0 && maxCtx <= fullGpuMaxCtx) mode = 'full_gpu'
       else if (freeVram >= 500) mode = 'hybrid'
     }
 
-    return { ...v, fits, maxCtx, mode, recommended: false }
+    return { ...v, fits, maxCtx, selectableMaxCtx, fullGpuMaxCtx, mode, recommended: false }
   })
 
   // On small systems (RAM ≤ 16 GB and VRAM < 16 GB), prefer 9B-UD-Q4_K_XL
@@ -258,6 +292,21 @@ export function evaluateVariants(res: SystemResources): ModelVariantInfo[] {
 const RAM_OVERHEAD_MB = 3000
 const KV_SAFETY_FACTOR = 0.80
 
+interface CalcOptions {
+  gpuReserveMb: number
+  kvSafetyFactor: number
+}
+
+const SAFE_CALC_OPTIONS: CalcOptions = {
+  gpuReserveMb: 2000,
+  kvSafetyFactor: 0.80,
+}
+
+const SELECTABLE_CALC_OPTIONS: CalcOptions = {
+  gpuReserveMb: 768,
+  kvSafetyFactor: 0.92,
+}
+
 const CTX_SNAP_TARGETS = [262144, 131072, 65536, 32768, 24576, 16384, 12288, 8192, 6144, 4096]
 
 function kvLayersSplit(gpuLayersCapped: number, arch: ModelArchInfo): { kvOnGpu: number; kvOnCpu: number } {
@@ -272,19 +321,20 @@ function calcContextFromMemory(
   kvOnCpu: number,
   kvQuantized: boolean,
   arch: ModelArchInfo,
+  kvSafetyFactor: number,
 ): number {
   const bytesPerLayer = kvQuantized ? arch.kvBytesPerLayerQ8 : arch.kvBytesPerLayerF16
   let maxTokens = Infinity
 
   if (kvOnGpu > 0) {
     if (vramForKvMb <= 0) return 4096
-    const vramBytes = vramForKvMb * 1024 * 1024 * KV_SAFETY_FACTOR
+    const vramBytes = vramForKvMb * 1024 * 1024 * kvSafetyFactor
     maxTokens = Math.min(maxTokens, Math.floor(vramBytes / (kvOnGpu * bytesPerLayer)))
   }
 
   if (kvOnCpu > 0) {
     if (ramForKvMb <= 0) return 4096
-    const ramBytes = ramForKvMb * 1024 * 1024 * KV_SAFETY_FACTOR
+    const ramBytes = ramForKvMb * 1024 * 1024 * kvSafetyFactor
     maxTokens = Math.min(maxTokens, Math.floor(ramBytes / (kvOnCpu * bytesPerLayer)))
   }
 
@@ -304,6 +354,21 @@ interface Preset {
   cacheTypeV: string
 }
 
+function selectFullGpuPreset(
+  freeVramMb: number,
+  modelVramMb: number,
+  arch: ModelArchInfo,
+  kvType: { cacheTypeK: string; cacheTypeV: string },
+  options: CalcOptions = SAFE_CALC_OPTIONS,
+): Preset | null {
+  const fullGpuThreshold = modelVramMb + options.gpuReserveMb
+  if (freeVramMb < fullGpuThreshold) return null
+
+  const vramForKv = freeVramMb - modelVramMb
+  const ctx = calcContextFromMemory(vramForKv, arch.kvLayers, 0, 0, true, arch, options.kvSafetyFactor)
+  return { nGpuLayers: 999, ctxSize: ctx, flashAttn: true, ...kvType }
+}
+
 function selectPresetForSize(
   ramTotalMb: number,
   freeVramMb: number,
@@ -311,6 +376,7 @@ function selectPresetForSize(
   modelRamMb: number,
   modelVramMb: number,
   perLayerVramMb: number,
+  options: CalcOptions = SAFE_CALC_OPTIONS,
 ): Preset {
   const arch = getArch()
   // q8_0 KV cache: good balance of memory vs speed; recommended for long context (less VRAM/RAM for cache, still accurate)
@@ -327,23 +393,18 @@ function selectPresetForSize(
       return { nGpuLayers: 0, ctxSize: 4096, flashAttn: false, ...kvType }
     }
     const ramForKv = ramForModel - mmapModelMb
-    const ctx = calcContextFromMemory(0, 0, ramForKv, arch.kvLayers, true, arch)
+    const ctx = calcContextFromMemory(0, 0, ramForKv, arch.kvLayers, true, arch, options.kvSafetyFactor)
     return { nGpuLayers: 0, ctxSize: ctx, flashAttn: false, ...kvType }
   }
 
-  // Full GPU
-  const fullGpuThreshold = modelVramMb + 2000
-  if (freeVramMb >= fullGpuThreshold) {
-    const vramForKv = freeVramMb - modelVramMb
-    const ctx = calcContextFromMemory(vramForKv, arch.kvLayers, 0, 0, true, arch)
-    return { nGpuLayers: 999, ctxSize: ctx, flashAttn: true, ...kvType }
-  }
+  const fullGpuPreset = selectFullGpuPreset(freeVramMb, modelVramMb, arch, kvType, options)
+  if (fullGpuPreset) return fullGpuPreset
 
   // Hybrid: search for optimal GPU layer count that maximizes context.
-  let maxLayersOnGpu = Math.min(arch.blockCount, Math.max(0, Math.floor((freeVramMb - 2000) / perLayerVramMb)))
+  let maxLayersOnGpu = Math.min(arch.blockCount, Math.max(0, Math.floor((freeVramMb - options.gpuReserveMb) / perLayerVramMb)))
 
   if (isLaptop) {
-    maxLayersOnGpu = Math.min(maxLayersOnGpu, Math.max(0, Math.floor((freeVramMb - 3500) / (perLayerVramMb * 1.2))))
+    maxLayersOnGpu = Math.min(maxLayersOnGpu, Math.max(0, Math.floor((freeVramMb - (options.gpuReserveMb + 1500)) / (perLayerVramMb * 1.2))))
   }
 
   const layerStep = Math.max(1, Math.floor(arch.blockCount / arch.kvLayers))
@@ -362,7 +423,7 @@ function selectPresetForSize(
     const ctx = calcContextFromMemory(
       Math.max(0, vramKv), kvOnGpu,
       Math.max(0, ramKv), kvOnCpu,
-      true, arch,
+      true, arch, options.kvSafetyFactor,
     )
 
     if (ctx > bestCtx || (ctx === bestCtx && nGpu > bestNGpu)) {
@@ -377,6 +438,59 @@ function selectPresetForSize(
     flashAttn: bestNGpu > 0,
     ...kvType,
   }
+}
+
+function selectPresetForTargetCtx(
+  ramTotalMb: number,
+  freeVramMb: number,
+  isLaptop: boolean,
+  modelRamMb: number,
+  modelVramMb: number,
+  perLayerVramMb: number,
+  targetCtx: number,
+  options: CalcOptions = SELECTABLE_CALC_OPTIONS,
+): Preset {
+  const arch = getArch()
+  const kvType = { cacheTypeK: 'q8_0', cacheTypeV: 'q8_0' }
+  const clampedTarget = Math.min(targetCtx, arch.contextLength)
+  const fallback = selectPresetForSize(ramTotalMb, freeVramMb, isLaptop, modelRamMb, modelVramMb, perLayerVramMb, options)
+
+  const fullGpuPreset = selectFullGpuPreset(freeVramMb, modelVramMb, arch, kvType, options)
+  if (fullGpuPreset && fullGpuPreset.ctxSize >= clampedTarget) return fullGpuPreset
+
+  const perLayerCpuMb = Math.round(perLayerVramMb * 0.85)
+  let maxLayersOnGpu = Math.min(arch.blockCount, Math.max(0, Math.floor((freeVramMb - options.gpuReserveMb) / perLayerVramMb)))
+  if (isLaptop) {
+    maxLayersOnGpu = Math.min(maxLayersOnGpu, Math.max(0, Math.floor((freeVramMb - (options.gpuReserveMb + 1500)) / (perLayerVramMb * 1.2))))
+  }
+
+  const layerStep = Math.max(1, Math.floor(arch.blockCount / arch.kvLayers))
+  for (let nGpu = maxLayersOnGpu; nGpu >= 0; nGpu -= layerStep) {
+    const gpuCapped = Math.min(nGpu, arch.blockCount)
+    const cpuL = arch.blockCount - gpuCapped
+    const { kvOnGpu, kvOnCpu } = kvLayersSplit(gpuCapped, arch)
+
+    const cpuModelRam = cpuL * perLayerCpuMb
+    const ramKv = ramTotalMb - RAM_OVERHEAD_MB - cpuModelRam
+    const vramKv = freeVramMb - (gpuCapped * perLayerVramMb)
+
+    const ctx = calcContextFromMemory(
+      Math.max(0, vramKv), kvOnGpu,
+      Math.max(0, ramKv), kvOnCpu,
+      true, arch, options.kvSafetyFactor,
+    )
+
+    if (ctx >= clampedTarget) {
+      return {
+        nGpuLayers: gpuCapped,
+        ctxSize: clampedTarget,
+        flashAttn: gpuCapped > 0,
+        ...kvType,
+      }
+    }
+  }
+
+  return fallback
 }
 
 function selectPreset(ramTotalMb: number, freeVramMb: number, isLaptop: boolean): Preset {
@@ -409,7 +523,9 @@ export function computeOptimalArgs(
     if (variant) {
       const memMb = modelMemoryMb(variant)
       const layMb = layerVramMb(variant)
-      preset = selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layMb)
+      preset = (userCtxSize && userCtxSize > 0)
+        ? selectPresetForTargetCtx(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layMb, userCtxSize, SELECTABLE_CALC_OPTIONS)
+        : selectPresetForSize(res.ramTotalMb, freeVram, isLaptop, memMb, memMb, layMb, SAFE_CALC_OPTIONS)
     } else {
       preset = selectPreset(res.ramTotalMb, freeVram, isLaptop)
     }
@@ -417,10 +533,10 @@ export function computeOptimalArgs(
     preset = selectPreset(res.ramTotalMb, freeVram, isLaptop)
   }
 
-  // Respect user's explicit choice — don't silently clamp to preset.
-  // If the server can't handle it, queryActualCtxSize() will detect the real n_ctx.
+  // Respect user's explicit choice when we can fit it by offloading more to CPU/RAM.
+  // If the server still can't handle it, queryActualCtxSize() will detect the real n_ctx.
   const ctxSize = (userCtxSize && userCtxSize > 0)
-    ? userCtxSize
+    ? Math.min(userCtxSize, preset.ctxSize)
     : preset.ctxSize
 
   return {

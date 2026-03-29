@@ -24,7 +24,7 @@ if (process.env.ELECTRON_NO_SANDBOX || process.argv.includes('--no-sandbox')) {
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   app.disableHardwareAcceleration()
 }
-import { detect, evaluateVariants, loadModelArch, getArch } from './resources'
+import { detect, evaluateVariants, loadModelArch, getArch, applyGpuPreferences } from './resources'
 import * as modelManager from './model-manager'
 import * as serverManager from './server-manager'
 import * as config from './config'
@@ -338,10 +338,15 @@ app.on('before-quit', () => {
 function registerIpcHandlers() {
   ipcMain.handle('detect-resources', () => detect())
 
-  ipcMain.handle('get-model-variants', () => {
+  ipcMain.handle('get-model-variants', (_e, override?: Pick<config.AppConfig, 'gpuMode' | 'gpuIndex'>) => {
     const modelPath = modelManager.getModelPath()
     if (modelPath) loadModelArch(modelPath)
-    return evaluateVariants(detect())
+    const cfg = config.load()
+    return evaluateVariants(applyGpuPreferences(
+      detect(),
+      override?.gpuMode ?? cfg.gpuMode,
+      override?.gpuIndex ?? cfg.gpuIndex,
+    ))
   })
 
   ipcMain.handle('select-model-variant', (_e, quant: string) => {

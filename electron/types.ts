@@ -5,6 +5,8 @@ export interface GpuInfo {
   vramFreeMb: number
 }
 
+export type GpuMode = 'single' | 'split'
+
 export interface SystemResources {
   gpus: GpuInfo[]
   cpuModel: string
@@ -91,6 +93,8 @@ export interface ModelVariant {
 export interface ModelVariantInfo extends ModelVariant {
   fits: boolean
   maxCtx: number
+  selectableMaxCtx: number
+  fullGpuMaxCtx: number
   mode: 'cpu' | 'hybrid' | 'full_gpu'
   recommended: boolean
 }

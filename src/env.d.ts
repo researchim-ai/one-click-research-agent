@@ -3,7 +3,9 @@
 interface ElectronAPI {
   getStatus(): Promise<import('../electron/types').AppStatus>
   detectResources(): Promise<import('../electron/types').SystemResources>
-  getModelVariants(): Promise<import('../electron/types').ModelVariantInfo[]>
+  getModelVariants(
+    override?: Pick<import('../electron/config').AppConfig, 'gpuMode' | 'gpuIndex'>
+  ): Promise<import('../electron/types').ModelVariantInfo[]>
   selectModelVariant(quant: string): Promise<void>
   getConfig(): Promise<import('../electron/config').AppConfig>
   saveConfig(partial: Partial<import('../electron/config').AppConfig>): Promise<import('../electron/config').AppConfig>

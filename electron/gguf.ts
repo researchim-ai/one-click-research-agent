@@ -185,6 +185,7 @@ const KNOWN_ARCH_OVERRIDES: Record<string, ArchOverride> = {
   // Qwen3.5-35B-A3B: 40 layers, layout 10 × (3×DeltaNet + 1×Attention)
   // → 10 of 40 layers have attention KV cache, KV head_dim = 256
   'qwen3moe': { kvLayersFraction: 0.25, headDimKvOverride: 256 },
+  'qwen35moe': { kvLayersFraction: 0.25, headDimKvOverride: 256 },
   // If the architecture is registered differently:
   'qwen3': { kvLayersFraction: 0.25, headDimKvOverride: 256 },
 }
@@ -221,11 +222,16 @@ export function deriveArchInfo(meta: GGUFMetadata): ModelArchInfo {
 
   // Check for known architecture overrides
   const override = KNOWN_ARCH_OVERRIDES[arch]
+  const fullAttentionInterval = getNum(meta, `${arch}.full_attention_interval`, 'llama.full_attention_interval')
   let kvLayers = blockCount
-  if (override) {
+  if (fullAttentionInterval > 0) {
+    // Some hybrid/MoE architectures expose the exact spacing between
+    // full-attention blocks. Those are the only layers that need KV cache.
+    kvLayers = Math.ceil(blockCount / fullAttentionInterval)
+  } else if (override) {
     kvLayers = Math.round(blockCount * override.kvLayersFraction)
-    if (override.headDimKvOverride) headDimKv = override.headDimKvOverride
   }
+  if (override?.headDimKvOverride) headDimKv = override.headDimKvOverride
 
   // KV bytes per attention layer per token:
   // K + V = 2 * headCountKv * headDimKv values

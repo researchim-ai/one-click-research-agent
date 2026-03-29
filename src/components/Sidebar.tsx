@@ -128,7 +128,7 @@ function TreeNode({
   setExpandedPaths: (fn: (prev: Set<string>) => Set<string>) => void
   activeFilePath?: string | null
 }) {
-  const isExpanded = expandedPaths.has(entry.path) || depth < 1
+  const isExpanded = expandedPaths.has(entry.path)
   const setExpanded = (exp: boolean) => setExpandedPaths((prev) => {
     const next = new Set(prev)
     if (exp) next.add(entry.path)

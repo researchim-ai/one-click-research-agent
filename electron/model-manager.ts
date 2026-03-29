@@ -10,6 +10,31 @@ import { MODEL_VARIANTS } from './resources'
 const DEFAULT_REPO_ID = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 const DEFAULT_QUANT = 'UD-Q4_K_XL'
 
+function normalizeToken(value: string): string {
+  return value.toLowerCase().replace(/-/g, '_')
+}
+
+function is9BQuant(quant: string): boolean {
+  return quant.startsWith('9B-')
+}
+
+function matchesQuantFile(filename: string, quant: string): boolean {
+  const normalized = normalizeToken(filename)
+  const quantNorm = normalizeToken(quant)
+  if (!normalized.includes(quantNorm)) return false
+
+  const is9BFile = normalized.includes('9b')
+  return is9BQuant(quant) ? is9BFile : !is9BFile
+}
+
+function findInstalledModelFile(files: string[], quant: string): string | null {
+  const exactFamilyMatch = files.find((file) => matchesQuantFile(file, quant))
+  if (exactFamilyMatch) return exactFamilyMatch
+
+  const quantNorm = normalizeToken(quant)
+  return files.find((file) => normalizeToken(file).includes(quantNorm)) ?? null
+}
+
 function getRepoId(quant?: string): string {
   const q = quant ?? selectedQuant
   const variant = MODEL_VARIANTS.find((v: ModelVariant) => v.quant === q)
@@ -46,8 +71,7 @@ export function getModelPath(): string | null {
   const dir = modelsDir()
   if (!fs.existsSync(dir)) return null
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.gguf'))
-  const quantNorm = selectedQuant.toLowerCase().replace(/-/g, '_')
-  const match = files.find((f) => f.toLowerCase().replace(/-/g, '_').includes(quantNorm))
+  const match = findInstalledModelFile(files, selectedQuant)
   if (match) return path.join(dir, match)
   return files.length > 0 ? path.join(dir, files[0]) : null
 }
@@ -56,8 +80,7 @@ export function isDownloaded(): boolean {
   const dir = modelsDir()
   if (!fs.existsSync(dir)) return false
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.gguf'))
-  const quantNorm = selectedQuant.toLowerCase().replace(/-/g, '_')
-  return files.some((f) => f.toLowerCase().replace(/-/g, '_').includes(quantNorm))
+  return findInstalledModelFile(files, selectedQuant) !== null
 }
 
 interface HfSibling {

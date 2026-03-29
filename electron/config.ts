@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import type { GpuMode } from './types'
 import type { ResearchPresetId } from '../research-presets'
 
 export interface CustomTool {
@@ -15,6 +16,8 @@ export interface CustomTool {
 export interface AppConfig {
   lastQuant: string
   ctxSize: number | null
+  gpuMode: GpuMode
+  gpuIndex: number | null
   selectedPreset: ResearchPresetId
   customTools: CustomTool[]
   systemPrompt: string | null
@@ -34,6 +37,8 @@ export interface AppConfig {
 const DEFAULT_CONFIG: AppConfig = {
   lastQuant: 'UD-Q4_K_XL',
   ctxSize: null,
+  gpuMode: 'single',
+  gpuIndex: 0,
   selectedPreset: 'universal',
   customTools: [],
   systemPrompt: null,
