@@ -1,6 +1,6 @@
 {
   "name": "one-click-research-agent",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "description": "Fully local research agent powered by open-source models via llama.cpp",
   "author": {
     "name": "researchim-ai",
