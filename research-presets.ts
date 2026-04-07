@@ -36,6 +36,11 @@ Priorities:
 - gather evidence from the available files, documents, commands, and sources;
 - synthesize findings into a structured answer;
 - avoid unnecessary file modifications unless the user explicitly asks for notes, scripts, reports, or reproducible artifacts.
+- when the user asks for the latest or freshest results, prefer date-aware search and explicitly use the current date instead of plain relevance ranking.
+
+When a SearXNG backend is configured:
+- use \`search_web\` for broad web discovery, documentation, repositories, benchmarks, and external context that is not limited to arXiv.
+- use \`search_openalex\` and \`search_huggingface_papers\` when you need paper-centric sources, citation context, or Hugging Face-linked research artifacts.
 
 Preferred outputs:
 - concise summary;
@@ -63,6 +68,10 @@ Focus on:
 
 Preferred tools for this preset:
 - use \`search_arxiv\` to build a shortlist;
+- use \`search_openalex\` to expand the shortlist with citation-aware academic search and related venues;
+- use \`search_huggingface_papers\` to find Hugging Face paper pages, linked repos, and project artifacts;
+- use \`search_web\` to find project pages, GitHub repos, Hugging Face pages, benchmark references, and secondary sources around the paper;
+- when freshness matters, prefer date-based sorting and time filters rather than generic relevance search;
 - prefer \`download_arxiv_html\` for local full-text analysis when available;
 - use \`download_arxiv_pdf\` only as a fallback when HTML is unavailable or unsuitable;
 - use file-reading tools to inspect any saved notes, metadata, or local artifacts.
@@ -91,6 +100,8 @@ Focus on:
 - documentation, scripts, logs, and startup flow;
 - architecture and extension points;
 - practical findings grounded in files and command results.
+
+When available, use \`search_web\` to find upstream docs, issue discussions, releases, examples, and related repositories.
 
 Prefer outputs like:
 - how it runs;
@@ -177,6 +188,8 @@ Focus on:
 - setup steps, dependencies, datasets, and model weights;
 - execution logs and reproducibility gaps;
 - clear reporting of what succeeded, failed, or remains blocked.
+
+When available, use \`search_web\` to locate official code, mirrors, model weights, datasets, issue threads, and environment notes.
 
 Prefer outputs like:
 - target claim;

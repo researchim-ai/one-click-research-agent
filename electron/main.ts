@@ -28,7 +28,8 @@ import { detect, evaluateVariants, loadModelArch, getArch, applyGpuPreferences }
 import * as modelManager from './model-manager'
 import * as serverManager from './server-manager'
 import * as config from './config'
-import { TOOL_DEFINITIONS } from './tools'
+import { getBuiltinToolDefinitions } from './tools'
+import { ensureWebSearchBackend, getWebSearchStatus } from './searxng'
 import {
   runAgent, resetAgent, setWorkspace, cancelAgent,
   createSession, switchSession, listSessions, deleteSession,
@@ -349,6 +350,23 @@ function registerIpcHandlers() {
     ))
   })
 
+  ipcMain.handle(
+    'get-web-search-status',
+    (_e, override?: Pick<config.AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>) =>
+      getWebSearchStatus({
+        webSearchProvider: override?.webSearchProvider ?? config.load().webSearchProvider,
+        searxngBaseUrl: override?.searxngBaseUrl ?? config.load().searxngBaseUrl,
+      }),
+  )
+  ipcMain.handle(
+    'ensure-web-search',
+    (_e, override?: Pick<config.AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>) =>
+      ensureWebSearchBackend({
+        webSearchProvider: override?.webSearchProvider ?? config.load().webSearchProvider,
+        searxngBaseUrl: override?.searxngBaseUrl ?? config.load().searxngBaseUrl,
+      }),
+  )
+
   ipcMain.handle('select-model-variant', (_e, quant: string) => {
     modelManager.setSelectedQuant(quant)
   })
@@ -360,7 +378,7 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('get-tools', (): ToolInfo[] => {
-    const builtins: ToolInfo[] = TOOL_DEFINITIONS.map((t: any) => ({
+    const builtins: ToolInfo[] = getBuiltinToolDefinitions(config.load()).map((t: any) => ({
       name: t.function.name,
       description: t.function.description,
       builtin: true,
@@ -677,6 +695,20 @@ function registerIpcHandlers() {
 
   ipcMain.handle('copy-to-clipboard', (_e, text: string) => {
     clipboard.writeText(text)
+  })
+
+  ipcMain.handle('open-external-url', async (_e, rawUrl: string) => {
+    const url = String(rawUrl ?? '').trim()
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      throw new Error('Некорректный URL')
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('Разрешены только http/https ссылки')
+    }
+    await shell.openExternal(parsed.toString())
   })
 
   ipcMain.handle('reveal-in-explorer', (_e, targetPath: string) => {

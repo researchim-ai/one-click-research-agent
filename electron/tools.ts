@@ -1,7 +1,9 @@
 import { execFileSync, execSync } from 'child_process'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
-import type { CustomTool } from './config'
+import type { AppConfig, CustomTool } from './config'
+import { getWebSearchStatus, loadWebSearchConfig, resolveWebSearchBaseUrl, shouldEnableWebSearchTool } from './searxng'
 
 export const TOOL_DEFINITIONS = [
   {
@@ -31,6 +33,44 @@ export const TOOL_DEFINITIONS = [
         properties: {
           query: { type: 'string', description: 'Search query for arXiv, such as "browser agents" or "protein folding".' },
           max_results: { type: 'number', description: 'Maximum number of papers to return (default: 5, max: 10).' },
+          from_date: { type: 'string', description: 'Optional lower bound for submission date, for example "2024-01-01" or "20240101".' },
+          to_date: { type: 'string', description: 'Optional upper bound for submission date, for example "2024-12-31" or "20241231".' },
+          sort_by: { type: 'string', description: 'Optional sort field: "relevance", "submittedDate", or "lastUpdatedDate".' },
+          sort_order: { type: 'string', description: 'Optional sort order: "descending" or "ascending".' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_huggingface_papers',
+      description:
+        'Search Hugging Face Papers and return paper cards with title, paper URL, arXiv URL, summary, organization, project page, GitHub repo, and popularity signals when available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query for Hugging Face Papers, such as "agent memory" or "protein language model".' },
+          max_results: { type: 'number', description: 'Maximum number of papers to return (default: 5, max: 10).' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_openalex',
+      description:
+        'Search OpenAlex works and return structured academic results with title, authors, year, venue, citation count, abstract, DOI, and open-access links when available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Academic search query, such as "in-context reinforcement learning agents" or "diffusion protein design".' },
+          max_results: { type: 'number', description: 'Maximum number of papers to return (default: 5, max: 10).' },
+          year_from: { type: 'number', description: 'Optional lower bound for publication year.' },
+          year_to: { type: 'number', description: 'Optional upper bound for publication year.' },
         },
         required: ['query'],
       },
@@ -65,6 +105,25 @@ export const TOOL_DEFINITIONS = [
           output_path: { type: 'string', description: 'Optional relative or absolute output path inside the workspace.' },
         },
         required: ['arxiv_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_web',
+      description:
+        'Search the web through a configured SearXNG instance and return structured results with titles, URLs, snippets, engines, and optional dates.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Web search query, such as "Qwen3.5-35B-A3B github repo" or "browser agents benchmark".' },
+          max_results: { type: 'number', description: 'Maximum number of results to return (default: 5, max: 10).' },
+          categories: { type: 'string', description: 'Optional SearXNG categories, for example "general", "science", "it", or comma-separated values.' },
+          language: { type: 'string', description: 'Optional search language, for example "en" or "ru".' },
+          time_range: { type: 'string', description: 'Optional time range such as "day", "month", or "year".' },
+        },
+        required: ['query'],
       },
     },
   },
@@ -236,7 +295,13 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'write_file':
         return writeFile(args.path, args.content, workspace)
       case 'search_arxiv':
-        return searchArxiv(args.query, args.max_results)
+        return searchArxiv(args.query, args.max_results, args.from_date, args.to_date, args.sort_by, args.sort_order)
+      case 'search_huggingface_papers':
+        return searchHuggingFacePapers(args.query, args.max_results)
+      case 'search_openalex':
+        return searchOpenAlex(args.query, args.max_results, args.year_from, args.year_to)
+      case 'search_web':
+        return searchWeb(args.query, args.max_results, args.categories, args.language, args.time_range)
       case 'download_arxiv_html':
         return downloadArxivHtml(args.arxiv_id, args.output_path, workspace)
       case 'download_arxiv_pdf':
@@ -327,6 +392,14 @@ function normalizeArxivId(input: string): string {
     .replace(/^https?:\/\/arxiv\.org\/pdf\//i, '')
 }
 
+export function getBuiltinToolDefinitions(cfg?: Pick<AppConfig, 'webSearchProvider' | 'searxngBaseUrl'> | null): typeof TOOL_DEFINITIONS {
+  const searchEnabled = shouldEnableWebSearchTool({
+    webSearchProvider: cfg?.webSearchProvider ?? (cfg?.searxngBaseUrl ? 'custom-searxng' : 'disabled'),
+    searxngBaseUrl: cfg?.searxngBaseUrl ?? null,
+  })
+  return TOOL_DEFINITIONS.filter((tool) => tool.function.name !== 'search_web' || searchEnabled)
+}
+
 function escapeXml(text: string): string {
   return text
     .replace(/&lt;/g, '<')
@@ -347,15 +420,110 @@ function extractXmlTags(xml: string, tag: string): string[] {
   return [...xml.matchAll(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'gi'))].map((match) => escapeXml(match[1]))
 }
 
-function searchArxiv(query: string, maxResults?: number): string {
+function clampSearchLimit(maxResults: number | undefined): number {
+  return Math.max(1, Math.min(10, Number(maxResults) || 5))
+}
+
+function formatDateToYmd(date: Date): string {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}${m}${d}`
+}
+
+function detectFreshnessHints(rawQuery: string): {
+  freshness: boolean
+  today: boolean
+  week: boolean
+  month: boolean
+  year: boolean
+} {
+  const q = String(rawQuery ?? '').toLowerCase()
+  const freshness = /(latest|recent|newest|fresh|today|this week|this month|this year|last week|last month|последн|свеж|новейш|сегодня|свежие|за сегодня|за неделю|за месяц|на этой неделе|в этом месяце|в этом году)/.test(q)
+  return {
+    freshness,
+    today: /(today|сегодня|за сегодня)/.test(q),
+    week: /(this week|last week|за неделю|на этой неделе)/.test(q),
+    month: /(this month|last month|за месяц|в этом месяце)/.test(q),
+    year: /(this year|в этом году|за год)/.test(q),
+  }
+}
+
+function inferDateWindow(rawQuery: string): { fromDate: string | null; toDate: string | null; freshness: boolean } {
+  const hints = detectFreshnessHints(rawQuery)
+  const now = new Date()
+  if (hints.today) {
+    const ymd = formatDateToYmd(now)
+    return { fromDate: ymd, toDate: ymd, freshness: true }
+  }
+  if (hints.week) {
+    const from = new Date(now)
+    from.setDate(now.getDate() - 7)
+    return { fromDate: formatDateToYmd(from), toDate: formatDateToYmd(now), freshness: true }
+  }
+  if (hints.month) {
+    const from = new Date(now.getFullYear(), now.getMonth(), 1)
+    return { fromDate: formatDateToYmd(from), toDate: formatDateToYmd(now), freshness: true }
+  }
+  if (hints.year) {
+    const from = new Date(now.getFullYear(), 0, 1)
+    return { fromDate: formatDateToYmd(from), toDate: formatDateToYmd(now), freshness: true }
+  }
+  return { fromDate: null, toDate: null, freshness: hints.freshness }
+}
+
+function isFreshnessOnlyQuery(rawQuery: string): boolean {
+  const stripped = String(rawQuery ?? '')
+    .replace(/latest|recent|newest|fresh|today|this week|this month|this year|last week|last month|papers?|articles?|стат(ьи|ей|ья)|последн\w*|свеж\w*|новейш\w*|сегодня|за сегодня|за неделю|за месяц|на этой неделе|в этом месяце|в этом году/gi, '')
+    .trim()
+  return stripped.length === 0 || !/[a-zа-я0-9]{4,}/i.test(stripped)
+}
+
+function normalizeIsoDate(value: string | undefined): string | null {
+  const trimmed = String(value ?? '').trim()
+  if (!trimmed) return null
+  if (/^\d{8}$/.test(trimmed)) return trimmed
+  const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!match) return null
+  return `${match[1]}${match[2]}${match[3]}`
+}
+
+function searchArxiv(
+  query: string,
+  maxResults?: number,
+  fromDate?: string,
+  toDate?: string,
+  sortBy?: string,
+  sortOrder?: string,
+): string {
   const trimmedQuery = String(query ?? '').trim()
   if (!trimmedQuery) return 'Error: query is required.'
 
-  const limit = Math.max(1, Math.min(10, Number(maxResults) || 5))
+  const limit = clampSearchLimit(maxResults)
+  const inferredWindow = inferDateWindow(trimmedQuery)
+  const freshnessHints = detectFreshnessHints(trimmedQuery)
+  const normalizedFrom = normalizeIsoDate(fromDate) ?? inferredWindow.fromDate
+  const normalizedTo = normalizeIsoDate(toDate) ?? inferredWindow.toDate
+  if (fromDate && !normalizedFrom) return 'Error: from_date must be in YYYY-MM-DD or YYYYMMDD format.'
+  if (toDate && !normalizedTo) return 'Error: to_date must be in YYYY-MM-DD or YYYYMMDD format.'
+
+  const safeSortBy = ['relevance', 'submittedDate', 'lastUpdatedDate'].includes(String(sortBy ?? ''))
+    ? String(sortBy)
+    : inferredWindow.freshness ? 'submittedDate' : 'relevance'
+  const safeSortOrder = ['ascending', 'descending'].includes(String(sortOrder ?? ''))
+    ? String(sortOrder)
+    : 'descending'
+  const dateFilter = (normalizedFrom || normalizedTo)
+    ? ` AND submittedDate:[${normalizedFrom ? normalizedFrom + '0000' : '*'} TO ${normalizedTo ? normalizedTo + '2359' : '*'}]`
+    : ''
   const script = `
 const query = process.argv[1]
 const limit = Number(process.argv[2] || '5')
-const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent('all:' + query) + '&start=0&max_results=' + limit
+const sortBy = process.argv[3] || 'relevance'
+const sortOrder = process.argv[4] || 'descending'
+const dateFilter = process.argv[5] || ''
+const searchQuery = dateFilter ? '(all:' + query + ')' + dateFilter : 'all:' + query
+const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=0&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
 fetch(url, {
   headers: { 'User-Agent': 'one-click-research-agent/0.1' },
 }).then(async (res) => {
@@ -370,7 +538,7 @@ fetch(url, {
 
   let xml = ''
   try {
-    xml = runNodeScript(script, [trimmedQuery, String(limit)])
+    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter])
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e)
     return `Error: failed to search arXiv. ${stderr.trim()}`
@@ -404,7 +572,301 @@ fetch(url, {
     ].join('\n')
   })
 
-  return `Found ${entries.length} arXiv paper(s) for "${trimmedQuery}":\n\n${lines.join('\n\n')}`
+  const filters: string[] = []
+  if (normalizedFrom) filters.push(`from ${normalizedFrom.slice(0, 4)}-${normalizedFrom.slice(4, 6)}-${normalizedFrom.slice(6, 8)}`)
+  if (normalizedTo) filters.push(`to ${normalizedTo.slice(0, 4)}-${normalizedTo.slice(4, 6)}-${normalizedTo.slice(6, 8)}`)
+  filters.push(`sort ${safeSortBy} ${safeSortOrder}`)
+  return `Found ${entries.length} arXiv paper(s) for "${trimmedQuery}" (${filters.join(', ')}):\n\n${lines.join('\n\n')}`
+}
+
+function searchWeb(
+  query: string,
+  maxResults: number | undefined,
+  categories: string | undefined,
+  language: string | undefined,
+  timeRange: string | undefined,
+): string {
+  const trimmedQuery = String(query ?? '').trim()
+  if (!trimmedQuery) return 'Error: query is required.'
+
+  const webSearchCfg = loadWebSearchConfig()
+  let searxngBaseUrl: string | null = null
+  try {
+    searxngBaseUrl = resolveWebSearchBaseUrl(webSearchCfg, true)
+  } catch (e: any) {
+    const message = String(e?.message || e).trim()
+    return `Error: failed to prepare SearXNG backend. ${message}`
+  }
+  if (!searxngBaseUrl) {
+    const status = getWebSearchStatus(webSearchCfg)
+    return `Error: web search is unavailable. ${status.detail}`
+  }
+
+  const inferredWindow = inferDateWindow(trimmedQuery)
+  const freshnessHints = detectFreshnessHints(trimmedQuery)
+  const limit = Math.max(1, Math.min(10, Number(maxResults) || 5))
+  const params = new URLSearchParams({
+    q: trimmedQuery,
+    format: 'json',
+  })
+  if (categories && String(categories).trim()) params.set('categories', String(categories).trim())
+  if (language && String(language).trim()) params.set('language', String(language).trim())
+  const effectiveTimeRange = String(timeRange ?? '').trim()
+    || (freshnessHints.today ? 'day' : freshnessHints.week || freshnessHints.month ? 'month' : freshnessHints.year ? 'year' : '')
+  if (effectiveTimeRange) params.set('time_range', effectiveTimeRange)
+
+  const script = `
+const baseUrl = process.argv[1]
+const queryString = process.argv[2]
+fetch(baseUrl + '/search?' + queryString, {
+  headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
+}).then(async (res) => {
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  const json = await res.json()
+  process.stdout.write(JSON.stringify(json))
+}).catch((err) => {
+  console.error(String(err?.message || err))
+  process.exit(1)
+})
+`
+
+  let payload: any
+  try {
+    const out = runNodeScript(script, [searxngBaseUrl, params.toString()])
+    payload = JSON.parse(out)
+  } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    return `Error: failed to search via SearXNG. ${stderr}`
+  }
+
+  const results = Array.isArray(payload?.results) ? payload.results.slice(0, limit) : []
+  if (results.length === 0) return `No web results found for "${trimmedQuery}".`
+
+  const lines = results.map((entry: any, idx: number) => {
+    const title = String(entry?.title || 'Untitled').trim()
+    const url = String(entry?.url || entry?.link || '').trim()
+    const snippet = String(entry?.content || entry?.snippet || '').replace(/\s+/g, ' ').trim()
+    const engines = Array.isArray(entry?.engines)
+      ? entry.engines.join(', ')
+      : String(entry?.engine || entry?.source || entry?.category || '').trim()
+    const published = String(entry?.publishedDate || entry?.published || entry?.date || '').trim()
+    return [
+      `${idx + 1}. ${title}`,
+      url ? `   URL: ${url}` : null,
+      engines ? `   Engines: ${engines}` : null,
+      published ? `   Published: ${published}` : null,
+      snippet ? `   Snippet: ${snippet}` : null,
+    ].filter(Boolean).join('\n')
+  })
+
+  return `Found ${results.length} web result(s) for "${trimmedQuery}"${effectiveTimeRange ? ` (time_range=${effectiveTimeRange})` : ''}:\n\n${lines.join('\n\n')}`
+}
+
+function searchHuggingFacePapers(query: string, maxResults?: number): string {
+  const trimmedQuery = String(query ?? '').trim()
+  if (!trimmedQuery) return 'Error: query is required.'
+
+  const limit = clampSearchLimit(maxResults)
+  const inferredWindow = inferDateWindow(trimmedQuery)
+  const script = `
+const query = process.argv[1]
+const limit = Number(process.argv[2] || '5')
+const latestMode = process.argv[3] === '1'
+function decodeHtmlText(text) {
+  return String(text || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+}
+function extractObjects(text, limit) {
+  const marker = '{"paper":{"id":"'
+  const out = []
+  let index = 0
+  while (out.length < limit && (index = text.indexOf(marker, index)) !== -1) {
+    let depth = 0
+    let inString = false
+    let escaped = false
+    let end = -1
+    for (let i = index; i < text.length; i++) {
+      const ch = text[i]
+      if (escaped) { escaped = false; continue }
+      if (ch === '\\\\' && inString) { escaped = true; continue }
+      if (ch === '"') { inString = !inString; continue }
+      if (inString) continue
+      if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) { end = i + 1; break }
+      }
+    }
+    if (end <= index) break
+    try {
+      const obj = JSON.parse(text.slice(index, end))
+      if (obj && obj.paper && obj.paper.id) out.push(obj)
+    } catch {}
+    index = end
+  }
+  return out
+}
+const url = latestMode ? 'https://huggingface.co/papers' : 'https://huggingface.co/papers?q=' + encodeURIComponent(query)
+fetch(url, {
+  headers: { 'User-Agent': 'one-click-research-agent/0.1' },
+}).then(async (res) => {
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  const html = decodeHtmlText(await res.text())
+  process.stdout.write(JSON.stringify(extractObjects(html, limit)))
+}).catch((err) => {
+  console.error(String(err?.message || err))
+  process.exit(1)
+})
+`
+
+  let items: any[] = []
+  try {
+    const freshnessOnly = inferredWindow.freshness && isFreshnessOnlyQuery(trimmedQuery)
+    const out = runNodeScript(script, [trimmedQuery, String(limit), freshnessOnly ? '1' : '0'])
+    items = JSON.parse(out)
+  } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    return `Error: failed to search Hugging Face Papers. ${stderr}`
+  }
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return `No Hugging Face Papers results found for "${trimmedQuery}".`
+  }
+
+  const lines = items.slice(0, limit).map((entry: any, idx: number) => {
+    const paper = entry?.paper ?? {}
+    const title = String(entry?.title || paper?.title || 'Untitled').trim()
+    const paperId = String(paper?.id || '').trim()
+    const summary = String(entry?.summary || paper?.summary || '').replace(/\s+/g, ' ').trim()
+    const org = String(entry?.organization?.fullname || entry?.organization?.name || paper?.organization?.fullname || '').trim()
+    const projectPage = String(paper?.projectPage || '').trim()
+    const githubRepo = String(paper?.githubRepo || '').trim()
+    const published = String(entry?.publishedAt || paper?.publishedAt || '').trim()
+    const upvotes = Number.isFinite(Number(paper?.upvotes)) ? String(paper.upvotes) : ''
+    const comments = Number.isFinite(Number(entry?.numComments)) ? String(entry.numComments) : ''
+    const authors = Array.isArray(paper?.authors)
+      ? paper.authors.map((author: any) => String(author?.name || '').trim()).filter(Boolean).slice(0, 8).join(', ')
+      : ''
+    const paperUrl = paperId ? `https://huggingface.co/papers/${paperId}` : ''
+    const arxivUrl = paperId ? `https://arxiv.org/abs/${paperId}` : ''
+    return [
+      `${idx + 1}. ${title}`,
+      paperId ? `   Paper ID: ${paperId}` : null,
+      paperUrl ? `   Hugging Face: ${paperUrl}` : null,
+      arxivUrl ? `   arXiv: ${arxivUrl}` : null,
+      projectPage ? `   Project: ${projectPage}` : null,
+      githubRepo ? `   GitHub: ${githubRepo}` : null,
+      org ? `   Organization: ${org}` : null,
+      authors ? `   Authors: ${authors}` : null,
+      published ? `   Published: ${published}` : null,
+      upvotes ? `   Upvotes: ${upvotes}` : null,
+      comments ? `   Comments: ${comments}` : null,
+      summary ? `   Summary: ${summary}` : null,
+    ].filter(Boolean).join('\n')
+  })
+
+  return `Found ${Math.min(items.length, limit)} Hugging Face Papers result(s) for "${trimmedQuery}":\n\n${lines.join('\n\n')}`
+}
+
+function searchOpenAlex(query: string, maxResults?: number, yearFrom?: number, yearTo?: number): string {
+  const trimmedQuery = String(query ?? '').trim()
+  if (!trimmedQuery) return 'Error: query is required.'
+
+  const limit = clampSearchLimit(maxResults)
+  const inferredWindow = inferDateWindow(trimmedQuery)
+  const inferredMinYear = inferredWindow.fromDate ? Number(inferredWindow.fromDate.slice(0, 4)) : null
+  const inferredMaxYear = inferredWindow.toDate ? Number(inferredWindow.toDate.slice(0, 4)) : null
+  const minYear = Number.isFinite(Number(yearFrom)) ? Math.trunc(Number(yearFrom)) : inferredMinYear
+  const maxYear = Number.isFinite(Number(yearTo)) ? Math.trunc(Number(yearTo)) : inferredMaxYear
+  if (minYear !== null && (minYear < 1900 || minYear > 2100)) return 'Error: year_from must be between 1900 and 2100.'
+  if (maxYear !== null && (maxYear < 1900 || maxYear > 2100)) return 'Error: year_to must be between 1900 and 2100.'
+  if (minYear !== null && maxYear !== null && minYear > maxYear) return 'Error: year_from cannot be greater than year_to.'
+
+  const params = new URLSearchParams()
+  const freshnessOnly = inferredWindow.freshness && isFreshnessOnlyQuery(trimmedQuery)
+  if (!freshnessOnly) params.set('search', trimmedQuery)
+  const filters: string[] = []
+  if (inferredWindow.fromDate) filters.push(`from_publication_date:${inferredWindow.fromDate.slice(0, 4)}-${inferredWindow.fromDate.slice(4, 6)}-${inferredWindow.fromDate.slice(6, 8)}`)
+  else if (minYear !== null) filters.push(`from_publication_date:${minYear}-01-01`)
+  if (inferredWindow.toDate) filters.push(`to_publication_date:${inferredWindow.toDate.slice(0, 4)}-${inferredWindow.toDate.slice(4, 6)}-${inferredWindow.toDate.slice(6, 8)}`)
+  else if (maxYear !== null) filters.push(`to_publication_date:${maxYear}-12-31`)
+  if (filters.length > 0) params.set('filter', filters.join(','))
+  params.set('per_page', String(limit))
+  if (inferredWindow.freshness) params.set('sort', 'publication_date:desc')
+
+  const script = `
+const url = 'https://api.openalex.org/works?' + process.argv[1]
+fetch(url, {
+  headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
+}).then(async (res) => {
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  process.stdout.write(JSON.stringify(await res.json()))
+}).catch((err) => {
+  console.error(String(err?.message || err))
+  process.exit(1)
+})
+`
+
+  let payload: any
+  try {
+    payload = JSON.parse(runNodeScript(script, [params.toString()]))
+  } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    return `Error: failed to search OpenAlex. ${stderr}`
+  }
+
+  const items = Array.isArray(payload?.results) ? payload.results.slice(0, limit) : []
+  if (items.length === 0) return `No OpenAlex papers found for "${trimmedQuery}".`
+
+  const lines = items.map((entry: any, idx: number) => {
+    const title = String(entry?.display_name || entry?.title || 'Untitled').trim()
+    const url = String(entry?.id || '').trim()
+    const doi = String(entry?.doi || '').trim()
+    const landingPage = String(entry?.primary_location?.landing_page_url || '').trim()
+    const openAccessPdf = String(entry?.primary_location?.pdf_url || '').trim()
+    const year = entry?.publication_year ? String(entry.publication_year) : ''
+    const venue = String(entry?.primary_location?.source?.display_name || '').trim()
+    const publicationDate = String(entry?.publication_date || '').trim()
+    const citationCount = Number.isFinite(Number(entry?.cited_by_count)) ? String(entry.cited_by_count) : ''
+    const abstract = entry?.abstract_inverted_index
+      ? Object.entries(entry.abstract_inverted_index as Record<string, number[]>)
+          .flatMap(([word, positions]) => (positions as number[]).map((pos) => [pos, word] as const))
+          .sort((a, b) => a[0] - b[0])
+          .map(([, word]) => word)
+          .join(' ')
+      : ''
+    const authors = Array.isArray(entry?.authorships)
+      ? entry.authorships.map((authorship: any) => String(authorship?.author?.display_name || '').trim()).filter(Boolean).slice(0, 10).join(', ')
+      : ''
+    const fieldsOfStudy = Array.isArray(entry?.concepts)
+      ? entry.concepts.map((concept: any) => String(concept?.display_name || '').trim()).filter(Boolean).slice(0, 6).join(', ')
+      : ''
+    return [
+      `${idx + 1}. ${title}`,
+      year ? `   Year: ${year}` : null,
+      venue ? `   Venue: ${venue}` : null,
+      publicationDate ? `   Published: ${publicationDate}` : null,
+      authors ? `   Authors: ${authors}` : null,
+      citationCount ? `   Citations: ${citationCount}` : null,
+      fieldsOfStudy ? `   Fields: ${fieldsOfStudy}` : null,
+      url ? `   OpenAlex: ${url}` : null,
+      doi ? `   DOI: ${doi}` : null,
+      landingPage ? `   Landing Page: ${landingPage}` : null,
+      openAccessPdf ? `   Open PDF: ${openAccessPdf}` : null,
+      abstract ? `   Abstract: ${abstract.replace(/\s+/g, ' ').trim()}` : null,
+    ].filter(Boolean).join('\n')
+  })
+
+  const filterText = inferredWindow.fromDate || inferredWindow.toDate
+    ? `, dates ${inferredWindow.fromDate ? `${inferredWindow.fromDate.slice(0, 4)}-${inferredWindow.fromDate.slice(4, 6)}-${inferredWindow.fromDate.slice(6, 8)}` : '*'}..${inferredWindow.toDate ? `${inferredWindow.toDate.slice(0, 4)}-${inferredWindow.toDate.slice(4, 6)}-${inferredWindow.toDate.slice(6, 8)}` : '*'}`
+    : minYear !== null || maxYear !== null
+      ? `, years ${minYear ?? '*'}-${maxYear ?? '*'}`
+      : ''
+  return `Found ${items.length} OpenAlex paper(s) for "${trimmedQuery}"${filterText}:\n\n${lines.join('\n\n')}`
 }
 
 function downloadArxivHtml(arxivId: string, outputPath: string | undefined, workspace: string): string {

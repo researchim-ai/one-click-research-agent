@@ -1,23 +1,67 @@
 import { memo, useMemo } from 'react'
 import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ToolCallBlock } from './ToolCallBlock'
 import type { ChatMessage } from '../hooks/useAgent'
+import { normalizeExternalHttpUrl } from '../utils/external-links'
 
 interface Props {
   message: ChatMessage
   onApprove?: (id: string) => void
   onDeny?: (id: string) => void
+  externalLinksEnabled?: boolean
+  onOpenLink?: (url: string) => void
 }
 
 const rehypePlugins = [rehypeHighlight] as any[]
+const remarkPlugins = [remarkGfm] as any[]
 
-const MemoMarkdown = memo(function MemoMarkdown({ content }: { content: string }) {
-  return <Markdown rehypePlugins={rehypePlugins}>{content}</Markdown>
+const MemoMarkdown = memo(function MemoMarkdown({
+  content,
+  externalLinksEnabled,
+  onOpenLink,
+}: {
+  content: string
+  externalLinksEnabled: boolean
+  onOpenLink?: (url: string) => void
+}) {
+  return (
+    <Markdown
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
+      components={{
+        a: ({ href, children }) => {
+          const safeUrl = normalizeExternalHttpUrl(href)
+          if (!safeUrl || !externalLinksEnabled) {
+            return <span className="text-blue-300 underline decoration-dotted">{children}</span>
+          }
+          return (
+            <button
+              type="button"
+              onClick={() => onOpenLink?.(safeUrl)}
+              className="text-blue-300 underline decoration-blue-400/50 underline-offset-2 hover:text-blue-200 cursor-pointer break-all text-left"
+              title={safeUrl}
+            >
+              {children}
+            </button>
+          )
+        },
+      }}
+    >
+      {content}
+    </Markdown>
+  )
 })
 
-export const MessageBubble = memo(function MessageBubble({ message, onApprove, onDeny }: Props) {
+export const MessageBubble = memo(function MessageBubble({
+  message,
+  onApprove,
+  onDeny,
+  externalLinksEnabled = true,
+  onOpenLink,
+}: Props) {
   if (message.role === 'status') {
     return (
       <div className="text-center text-zinc-600 text-[11px] py-0.5 animate-[fadeIn_0.2s] font-mono">
@@ -68,6 +112,8 @@ export const MessageBubble = memo(function MessageBubble({ message, onApprove, o
               approvalStatus={tc.approvalStatus}
               onApprove={onApprove}
               onDeny={onDeny}
+              externalLinksEnabled={externalLinksEnabled}
+              onOpenLink={onOpenLink}
             />
           ))}
         </div>
@@ -91,7 +137,7 @@ export const MessageBubble = memo(function MessageBubble({ message, onApprove, o
 
       {hasContent && (
         <div className="agent-prose mt-1">
-          <MemoMarkdown content={message.content} />
+          <MemoMarkdown content={message.content} externalLinksEnabled={externalLinksEnabled} onOpenLink={onOpenLink} />
         </div>
       )}
 

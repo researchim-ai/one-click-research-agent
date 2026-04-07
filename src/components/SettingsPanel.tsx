@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
-import type { ModelVariantInfo, ToolInfo, SystemResources, GpuMode } from '../../electron/types'
-import type { AppConfig, CustomTool } from '../../electron/config'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
+import type { ModelVariantInfo, ToolInfo, SystemResources, GpuMode, WebSearchStatus } from '../../electron/types'
+import type { AppConfig, CustomTool, WebSearchProvider } from '../../electron/config'
 import { DEFAULT_PRESET_ID, RESEARCH_PRESETS, type ResearchPresetId } from '../../research-presets'
 
 interface Props {
@@ -53,6 +53,26 @@ function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): 
   return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
 }
 
+function SettingsSection({
+  title,
+  description,
+  children,
+}: {
+  title: string
+  description?: string
+  children: ReactNode
+}) {
+  return (
+    <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+      <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-950/50">
+        <div className="text-sm font-medium text-zinc-200">{title}</div>
+        {description && <div className="text-[11px] text-zinc-500 mt-1">{description}</div>}
+      </div>
+      <div className="p-4">{children}</div>
+    </section>
+  )
+}
+
 export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const [tab, setTab] = useState<Tab>('model')
   const [cfg, setCfg] = useState<AppConfig | null>(null)
@@ -76,6 +96,10 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const [approvalForFileOps, setApprovalForFileOps] = useState(true)
   const [approvalForCommands, setApprovalForCommands] = useState(true)
   const [selectedPreset, setSelectedPreset] = useState<ResearchPresetId>(DEFAULT_PRESET_ID)
+  const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
+  const [webSearchProvider, setWebSearchProvider] = useState<WebSearchProvider>('disabled')
+  const [searxngBaseUrl, setSearxngBaseUrl] = useState('')
+  const [webSearchStatus, setWebSearchStatus] = useState<WebSearchStatus | null>(null)
   const [agentDirty, setAgentDirty] = useState(false)
 
   // Prompts state
@@ -123,6 +147,13 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setApprovalForFileOps(c.approvalForFileOps ?? (c as any).approvalRequired ?? true)
       setApprovalForCommands(c.approvalForCommands ?? (c as any).approvalRequired ?? true)
       setSelectedPreset(c.selectedPreset ?? DEFAULT_PRESET_ID)
+      setExternalLinksEnabled(c.externalLinksEnabled ?? true)
+      setWebSearchProvider(c.webSearchProvider ?? (c.searxngBaseUrl ? 'custom-searxng' : 'disabled'))
+      setSearxngBaseUrl(c.searxngBaseUrl ?? '')
+      setWebSearchStatus(await window.api.getWebSearchStatus({
+        webSearchProvider: c.webSearchProvider ?? (c.searxngBaseUrl ? 'custom-searxng' : 'disabled'),
+        searxngBaseUrl: c.searxngBaseUrl ?? null,
+      }))
       setAgentDirty(false)
 
       setSysPrompt(p.systemPrompt ?? p.defaultSystemPrompt)
@@ -141,6 +172,14 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open, onClose])
+
+  useEffect(() => {
+    if (!open) return
+    window.api.getWebSearchStatus({
+      webSearchProvider,
+      searxngBaseUrl: searxngBaseUrl.trim() || null,
+    }).then(setWebSearchStatus).catch(() => {})
+  }, [open, webSearchProvider, searxngBaseUrl])
 
   if (!open || !cfg) return null
 
@@ -266,6 +305,13 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setMaxEmptyRetries(c.maxEmptyRetries ?? 3)
       setApprovalForFileOps(c.approvalForFileOps ?? true)
       setApprovalForCommands(c.approvalForCommands ?? true)
+      setExternalLinksEnabled(c.externalLinksEnabled ?? true)
+      setWebSearchProvider(c.webSearchProvider ?? (c.searxngBaseUrl ? 'custom-searxng' : 'disabled'))
+      setSearxngBaseUrl(c.searxngBaseUrl ?? '')
+      setWebSearchStatus(await window.api.getWebSearchStatus({
+        webSearchProvider: c.webSearchProvider ?? (c.searxngBaseUrl ? 'custom-searxng' : 'disabled'),
+        searxngBaseUrl: c.searxngBaseUrl ?? null,
+      }))
       setSysPrompt(p.defaultSystemPrompt)
       setSumPrompt(p.defaultSummarizePrompt)
       setDefaultSysPrompt(p.defaultSystemPrompt)
@@ -360,6 +406,10 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
               approvalForFileOps={approvalForFileOps}
               approvalForCommands={approvalForCommands}
               selectedPreset={selectedPreset}
+              externalLinksEnabled={externalLinksEnabled}
+              webSearchProvider={webSearchProvider}
+              searxngBaseUrl={searxngBaseUrl}
+              webSearchStatus={webSearchStatus}
               onChange={(field, value) => {
                 if (field === 'maxIterations') setMaxIterations(value as number)
                 else if (field === 'temperature') setTemperature(value as number)
@@ -368,6 +418,9 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
                 else if (field === 'approvalForFileOps') setApprovalForFileOps(value as boolean)
                 else if (field === 'approvalForCommands') setApprovalForCommands(value as boolean)
                 else if (field === 'selectedPreset') setSelectedPreset(value as ResearchPresetId)
+                else if (field === 'externalLinksEnabled') setExternalLinksEnabled(value as boolean)
+                else if (field === 'webSearchProvider') setWebSearchProvider(value as WebSearchProvider)
+                else if (field === 'searxngBaseUrl') setSearxngBaseUrl(value as string)
                 setAgentDirty(true)
               }}
             />
@@ -419,7 +472,23 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
             </span>
             <button
               onClick={async () => {
-                await window.api.saveConfig({ maxIterations, temperature, idleTimeoutSec, maxEmptyRetries, approvalForFileOps, approvalForCommands, selectedPreset })
+                await window.api.saveConfig({
+                  maxIterations,
+                  temperature,
+                  idleTimeoutSec,
+                  maxEmptyRetries,
+                  approvalForFileOps,
+                  approvalForCommands,
+                  selectedPreset,
+                  externalLinksEnabled,
+                  webSearchProvider,
+                  searxngBaseUrl: searxngBaseUrl.trim() || null,
+                })
+                setTools(await window.api.getTools())
+                setWebSearchStatus(await window.api.getWebSearchStatus({
+                  webSearchProvider,
+                  searxngBaseUrl: searxngBaseUrl.trim() || null,
+                }))
                 setAgentDirty(false)
               }}
               className="px-4 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-500 cursor-pointer transition-colors"
@@ -494,7 +563,10 @@ function ModelTab({
   return (
     <div className="space-y-6">
       {hasMultipleGpus && (
-        <div>
+        <SettingsSection
+          title="GPU и размещение модели"
+          description="Выбери, на какой видеокарте запускать `llama.cpp` и как распределять слои модели."
+        >
           <label className="block text-sm font-medium text-zinc-300 mb-3">Режим GPU</label>
           <div className="flex gap-2 mb-3">
             <button
@@ -544,11 +616,13 @@ function ModelTab({
               ))}
             </div>
           )}
-        </div>
+        </SettingsSection>
       )}
 
-      {/* Quant selection */}
-      <div>
+      <SettingsSection
+        title="Модель и квантизация"
+        description="Здесь выбирается семейство модели, степень квантования и рекомендуемый режим загрузки."
+      >
         <label className="block text-sm font-medium text-zinc-300 mb-3">Квантизация модели</label>
         <div className="space-y-1 max-h-[360px] overflow-y-auto rounded-xl border border-zinc-800 p-1">
           {(() => {
@@ -604,10 +678,12 @@ function ModelTab({
             ))
           })()}
         </div>
-      </div>
+      </SettingsSection>
 
-      {/* Context size */}
-      <div>
+      <SettingsSection
+        title="Контекст"
+        description="Управление длиной контекста для выбранной квантизации. Цвета помогают отличить чистый GPU от гибридного режима GPU+CPU."
+      >
         <label className="block text-sm font-medium text-zinc-300 mb-2">Размер контекста</label>
         <p className="text-xs text-zinc-500 mb-3">
           Рекомендованный максимум для текущей квантизации: {formatCtx(maxCtx)}
@@ -648,7 +724,7 @@ function ModelTab({
             })()
           ))}
         </div>
-      </div>
+      </SettingsSection>
     </div>
   )
 }
@@ -658,7 +734,7 @@ function ModelTab({
 // ---------------------------------------------------------------------------
 
 function AgentTab({
-  maxIterations, temperature, idleTimeoutSec, maxEmptyRetries, approvalForFileOps, approvalForCommands, selectedPreset, onChange,
+  maxIterations, temperature, idleTimeoutSec, maxEmptyRetries, approvalForFileOps, approvalForCommands, selectedPreset, externalLinksEnabled, webSearchProvider, searxngBaseUrl, webSearchStatus, onChange,
 }: {
   maxIterations: number
   temperature: number
@@ -667,13 +743,20 @@ function AgentTab({
   approvalForFileOps: boolean
   approvalForCommands: boolean
   selectedPreset: ResearchPresetId
-  onChange: (field: string, value: number | boolean | ResearchPresetId) => void
+  externalLinksEnabled: boolean
+  webSearchProvider: WebSearchProvider
+  searxngBaseUrl: string
+  webSearchStatus: WebSearchStatus | null
+  onChange: (field: string, value: number | boolean | ResearchPresetId | WebSearchProvider | string) => void
 }) {
   const activePreset = RESEARCH_PRESETS.find((preset) => preset.id === selectedPreset) ?? RESEARCH_PRESETS[0]
 
   return (
     <div className="space-y-5">
-      <div>
+      <SettingsSection
+        title="Режим работы агента"
+        description="Пресет определяет специализацию агента и подмешивает профильные инструкции в системный промпт."
+      >
         <label className="block text-sm font-medium text-zinc-300 mb-2">Режим агента</label>
         <p className="text-xs text-zinc-500 mb-3">
           По умолчанию работает универсальный research-agent. Пресеты усиливают его под конкретные сценарии.
@@ -711,99 +794,207 @@ function AgentTab({
             ))}
           </div>
         </div>
-      </div>
+      </SettingsSection>
 
-      {/* Max iterations */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <label className="text-sm text-zinc-300">Макс. итераций агента</label>
-          <span className="text-sm font-mono text-zinc-400">{maxIterations}</span>
+      <SettingsSection
+        title="Web Search"
+        description="Настройки общего web search через `SearXNG`: локальный managed backend, внешний instance и текущий статус доступности."
+      >
+        <div className="text-sm font-medium text-zinc-200">Web search через SearXNG</div>
+        <p className="text-xs text-zinc-500 mt-1 mb-3">
+          Можно полностью отключить web search, автоматически поднимать локальный `SearXNG` через Docker или использовать уже существующий instance.
+        </p>
+        <div className="space-y-2">
+          {[
+            {
+              id: 'disabled',
+              label: 'Выключено',
+              desc: 'Tool `search_web` скрыт и агент не использует общий web search.',
+            },
+            {
+              id: 'managed-searxng',
+              label: 'Managed local SearXNG',
+              desc: 'Приложение само поднимет локальный контейнер через Docker при первом поиске.',
+            },
+            {
+              id: 'custom-searxng',
+              label: 'Existing SearXNG URL',
+              desc: 'Использовать уже существующий совместимый backend.',
+            },
+          ].map((option) => {
+            const selected = webSearchProvider === option.id
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => onChange('webSearchProvider', option.id)}
+                className={`w-full text-left px-3 py-3 rounded-xl border transition-colors cursor-pointer ${
+                  selected
+                    ? 'border-blue-500/50 bg-blue-500/10'
+                    : 'border-zinc-800 bg-zinc-950/40 hover:border-zinc-700'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-medium text-zinc-200">{option.label}</div>
+                  {selected && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">выбрано</span>}
+                </div>
+                <p className="text-xs text-zinc-500 mt-1">{option.desc}</p>
+              </button>
+            )
+          })}
         </div>
-        <input
-          type="range" min={10} max={500} step={10} value={maxIterations}
-          onChange={(e) => onChange('maxIterations', parseInt(e.target.value))}
-          className="w-full accent-blue-500"
-        />
-        <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-          <span>10</span><span>Сколько шагов агент может сделать за один запрос</span><span>500</span>
+        {webSearchProvider === 'custom-searxng' && (
+          <>
+            <input
+              type="text"
+              value={searxngBaseUrl}
+              onChange={(e) => onChange('searxngBaseUrl', e.target.value)}
+              placeholder="http://127.0.0.1:8080"
+              className="w-full mt-3 px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+            <div className="text-[11px] text-zinc-600 mt-2">
+              Используется endpoint вида `/search?format=json`. Если URL пустой, backend не будет доступен.
+            </div>
+          </>
+        )}
+        <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-950/50 px-3 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-medium text-zinc-300">Статус backend</div>
+            <div className={`text-[11px] ${webSearchStatus?.healthy ? 'text-emerald-400' : 'text-zinc-500'}`}>
+              {webSearchStatus?.healthy ? 'доступен' : 'недоступен'}
+            </div>
+          </div>
+          <div className="text-[11px] text-zinc-500 mt-2">
+            {webSearchStatus?.detail ?? 'Проверка статуса...'}
+          </div>
+          <div className="text-[11px] text-zinc-600 mt-2">
+            Docker: {webSearchStatus?.dockerAvailable ? 'доступен' : 'не найден'}{webSearchStatus?.effectiveBaseUrl ? ` · URL: ${webSearchStatus.effectiveBaseUrl}` : ''}
+          </div>
         </div>
-      </div>
+      </SettingsSection>
 
-      {/* Temperature */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <label className="text-sm text-zinc-300">Температура</label>
-          <span className="text-sm font-mono text-zinc-400">{temperature.toFixed(2)}</span>
+      <SettingsSection
+        title="Поведение интерфейса"
+        description="Локальные UI-опции, влияющие на удобство и безопасность взаимодействия с результатами агента."
+      >
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="text-sm text-zinc-300">Кликабельные внешние ссылки</div>
+            <div className="text-[11px] text-zinc-600 mt-0.5">Разрешить переход по `http/https` ссылкам из ответов агента и показывать предупреждение перед открытием браузера</div>
+          </div>
+          <button
+            onClick={() => onChange('externalLinksEnabled', !externalLinksEnabled)}
+            className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${externalLinksEnabled ? 'bg-blue-600' : 'bg-zinc-700'}`}
+          >
+            <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${externalLinksEnabled ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
+          </button>
         </div>
-        <input
-          type="range" min={0} max={1.5} step={0.05} value={temperature}
-          onChange={(e) => onChange('temperature', parseFloat(e.target.value))}
-          className="w-full accent-blue-500"
-        />
-        <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-          <span>0 (точно)</span><span>Креативность модели</span><span>1.5 (хаотично)</span>
-        </div>
-      </div>
+      </SettingsSection>
 
-      {/* Idle timeout */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <label className="text-sm text-zinc-300">Таймаут бездействия (сек)</label>
-          <span className="text-sm font-mono text-zinc-400">{idleTimeoutSec}с</span>
-        </div>
-        <input
-          type="range" min={15} max={300} step={5} value={idleTimeoutSec}
-          onChange={(e) => onChange('idleTimeoutSec', parseInt(e.target.value))}
-          className="w-full accent-blue-500"
-        />
-        <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-          <span>15с</span><span>Сколько ждать ответа модели без данных</span><span>300с</span>
-        </div>
-      </div>
+      <SettingsSection
+        title="Параметры генерации"
+        description="Ограничения на длину и характер работы агента во время одного запроса."
+      >
+        <div className="space-y-5">
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-sm text-zinc-300">Макс. итераций агента</label>
+              <span className="text-sm font-mono text-zinc-400">{maxIterations}</span>
+            </div>
+            <input
+              type="range" min={10} max={500} step={10} value={maxIterations}
+              onChange={(e) => onChange('maxIterations', parseInt(e.target.value))}
+              className="w-full accent-blue-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+              <span>10</span><span>Сколько шагов агент может сделать за один запрос</span><span>500</span>
+            </div>
+          </div>
 
-      {/* Max empty retries */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <label className="text-sm text-zinc-300">Ретраи при пустом ответе</label>
-          <span className="text-sm font-mono text-zinc-400">{maxEmptyRetries}</span>
+          <div className="pt-1 border-t border-zinc-800">
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-sm text-zinc-300">Температура</label>
+              <span className="text-sm font-mono text-zinc-400">{temperature.toFixed(2)}</span>
+            </div>
+            <input
+              type="range" min={0} max={1.5} step={0.05} value={temperature}
+              onChange={(e) => onChange('temperature', parseFloat(e.target.value))}
+              className="w-full accent-blue-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+              <span>0 (точно)</span><span>Креативность модели</span><span>1.5 (хаотично)</span>
+            </div>
+          </div>
         </div>
-        <input
-          type="range" min={1} max={10} step={1} value={maxEmptyRetries}
-          onChange={(e) => onChange('maxEmptyRetries', parseInt(e.target.value))}
-          className="w-full accent-blue-500"
-        />
-        <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
-          <span>1</span><span>Сколько раз повторять при пустом ответе</span><span>10</span>
-        </div>
-      </div>
+      </SettingsSection>
 
-      {/* Approval: file ops */}
-      <div className="flex items-center justify-between py-2 border-t border-zinc-800">
-        <div>
-          <div className="text-sm text-zinc-300">Подтверждение записи и создания файлов</div>
-          <div className="text-[11px] text-zinc-600 mt-0.5">Спрашивать разрешение на write_file, edit_file, append_file, delete_file, create_directory</div>
-        </div>
-        <button
-          onClick={() => onChange('approvalForFileOps', !approvalForFileOps)}
-          className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${approvalForFileOps ? 'bg-blue-600' : 'bg-zinc-700'}`}
-        >
-          <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${approvalForFileOps ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
-        </button>
-      </div>
+      <SettingsSection
+        title="Надежность выполнения"
+        description="Таймауты и ретраи на случай пустых ответов или зависания модели."
+      >
+        <div className="space-y-5">
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-sm text-zinc-300">Таймаут бездействия (сек)</label>
+              <span className="text-sm font-mono text-zinc-400">{idleTimeoutSec}с</span>
+            </div>
+            <input
+              type="range" min={15} max={300} step={5} value={idleTimeoutSec}
+              onChange={(e) => onChange('idleTimeoutSec', parseInt(e.target.value))}
+              className="w-full accent-blue-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+              <span>15с</span><span>Сколько ждать ответа модели без данных</span><span>300с</span>
+            </div>
+          </div>
 
-      {/* Approval: commands */}
-      <div className="flex items-center justify-between py-2 border-t border-zinc-800">
-        <div>
-          <div className="text-sm text-zinc-300">Подтверждение выполнения команд</div>
-          <div className="text-[11px] text-zinc-600 mt-0.5">Спрашивать разрешение на execute_command (терминал, сборка, тесты и т.д.)</div>
+          <div className="pt-1 border-t border-zinc-800">
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-sm text-zinc-300">Ретраи при пустом ответе</label>
+              <span className="text-sm font-mono text-zinc-400">{maxEmptyRetries}</span>
+            </div>
+            <input
+              type="range" min={1} max={10} step={1} value={maxEmptyRetries}
+              onChange={(e) => onChange('maxEmptyRetries', parseInt(e.target.value))}
+              className="w-full accent-blue-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600 mt-0.5">
+              <span>1</span><span>Сколько раз повторять при пустом ответе</span><span>10</span>
+            </div>
+          </div>
         </div>
-        <button
-          onClick={() => onChange('approvalForCommands', !approvalForCommands)}
-          className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${approvalForCommands ? 'bg-blue-600' : 'bg-zinc-700'}`}
-        >
-          <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${approvalForCommands ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
-        </button>
-      </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title="Подтверждения и безопасность"
+        description="Что агент может делать сразу, а что должен дополнительно согласовать с пользователем."
+      >
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="text-sm text-zinc-300">Подтверждение записи и создания файлов</div>
+            <div className="text-[11px] text-zinc-600 mt-0.5">Спрашивать разрешение на write_file, edit_file, append_file, delete_file, create_directory</div>
+          </div>
+          <button
+            onClick={() => onChange('approvalForFileOps', !approvalForFileOps)}
+            className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${approvalForFileOps ? 'bg-blue-600' : 'bg-zinc-700'}`}
+          >
+            <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${approvalForFileOps ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between py-2 border-t border-zinc-800">
+          <div>
+            <div className="text-sm text-zinc-300">Подтверждение выполнения команд</div>
+            <div className="text-[11px] text-zinc-600 mt-0.5">Спрашивать разрешение на execute_command (терминал, сборка, тесты и т.д.)</div>
+          </div>
+          <button
+            onClick={() => onChange('approvalForCommands', !approvalForCommands)}
+            className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${approvalForCommands ? 'bg-blue-600' : 'bg-zinc-700'}`}
+          >
+            <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${approvalForCommands ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
+          </button>
+        </div>
+      </SettingsSection>
     </div>
   )
 }
@@ -837,9 +1028,10 @@ function ToolsTab({
 
   return (
     <div className="space-y-6">
-      {/* Built-in tools */}
-      <div>
-        <h3 className="text-sm font-medium text-zinc-300 mb-2">Встроенные инструменты</h3>
+      <SettingsSection
+        title="Встроенные инструменты"
+        description="Это базовые возможности приложения. Они управляются системой и показываются здесь для справки."
+      >
         <div className="space-y-1">
           {builtins.map((t) => (
             <div key={t.name} className="px-3 py-2 rounded-lg bg-zinc-900/50 border border-zinc-800/50">
@@ -850,10 +1042,12 @@ function ToolsTab({
             </div>
           ))}
         </div>
-      </div>
+      </SettingsSection>
 
-      {/* Custom tools */}
-      <div>
+      <SettingsSection
+        title="Пользовательские инструменты"
+        description="Собственные команды, которые агент сможет вызывать как отдельные функции."
+      >
         <div className="flex items-center justify-between mb-2">
           <h3 className="text-sm font-medium text-zinc-300">Пользовательские инструменты</h3>
           <button
@@ -900,7 +1094,7 @@ function ToolsTab({
         {editingTool && (
           <ToolEditor tool={editingTool} onSave={onSave} onCancel={onCancelEdit} />
         )}
-      </div>
+      </SettingsSection>
     </div>
   )
 }
@@ -1059,7 +1253,10 @@ function PromptsTab({
 
   return (
     <div className="space-y-6">
-      <div>
+      <SettingsSection
+        title="Системный промпт"
+        description="Главные инструкции для агента: стиль работы, ограничения, приоритеты и общий характер поведения."
+      >
         <div className="flex items-center justify-between mb-2">
           <label className="block text-sm font-medium text-zinc-300">Системный промпт</label>
           {!sysIsDefault && (
@@ -1084,9 +1281,12 @@ function PromptsTab({
         {sysIsDefault && (
           <p className="text-[10px] text-zinc-700 mt-1">Используется промпт по умолчанию</p>
         )}
-      </div>
+      </SettingsSection>
 
-      <div>
+      <SettingsSection
+        title="Промпт суммаризации"
+        description="Используется, когда агенту нужно сжать накопленный контекст и продолжить работу без потери сути."
+      >
         <div className="flex items-center justify-between mb-2">
           <label className="block text-sm font-medium text-zinc-300">Промпт суммаризации</label>
           {!sumIsDefault && (
@@ -1111,7 +1311,7 @@ function PromptsTab({
         {sumIsDefault && (
           <p className="text-[10px] text-zinc-700 mt-1">Используется промпт по умолчанию</p>
         )}
-      </div>
+      </SettingsSection>
     </div>
   )
 }

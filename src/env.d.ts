@@ -6,6 +6,12 @@ interface ElectronAPI {
   getModelVariants(
     override?: Pick<import('../electron/config').AppConfig, 'gpuMode' | 'gpuIndex'>
   ): Promise<import('../electron/types').ModelVariantInfo[]>
+  getWebSearchStatus(
+    override?: Pick<import('../electron/config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
+  ): Promise<import('../electron/types').WebSearchStatus>
+  ensureWebSearch(
+    override?: Pick<import('../electron/config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
+  ): Promise<import('../electron/types').WebSearchStatus>
   selectModelVariant(quant: string): Promise<void>
   getConfig(): Promise<import('../electron/config').AppConfig>
   saveConfig(partial: Partial<import('../electron/config').AppConfig>): Promise<import('../electron/config').AppConfig>
@@ -73,6 +79,7 @@ interface ElectronAPI {
   renameFile(oldPath: string, newPath: string): Promise<void>
   deletePath(targetPath: string): Promise<void>
   copyToClipboard(text: string): Promise<void>
+  openExternalUrl(url: string): Promise<void>
   revealInExplorer(targetPath: string): Promise<void>
   openInTerminalPath(dirPath: string): Promise<string>
 

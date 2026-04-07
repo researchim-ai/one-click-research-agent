@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import type { AppStatus, DownloadProgress, GpuMode, ModelVariantInfo, SystemResources } from '../../electron/types'
+import type { WebSearchProvider } from '../../electron/config'
 
 interface Props {
   status: AppStatus | null
@@ -8,7 +9,7 @@ interface Props {
   onComplete: () => void
 }
 
-type Phase = 'idle' | 'installing' | 'downloading' | 'starting' | 'done' | 'error'
+type Phase = 'idle' | 'installing' | 'search' | 'downloading' | 'starting' | 'done' | 'error'
 
 const DEFAULT_QUANT = 'UD-Q4_K_XL'
 
@@ -65,6 +66,9 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   const [selectedCtx, setSelectedCtx] = useState<number>(32768)
   const [selectedGpuMode, setSelectedGpuMode] = useState<GpuMode>('single')
   const [selectedGpuIndex, setSelectedGpuIndex] = useState<number>(0)
+  const [useSearxngSearch, setUseSearxngSearch] = useState(false)
+  const [savedWebSearchProvider, setSavedWebSearchProvider] = useState<WebSearchProvider>('disabled')
+  const [savedSearxngBaseUrl, setSavedSearxngBaseUrl] = useState<string | null>(null)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [ctxDropdownOpen, setCtxDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
@@ -83,6 +87,10 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
       setVariants(v)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
+      const currentProvider = cfg.webSearchProvider ?? (cfg.searxngBaseUrl ? 'custom-searxng' : 'disabled')
+      setSavedWebSearchProvider(currentProvider)
+      setSavedSearxngBaseUrl(cfg.searxngBaseUrl ?? null)
+      setUseSearxngSearch(currentProvider !== 'disabled')
       const quant = pickQuantForVariants(v, cfg.lastQuant || DEFAULT_QUANT)
       setSelectedQuant(quant)
       window.api.selectModelVariant(quant).catch(() => {})
@@ -184,11 +192,16 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
     setStartTime(Date.now())
 
     try {
+      const nextWebSearchProvider: WebSearchProvider = useSearxngSearch
+        ? (savedWebSearchProvider === 'custom-searxng' && savedSearxngBaseUrl ? 'custom-searxng' : 'managed-searxng')
+        : 'disabled'
+
       await window.api.saveConfig({
         lastQuant: selectedQuant,
         ctxSize: selectedCtx,
         gpuMode: selectedGpuMode,
         gpuIndex: selectedGpuIndex,
+        webSearchProvider: nextWebSearchProvider,
       })
 
       if (!status?.llamaReady) {
@@ -197,6 +210,20 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
         addLog('\u2705 llama-server установлен!')
       } else {
         addLog('\u2705 llama-server уже установлен — пропускаем')
+      }
+
+      if (useSearxngSearch) {
+        setPhase('search')
+        if (nextWebSearchProvider === 'managed-searxng') {
+          addLog('\u{1F50D} Подготавливаем локальный SearXNG через Docker…')
+        } else {
+          addLog('\u{1F50D} Проверяем доступность внешнего SearXNG…')
+        }
+        const webSearchStatus = await window.api.ensureWebSearch({
+          webSearchProvider: nextWebSearchProvider,
+          searxngBaseUrl: savedSearxngBaseUrl,
+        })
+        addLog(`\u2705 Web search готов: ${webSearchStatus.effectiveBaseUrl ?? webSearchStatus.detail}`)
       }
 
       setPhase('downloading')
@@ -249,6 +276,18 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
       done: phase !== 'idle' && phase !== 'installing' && phase !== 'error',
       detail: phase === 'installing' ? buildStatus : null,
     },
+    ...(useSearxngSearch ? [{
+      key: 'search',
+      label: savedWebSearchProvider === 'custom-searxng' && savedSearxngBaseUrl
+        ? 'Проверка SearXNG'
+        : 'Установка SearXNG',
+      desc: savedWebSearchProvider === 'custom-searxng' && savedSearxngBaseUrl
+        ? `Проверка внешнего backend (${savedSearxngBaseUrl})`
+        : 'Локальный managed SearXNG через Docker',
+      active: phase === 'search',
+      done: ['downloading', 'starting', 'done'].includes(phase),
+      detail: phase === 'search' ? 'Подготовка web search backend…' : null,
+    }] : []),
     {
       key: 'download',
       label: 'Скачивание модели',
@@ -343,6 +382,13 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                   <div className="mt-2 flex items-center gap-2">
                     <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
                     <span className="text-xs text-zinc-500">Обычно это занимает менее минуты…</span>
+                  </div>
+                )}
+
+                {step.key === 'search' && step.active && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-xs text-zinc-500">Поднимаем и проверяем backend web search…</span>
                   </div>
                 )}
 
@@ -634,6 +680,20 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 {'\u{1F680}'} Запустить
               </button>
             </div>
+            <label className="mt-4 flex items-start gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 cursor-pointer hover:border-zinc-700 transition-colors">
+              <input
+                type="checkbox"
+                checked={useSearxngSearch}
+                onChange={(e) => setUseSearxngSearch(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-blue-500 accent-blue-500"
+              />
+              <div>
+                <div className="text-sm font-medium text-zinc-200">Использовать web search через SearXNG</div>
+                <div className="text-[11px] text-zinc-500 mt-1">
+                  Если включено, агент получит `search_web`. Для первого запуска будет использоваться локальный managed `SearXNG`, а если у тебя уже сохранен свой URL, он останется использоваться.
+                </div>
+              </div>
+            </label>
             <button
               onClick={onComplete}
               className="w-full mt-3 py-2.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"

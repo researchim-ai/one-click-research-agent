@@ -108,3 +108,12 @@ export interface ToolInfo {
   command?: string
   parameters?: { name: string; description: string; required: boolean }[]
 }
+
+export interface WebSearchStatus {
+  provider: import('./config').WebSearchProvider
+  dockerAvailable: boolean
+  customUrlConfigured: boolean
+  effectiveBaseUrl: string | null
+  healthy: boolean
+  detail: string
+}

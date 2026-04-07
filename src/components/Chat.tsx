@@ -33,6 +33,8 @@ interface Props {
   codeRefs?: CodeReference[]
   onRemoveCodeRef?: (index: number) => void
   contextUsage?: ContextUsage | null
+  externalLinksEnabled?: boolean
+  onOpenExternalLink?: (url: string) => void
 }
 
 export function Chat({
@@ -45,6 +47,8 @@ export function Chat({
   codeRefs = [],
   onRemoveCodeRef,
   contextUsage,
+  externalLinksEnabled = true,
+  onOpenExternalLink,
 }: Props) {
   const [input, setInput] = useState('')
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([])
@@ -262,6 +266,8 @@ export function Chat({
                   message={msg}
                   onApprove={onApproval ? (id) => onApproval(id, true) : undefined}
                   onDeny={onApproval ? (id) => onApproval(id, false) : undefined}
+                  externalLinksEnabled={externalLinksEnabled}
+                  onOpenLink={onOpenExternalLink}
                 />
               </div>
             )

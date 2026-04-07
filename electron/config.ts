@@ -4,6 +4,8 @@ import os from 'os'
 import type { GpuMode } from './types'
 import type { ResearchPresetId } from '../research-presets'
 
+export type WebSearchProvider = 'disabled' | 'managed-searxng' | 'custom-searxng'
+
 export interface CustomTool {
   id: string
   name: string
@@ -19,6 +21,9 @@ export interface AppConfig {
   gpuMode: GpuMode
   gpuIndex: number | null
   selectedPreset: ResearchPresetId
+  externalLinksEnabled: boolean
+  webSearchProvider: WebSearchProvider
+  searxngBaseUrl: string | null
   customTools: CustomTool[]
   systemPrompt: string | null
   summarizePrompt: string | null
@@ -40,6 +45,9 @@ const DEFAULT_CONFIG: AppConfig = {
   gpuMode: 'single',
   gpuIndex: 0,
   selectedPreset: 'universal',
+  externalLinksEnabled: true,
+  webSearchProvider: 'disabled',
+  searxngBaseUrl: null,
   customTools: [],
   systemPrompt: null,
   summarizePrompt: null,
@@ -72,6 +80,9 @@ export function load(): AppConfig {
     const raw = fs.readFileSync(configPath(), 'utf-8')
     const parsed = JSON.parse(raw)
     const loaded = { ...DEFAULT_CONFIG, ...parsed }
+    if (parsed.webSearchProvider === undefined && parsed.searxngBaseUrl) {
+      loaded.webSearchProvider = 'custom-searxng'
+    }
     // Migrate old single approvalRequired to the two new flags
     if (parsed.approvalRequired !== undefined && (parsed.approvalForFileOps === undefined || parsed.approvalForCommands === undefined)) {
       loaded.approvalForFileOps = Boolean(parsed.approvalRequired)

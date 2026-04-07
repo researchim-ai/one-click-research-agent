@@ -1,4 +1,5 @@
 import { useState, memo } from 'react'
+import { ExternalLinkText } from './ExternalLinkText'
 
 interface Props {
   name: string
@@ -8,6 +9,8 @@ interface Props {
   approvalStatus?: 'pending' | 'approved' | 'denied'
   onApprove?: (id: string) => void
   onDeny?: (id: string) => void
+  externalLinksEnabled?: boolean
+  onOpenLink?: (url: string) => void
 }
 
 const TOOL_ICONS: Record<string, string> = {
@@ -42,7 +45,17 @@ function formatArgs(name: string, args: Record<string, unknown>): string {
   }
 }
 
-export const ToolCallBlock = memo(function ToolCallBlock({ name, args, result, approvalId, approvalStatus, onApprove, onDeny }: Props) {
+export const ToolCallBlock = memo(function ToolCallBlock({
+  name,
+  args,
+  result,
+  approvalId,
+  approvalStatus,
+  onApprove,
+  onDeny,
+  externalLinksEnabled = true,
+  onOpenLink,
+}: Props) {
   const [expanded, setExpanded] = useState(false)
   const icon = TOOL_ICONS[name] ?? '◦'
   const brief = formatArgs(name, args)
@@ -100,11 +113,11 @@ export const ToolCallBlock = memo(function ToolCallBlock({ name, args, result, a
             </pre>
           )}
           {result && (
-            <pre className={`px-2.5 py-1.5 text-[11px] whitespace-pre-wrap max-h-60 overflow-y-auto ${
+            <div className={`px-2.5 py-1.5 text-[11px] whitespace-pre-wrap max-h-60 overflow-y-auto ${
               isError ? 'text-red-400/80' : 'text-zinc-500'
             }`}>
-              {result}
-            </pre>
+              <ExternalLinkText text={result} externalLinksEnabled={externalLinksEnabled} onOpenLink={onOpenLink} />
+            </div>
           )}
         </div>
       )}

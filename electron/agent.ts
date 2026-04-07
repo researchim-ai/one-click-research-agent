@@ -1,10 +1,11 @@
-import { TOOL_DEFINITIONS, executeTool, executeCustomTool } from './tools'
+import { getBuiltinToolDefinitions, executeTool, executeCustomTool } from './tools'
 import type { AgentEvent } from './types'
 import type { AppConfig } from './config'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { getWebSearchStatus } from './searxng'
 import { getResearchPresetById } from '../research-presets'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
@@ -148,9 +149,20 @@ export const DEFAULT_SYSTEM_PROMPT = `You are a local-first research agent runni
 - **read_file**: Read documents, notes, configs, source files, logs, or generated artifacts. Use offset/limit for large files.
 - **list_directory**: Understand workspace structure and find relevant folders quickly.
 - **find_files**: Use type="name" for file patterns and type="content" to locate exact text or symbols.
+- **search_arxiv**: Use for arXiv discovery. It supports result limits plus optional date filters and sorting.
+- **search_huggingface_papers**: Use to find Hugging Face paper pages, linked GitHub repos, project pages, and paper summaries.
+- **search_openalex**: Use for broader academic discovery, citation-aware paper search, venues, DOI metadata, and open-access links.
+- **search_web**: Use when a SearXNG backend is configured and you need broad web results beyond arXiv, such as docs, repos, datasets, benchmarks, or project pages.
 - **execute_command**: Use for reproducibility, data extraction, builds, tests, scripts, or repo inspection. Always inspect the result.
 - **write_file / edit_file / append_file**: Use only when the user wants saved outputs such as notes, summaries, scripts, or fixes.
 - **create_directory / delete_file**: Use sparingly and only with a clear purpose.
+
+## Time awareness
+
+- You MUST pay attention to the current date provided in the environment section.
+- For requests like "latest", "recent", "newest", "today", "this week", "this month", "за сегодня", "за неделю", "самые последние", prefer date-aware search instead of plain relevance search.
+- For arXiv freshness requests, prefer \`sort_by=submittedDate\`, \`sort_order=descending\`, and add \`from_date\` / \`to_date\` when the user implies a concrete time window.
+- For broad freshness requests without a precise source, prefer a combination of \`search_web\`, \`search_huggingface_papers\`, and \`search_openalex\`, and explain which source determines the ranking.
 
 ## Output quality
 
@@ -202,6 +214,8 @@ const COMPACT_SYSTEM_PROMPT = `You are a local-first autonomous research agent w
 ## Rules
 - Prefer evidence over speculation
 - Keep outputs structured and concise
+- Use the current date from the environment for freshness-sensitive searches
+- For "latest/recent/today" requests, prefer date-aware sorting and filters over plain relevance
 - Think step by step in <think>...</think> tags
 - Be concise. Respond in the user's language
 - Prefer read_file over shell file reads`
@@ -212,7 +226,9 @@ function getOsInfo(): string {
   const isMac = platform === 'darwin'
   const osName = isWin ? 'Windows' : isMac ? 'macOS' : 'Linux'
   const shell = isWin ? 'PowerShell/cmd' : (process.env.SHELL?.split('/').pop() ?? 'bash')
-  return `\n\n## Environment\n- **OS**: ${osName} (${process.arch})\n- **Shell**: ${shell}\n` +
+  const now = new Date()
+  const isoDate = now.toISOString().slice(0, 10)
+  return `\n\n## Environment\n- **OS**: ${osName} (${process.arch})\n- **Shell**: ${shell}\n- **Today**: ${isoDate}\n` +
     (isWin
       ? '- Use Windows-compatible commands: `dir` instead of `ls`, `type` instead of `cat`, `del` instead of `rm`, `mkdir` (works on both), `move` instead of `mv`, `copy` instead of `cp`\n- Use `\\\\` or `/` for path separators in commands\n- PowerShell commands like `Get-ChildItem`, `Get-Content` also work\n'
       : '- Standard Unix commands available: `ls`, `cat`, `rm`, `mv`, `cp`, `grep`, `find`, etc.\n')
@@ -223,7 +239,15 @@ function getSystemPrompt(): string {
   const preset = getResearchPresetById(cfg.selectedPreset)
   const custom = cfg.systemPrompt
   const base = custom || (ctxTokens() < 16384 ? COMPACT_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT)
-  return base + '\n\n' + preset.promptAddon + getOsInfo()
+  const webSearchStatus = getWebSearchStatus(cfg)
+  const webSearchInfo = webSearchStatus.provider === 'managed-searxng'
+    ? webSearchStatus.dockerAvailable
+      ? '\n## Web Search\n- `search_web` uses a managed local SearXNG backend and can auto-start it on first use.\n'
+      : '\n## Web Search\n- Managed local SearXNG is selected, but Docker is unavailable, so general web search is currently unavailable.\n'
+    : webSearchStatus.provider === 'custom-searxng' && webSearchStatus.effectiveBaseUrl
+      ? `\n## Web Search\n- \`search_web\` is available through the configured SearXNG instance at ${webSearchStatus.effectiveBaseUrl}\n`
+      : '\n## Web Search\n- General web search is currently unavailable.\n'
+  return base + '\n\n' + preset.promptAddon + webSearchInfo + getOsInfo()
 }
 
 function getSummarizePrompt(): string {
@@ -265,7 +289,7 @@ function getAllTools(): any[] {
       },
     },
   }))
-  const all = [...TOOL_DEFINITIONS, ...customDefs]
+  const all = [...getBuiltinToolDefinitions(doGetConfig()), ...customDefs]
   // On small contexts, use compact descriptions to save ~40% tool overhead
   return ctxTokens() < 16384 ? compactToolDefs(all) : all
 }

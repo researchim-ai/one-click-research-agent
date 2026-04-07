@@ -54,7 +54,10 @@ Already implemented:
 - default `Universal Research` mode
 - selectable research presets in the settings panel
 - research-oriented system prompts instead of coding-only defaults
+- web search through `SearXNG` (`search_web`) with `disabled`, `managed local`, and `custom URL` modes
 - arXiv search through `search_arxiv`
+- Hugging Face Papers search through `search_huggingface_papers`
+- academic paper search through `search_openalex`
 - arXiv HTML download through `download_arxiv_html`
 - arXiv PDF download through `download_arxiv_pdf`
 - sidebar refresh after agent file tools, commands, and custom tools
@@ -115,6 +118,30 @@ Typical first-run flow:
 - `Find the best arXiv papers about reinforcement learning`
 - `Compare 5 papers about small language models for agents`
 - `Download HTML versions of the best papers and extract the main claims`
+- `Find a paper, then use web search to locate its GitHub repo and dataset`
+
+## Web Search via SearXNG
+
+The project supports web search through `SearXNG` in two working modes:
+
+- `Managed local SearXNG`: the app auto-starts a local Docker container on first search
+- `Existing SearXNG URL`: use an already running compatible instance
+
+How to enable it:
+
+1. Open `Settings -> Agent`
+2. Find the `Web search via SearXNG` section
+3. Choose one of the modes:
+4. `Managed local SearXNG` for an automatic local Docker-backed backend
+5. or `Existing SearXNG URL` and enter a base URL such as `http://127.0.0.1:8080`
+6. After saving, the agent gets the built-in `search_web` tool when the backend is available
+
+This is useful for:
+
+- finding GitHub / Hugging Face / Papers With Code links
+- locating docs and benchmark pages
+- finding code / dataset links around a paper
+- broad web research outside arXiv
 
 ### Open Source App Analysis
 
@@ -138,6 +165,12 @@ Implemented arXiv tools:
 - `search_arxiv`
 - `download_arxiv_html`
 - `download_arxiv_pdf`
+
+Additional research tools:
+
+- `search_huggingface_papers`
+- `search_openalex`
+- `search_web`
 
 ## Architecture Overview
 

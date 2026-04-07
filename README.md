@@ -56,7 +56,10 @@
 - дефолтный режим `Universal Research`
 - выбор research-пресетов в панели настроек
 - research-oriented системные промпты вместо старых coding-only инструкций
+- web search через `SearXNG` (`search_web`) с режимами `disabled`, `managed local`, `custom URL`
 - поиск arXiv через `search_arxiv`
+- поиск Hugging Face Papers через `search_huggingface_papers`
+- академический поиск через `search_openalex`
 - загрузка arXiv HTML через `download_arxiv_html`
 - загрузка arXiv PDF через `download_arxiv_pdf`
 - автообновление левой панели после file tools, команд и custom tools агента
@@ -117,6 +120,30 @@ npm run package:linux
 - `Найди лучшие arXiv papers по reinforcement learning`
 - `Сравни 5 papers по теме small language models for agents`
 - `Скачай HTML версии лучших статей и выдели основные claims`
+- `Найди paper, а потом через web search найди его GitHub repo и dataset`
+
+## Web Search через SearXNG
+
+Проект поддерживает web search через `SearXNG` в двух рабочих режимах:
+
+- `Managed local SearXNG`: приложение само поднимает локальный контейнер через Docker при первом поиске
+- `Existing SearXNG URL`: используется уже существующий совместимый instance
+
+Как включить:
+
+1. Открой `Settings -> Agent`
+2. Найди блок `Web search через SearXNG`
+3. Выбери один из режимов:
+4. `Managed local SearXNG` для автоматического локального backend через Docker
+5. или `Existing SearXNG URL` и укажи базовый URL, например `http://127.0.0.1:8080`
+6. После сохранения агент получит встроенный tool `search_web`, если backend доступен
+
+Это полезно для:
+
+- поиска GitHub/Hugging Face/Papers With Code ссылок
+- поиска документации и benchmark pages
+- поиска code/dataset links вокруг paper
+- общего web research вне arXiv
 
 ### Open Source App Analysis
 
@@ -140,6 +167,12 @@ npm run package:linux
 - `search_arxiv`
 - `download_arxiv_html`
 - `download_arxiv_pdf`
+
+Дополнительные research-инструменты:
+
+- `search_huggingface_papers`
+- `search_openalex`
+- `search_web`
 
 ## Обзор архитектуры
 

@@ -6,6 +6,12 @@ contextBridge.exposeInMainWorld('api', {
   detectResources: (): Promise<SystemResources> => ipcRenderer.invoke('detect-resources'),
   getModelVariants: (override?: { gpuMode?: import('./types').GpuMode; gpuIndex?: number | null }): Promise<any[]> =>
     ipcRenderer.invoke('get-model-variants', override),
+  getWebSearchStatus: (
+    override?: Pick<import('./config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
+  ): Promise<import('./types').WebSearchStatus> => ipcRenderer.invoke('get-web-search-status', override),
+  ensureWebSearch: (
+    override?: Pick<import('./config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
+  ): Promise<import('./types').WebSearchStatus> => ipcRenderer.invoke('ensure-web-search', override),
   selectModelVariant: (quant: string): Promise<void> => ipcRenderer.invoke('select-model-variant', quant),
   getConfig: (): Promise<any> => ipcRenderer.invoke('get-config'),
   saveConfig: (partial: any): Promise<any> => ipcRenderer.invoke('save-config', partial),
@@ -96,6 +102,7 @@ contextBridge.exposeInMainWorld('api', {
   renameFile: (oldPath: string, newPath: string): Promise<void> => ipcRenderer.invoke('rename-file', oldPath, newPath),
   deletePath: (targetPath: string): Promise<void> => ipcRenderer.invoke('delete-path', targetPath),
   copyToClipboard: (text: string): Promise<void> => ipcRenderer.invoke('copy-to-clipboard', text),
+  openExternalUrl: (url: string): Promise<void> => ipcRenderer.invoke('open-external-url', url),
   revealInExplorer: (targetPath: string): Promise<void> => ipcRenderer.invoke('reveal-in-explorer', targetPath),
   openInTerminalPath: (dirPath: string): Promise<string> => ipcRenderer.invoke('open-in-terminal-path', dirPath),
 

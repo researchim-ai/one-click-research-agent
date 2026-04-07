@@ -13,6 +13,7 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { normalizeExternalHttpUrl } from './utils/external-links'
 
 export function App() {
   const {
@@ -34,6 +35,8 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined)
   const [diffView, setDiffView] = useState<{ filePath: string; original: string; modified: string } | null>(null)
+  const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
+  const [pendingExternalUrl, setPendingExternalUrl] = useState<string | null>(null)
   const [breadcrumbExpandTo, setBreadcrumbExpandTo] = useState<string | null>(null)
   const [fileMenuOpen, setFileMenuOpen] = useState(false)
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
@@ -47,6 +50,13 @@ export function App() {
     if (!fileMenuOpen || !window.api?.getRecentWorkspaces) return
     window.api.getRecentWorkspaces().then(setRecentWorkspaces).catch(() => setRecentWorkspaces([]))
   }, [fileMenuOpen])
+
+  useEffect(() => {
+    if (!window.api?.getConfig) return
+    window.api.getConfig()
+      .then((cfg) => setExternalLinksEnabled(cfg.externalLinksEnabled ?? true))
+      .catch(() => setExternalLinksEnabled(true))
+  }, [settingsOpen])
 
   useEffect(() => {
     if (!fileMenuOpen) return
@@ -141,6 +151,23 @@ export function App() {
     setSetupDone(true)
     pollStatus()
   }
+
+  const requestOpenExternalLink = useCallback((rawUrl: string) => {
+    const safeUrl = normalizeExternalHttpUrl(rawUrl)
+    if (!safeUrl || !externalLinksEnabled) return
+    setPendingExternalUrl(safeUrl)
+  }, [externalLinksEnabled])
+
+  const confirmOpenExternalLink = useCallback(async () => {
+    if (!pendingExternalUrl || !window.api?.openExternalUrl) return
+    try {
+      await window.api.openExternalUrl(pendingExternalUrl)
+    } catch (e: any) {
+      alert('Не удалось открыть ссылку: ' + (e?.message ?? e))
+    } finally {
+      setPendingExternalUrl(null)
+    }
+  }, [pendingExternalUrl])
 
   const toggleTerminal = () => {
     if (!terminalOpen || bottomPanel.collapsed) {
@@ -306,6 +333,40 @@ export function App() {
       )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} initialTab={settingsTab} />
+      {pendingExternalUrl && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/70" onClick={() => setPendingExternalUrl(null)} />
+          <div className="relative w-full max-w-lg rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl">
+            <div className="px-5 py-4 border-b border-zinc-800">
+              <div className="text-base font-semibold text-zinc-100">Открыть внешнюю ссылку?</div>
+              <div className="text-sm text-zinc-500 mt-1">
+                Ссылка будет открыта в браузере вне приложения.
+              </div>
+            </div>
+            <div className="px-5 py-4">
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-300 break-all">
+                {pendingExternalUrl}
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-zinc-800 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingExternalUrl(null)}
+                className="px-4 py-2 text-sm rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer transition-colors"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={confirmOpenExternalLink}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-500 cursor-pointer transition-colors"
+              >
+                Открыть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex flex-1 overflow-hidden">
         {/* File tree sidebar */}
@@ -453,6 +514,8 @@ export function App() {
                   codeRefs={codeRefs}
                   onRemoveCodeRef={removeCodeRef}
                   contextUsage={contextUsage}
+                  externalLinksEnabled={externalLinksEnabled}
+                  onOpenExternalLink={requestOpenExternalLink}
                 />
               </div>
             )}
