@@ -1,0 +1,174 @@
+export interface Source {
+  idx: number
+  title: string
+  url: string
+  authors?: string
+  date?: string
+  sourceTool: string
+  snippet?: string
+}
+
+/**
+ * Per-session tracker that collects sources from search tool results.
+ * Sources survive context compression and are injected into the system
+ * prompt so the agent can reference them with [1], [2], etc.
+ */
+export class SourceTracker {
+  private sources: Source[] = []
+  private urlSet = new Set<string>()
+
+  clear(): void {
+    this.sources = []
+    this.urlSet.clear()
+  }
+
+  add(src: Omit<Source, 'idx'>): number {
+    const url = src.url.trim()
+    if (!url) return -1
+    if (this.urlSet.has(url)) {
+      return this.sources.findIndex((s) => s.url === url)
+    }
+    const idx = this.sources.length + 1
+    this.sources.push({ ...src, idx, url })
+    this.urlSet.add(url)
+    return idx
+  }
+
+  addMany(items: Omit<Source, 'idx'>[]): void {
+    for (const item of items) this.add(item)
+  }
+
+  getAll(): Source[] {
+    return this.sources
+  }
+
+  count(): number {
+    return this.sources.length
+  }
+
+  formatForSystemPrompt(maxChars: number): string {
+    if (this.sources.length === 0) return ''
+    const lines: string[] = ['## Collected Sources\n']
+    let total = lines[0].length
+    for (const s of this.sources) {
+      const line = `[${s.idx}] ${s.title}${s.date ? ` (${s.date})` : ''} — ${s.url}`
+      if (total + line.length + 1 > maxChars) {
+        lines.push(`... and ${this.sources.length - lines.length + 1} more sources`)
+        break
+      }
+      lines.push(line)
+      total += line.length + 1
+    }
+    return lines.join('\n')
+  }
+
+  formatForReport(): string {
+    if (this.sources.length === 0) return ''
+    const lines = this.sources.map((s) => {
+      const parts = [`[${s.idx}]`]
+      if (s.authors) parts.push(s.authors + '.')
+      parts.push(`"${s.title}."`)
+      if (s.date) parts.push(`(${s.date}).`)
+      parts.push(s.url)
+      return parts.join(' ')
+    })
+    return lines.join('\n')
+  }
+}
+
+const trackersBySession = new Map<string, SourceTracker>()
+
+export function getSourceTracker(sessionId: string): SourceTracker {
+  if (!trackersBySession.has(sessionId)) {
+    trackersBySession.set(sessionId, new SourceTracker())
+  }
+  return trackersBySession.get(sessionId)!
+}
+
+export function clearSourceTracker(sessionId: string): void {
+  trackersBySession.delete(sessionId)
+}
+
+// ---------------------------------------------------------------------------
+// Parsing helpers: extract structured sources from search tool result strings
+// ---------------------------------------------------------------------------
+
+export function parseArxivResults(text: string): Omit<Source, 'idx'>[] {
+  const items: Omit<Source, 'idx'>[] = []
+  const blocks = text.split(/\n\n(?=\d+\.\s)/)
+  for (const block of blocks) {
+    const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
+    const url = block.match(/Abstract:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const authors = block.match(/Authors:\s+(.+)/)?.[1]?.trim()
+    const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
+    const summary = block.match(/Summary:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
+    if (title && url) {
+      items.push({ title, url, authors, date, sourceTool: 'search_arxiv', snippet: summary })
+    }
+  }
+  return items
+}
+
+export function parseOpenAlexResults(text: string): Omit<Source, 'idx'>[] {
+  const items: Omit<Source, 'idx'>[] = []
+  const blocks = text.split(/\n\n(?=\d+\.\s)/)
+  for (const block of blocks) {
+    const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
+    const doi = block.match(/DOI:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const landing = block.match(/Landing Page:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const url = doi || landing || block.match(/OpenAlex:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const authors = block.match(/Authors:\s+(.+)/)?.[1]?.trim()
+    const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
+    const abstract = block.match(/Abstract:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
+    if (title && url) {
+      items.push({ title, url, authors, date, sourceTool: 'search_openalex', snippet: abstract })
+    }
+  }
+  return items
+}
+
+export function parseHuggingFaceResults(text: string): Omit<Source, 'idx'>[] {
+  const items: Omit<Source, 'idx'>[] = []
+  const blocks = text.split(/\n\n(?=\d+\.\s)/)
+  for (const block of blocks) {
+    const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
+    const hfUrl = block.match(/Hugging Face:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const arxivUrl = block.match(/arXiv:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const url = hfUrl || arxivUrl
+    const authors = block.match(/Authors:\s+(.+)/)?.[1]?.trim()
+    const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
+    const summary = block.match(/Summary:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
+    if (title && url) {
+      items.push({ title, url, authors, date, sourceTool: 'search_huggingface_papers', snippet: summary })
+    }
+  }
+  return items
+}
+
+export function parseWebResults(text: string): Omit<Source, 'idx'>[] {
+  const items: Omit<Source, 'idx'>[] = []
+  const blocks = text.split(/\n\n(?=\d+\.\s)/)
+  for (const block of blocks) {
+    const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
+    const url = block.match(/URL:\s+(https?:\/\/\S+)/)?.[1]?.trim()
+    const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
+    const snippet = block.match(/Snippet:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
+    if (title && url) {
+      items.push({ title, url, date, sourceTool: 'search_web', snippet })
+    }
+  }
+  return items
+}
+
+const PARSERS: Record<string, (text: string) => Omit<Source, 'idx'>[]> = {
+  search_arxiv: parseArxivResults,
+  search_openalex: parseOpenAlexResults,
+  search_huggingface_papers: parseHuggingFaceResults,
+  search_web: parseWebResults,
+}
+
+export function extractSourcesFromToolResult(toolName: string, result: string): Omit<Source, 'idx'>[] {
+  const parser = PARSERS[toolName]
+  if (!parser) return []
+  try { return parser(result) } catch { return [] }
+}

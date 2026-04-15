@@ -7,6 +7,8 @@ import * as path from 'path'
 import * as os from 'os'
 import { getWebSearchStatus } from './searxng'
 import { getResearchPresetById } from '../research-presets'
+import { getSourceTracker, extractSourcesFromToolResult } from './sources'
+import { loadPriorKnowledge } from './memory'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
 export interface AgentBridge {
@@ -247,7 +249,24 @@ function getSystemPrompt(): string {
     : webSearchStatus.provider === 'custom-searxng' && webSearchStatus.effectiveBaseUrl
       ? `\n## Web Search\n- \`search_web\` is available through the configured SearXNG instance at ${webSearchStatus.effectiveBaseUrl}\n`
       : '\n## Web Search\n- General web search is currently unavailable.\n'
-  return base + '\n\n' + preset.promptAddon + webSearchInfo + getOsInfo()
+  let sourcesBlock = ''
+  let priorKnowledgeBlock = ''
+  try {
+    const session = doGetSession()
+    const tracker = getSourceTracker(session.id)
+    if (tracker.count() > 0) {
+      const maxSourceChars = Math.floor(getMessageBudget() * calibratedRatio * 0.10)
+      sourcesBlock = '\n\n' + tracker.formatForSystemPrompt(maxSourceChars)
+    }
+  } catch {}
+  try {
+    if (workspace) {
+      const maxKnowledgeChars = Math.floor(getMessageBudget() * calibratedRatio * 0.08)
+      const knowledge = loadPriorKnowledge(workspace, maxKnowledgeChars)
+      if (knowledge) priorKnowledgeBlock = '\n\n' + knowledge
+    }
+  } catch {}
+  return base + '\n\n' + preset.promptAddon + webSearchInfo + getOsInfo() + sourcesBlock + priorKnowledgeBlock
 }
 
 function getSummarizePrompt(): string {
@@ -1426,12 +1445,16 @@ interface WorkingMemory {
   filesRead: string[]
   keyFacts: string[]
   lastResults: string[]
+  researchQuestions: string[]
+  hypotheses: string[]
+  searchesDone: string[]
 }
 
 function extractWorkingMemory(msgs: Message[]): WorkingMemory {
   const mem: WorkingMemory = {
     currentTask: '', currentPlan: [], approach: '',
     filesModified: [], filesRead: [], keyFacts: [], lastResults: [],
+    researchQuestions: [], hypotheses: [], searchesDone: [],
   }
   const modifiedFiles = new Set<string>()
   const readFiles = new Set<string>()
@@ -1462,7 +1485,7 @@ function extractWorkingMemory(msgs: Message[]): WorkingMemory {
       }
     }
 
-    // Track files modified and read
+    // Track files modified and read, and search queries
     if (m.role === 'assistant' && m.tool_calls) {
       for (const tc of m.tool_calls) {
         const name = tc.function?.name
@@ -1479,7 +1502,31 @@ function extractWorkingMemory(msgs: Message[]): WorkingMemory {
           if (name === 'read_file' && args.path) {
             readFiles.add(args.path)
           }
+          if (['search_arxiv', 'search_openalex', 'search_huggingface_papers', 'search_web'].includes(name) && args.query) {
+            if (mem.searchesDone.length < 10) {
+              mem.searchesDone.push(`${name.replace('search_', '')}:"${String(args.query).slice(0, 60)}"`)
+            }
+          }
         } catch {}
+      }
+    }
+
+    // Extract research questions and hypotheses from assistant text
+    if (m.role === 'assistant' && m.content && mem.researchQuestions.length < 5) {
+      const text = stripThinking(m.content ?? '')
+      const rqMatches = text.match(/(?:research question|sub-question|подвопрос|вопрос)[\s:]+(.{10,150})/gi)
+      if (rqMatches) {
+        for (const rq of rqMatches.slice(0, 3)) {
+          const cleaned = rq.replace(/^.*?[:]\s*/, '').trim()
+          if (cleaned.length > 10 && mem.researchQuestions.length < 5) mem.researchQuestions.push(cleaned.slice(0, 120))
+        }
+      }
+      const hypMatches = text.match(/(?:hypothesis|hypothes[ei]s|гипотеза)[\s:]+(.{10,150})/gi)
+      if (hypMatches) {
+        for (const h of hypMatches.slice(0, 3)) {
+          const cleaned = h.replace(/^.*?[:]\s*/, '').trim()
+          if (cleaned.length > 10 && mem.hypotheses.length < 3) mem.hypotheses.push(cleaned.slice(0, 120))
+        }
       }
     }
 
@@ -1532,6 +1579,15 @@ function formatWorkingMemory(mem: WorkingMemory): string {
   }
   if (mem.lastResults.length > 0) {
     parts.push(`**Recent results:** ${mem.lastResults.join(' | ')}`)
+  }
+  if (mem.researchQuestions.length > 0) {
+    parts.push(`**Active research questions:**\n${mem.researchQuestions.map((q) => `- ${q}`).join('\n')}`)
+  }
+  if (mem.hypotheses.length > 0) {
+    parts.push(`**Working hypotheses:**\n${mem.hypotheses.map((h) => `- ${h}`).join('\n')}`)
+  }
+  if (mem.searchesDone.length > 0) {
+    parts.push(`**Searches performed (avoid repeating):** ${mem.searchesDone.join(', ')}`)
   }
   return parts.join('\n')
 }
@@ -2038,6 +2094,23 @@ function getProjectContext(ws: string): string {
       ctx += `Type: ${detected.join(', ')}\n`
     }
 
+    // Include .research/ directory contents if it exists
+    const researchDir = path.join(ws, '.research')
+    if (fs.existsSync(researchDir) && fs.statSync(researchDir).isDirectory()) {
+      try {
+        const researchTree = executeTool('list_directory', { path: '.research', depth: 2 }, ws)
+        ctx += `\n## Research workspace (.research/)\n\`\`\`\n${researchTree}\n\`\`\`\n`
+        const planPath = path.join(researchDir, 'plan.md')
+        if (fs.existsSync(planPath)) {
+          const planContent = fs.readFileSync(planPath, 'utf-8').trim()
+          if (planContent) {
+            const planSnippet = planContent.length > 1000 ? planContent.slice(0, 1000) + '\n...' : planContent
+            ctx += `### Research plan\n${planSnippet}\n`
+          }
+        }
+      } catch {}
+    }
+
     projectContextCache = { ws, ctx, ts: Date.now() }
     return budgetTrimProjectContext(ctx)
   } catch {
@@ -2365,15 +2438,21 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           }
 
           let result: string
+          const toolArgs = tc.name === 'generate_report' ? { ...tc.args, session_id: session.id } : tc.args
           if (isCustom) {
             const ct = recoveredCustomTools.find((t: any) => t.name === tc.name)
-            result = ct ? executeCustomTool(ct, tc.args, workspace) : `Error: custom tool "${tc.name}" not found`
+            result = ct ? executeCustomTool(ct, toolArgs, workspace) : `Error: custom tool "${tc.name}" not found`
           } else {
-            result = executeTool(tc.name, tc.args, workspace)
+            result = executeTool(tc.name, toolArgs, workspace)
           }
 
           const uiResult = result.length > 5000 ? result.slice(0, 5000) + '\n… [truncated]' : result
           doEmit( { type: 'tool_result', name: tc.name, result: uiResult })
+
+          try {
+            const sources = extractSourcesFromToolResult(tc.name, result)
+            if (sources.length > 0) getSourceTracker(session.id).addMany(sources)
+          } catch {}
 
           if (shouldNotifyWorkspaceChanged(tc.name, isCustom, result)) {
             invalidateProjectContextCache()
@@ -2526,6 +2605,9 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         consecutiveReReads = 0
       }
 
+      // Inject session_id for generate_report so it can access source tracker
+      if (toolName === 'generate_report') toolArgs = { ...toolArgs, session_id: session.id }
+
       // Request user approval when enabled for file ops or commands (or custom tools)
       let result: string
       const customTools = doGetConfig().customTools
@@ -2547,6 +2629,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       } else {
         result = executeTool(toolName, toolArgs, workspace)
       }
+
+      // Collect sources from search tools
+      try {
+        const sources = extractSourcesFromToolResult(toolName, result)
+        if (sources.length > 0) getSourceTracker(session.id).addMany(sources)
+      } catch {}
 
       // Truncate for UI
       const uiResult = result.length > 5000

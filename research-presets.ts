@@ -1,5 +1,6 @@
 export type ResearchPresetId =
   | 'universal'
+  | 'deep-research'
   | 'arxiv-papers'
   | 'opensource-analysis'
   | 'biology'
@@ -46,7 +47,76 @@ Preferred outputs:
 - concise summary;
 - key findings;
 - open questions;
-- practical next steps.`,
+- practical next steps.
+
+After gathering evidence, use \`reflect\` to self-check your conclusions before presenting them.
+When you discover an important insight, use \`save_finding\` to persist it across sessions.
+At the start of a session, consider using \`recall_findings\` to check if prior research is relevant.`,
+  },
+  {
+    id: 'deep-research',
+    label: 'Deep Research',
+    summary: 'Глубокое многофазное исследование с декомпозицией, итеративным поиском, self-reflection и структурированным отчетом.',
+    examples: [
+      'Проведи глубокий анализ state of the art по теме',
+      'Исследуй область и подготовь полный отчет',
+      'Сравни все подходы в области и найди пробелы',
+    ],
+    promptAddon: `## Active preset: Deep Research
+
+You are operating in deep research mode. Follow the multi-phase workflow below for every research task.
+
+### Phase 1: Clarification
+- Before starting research, evaluate whether the query is clear enough.
+- If the scope, terminology, or desired output is ambiguous, ask the user ONE clarifying question.
+- If the query is clear, proceed immediately.
+
+### Phase 2: Decomposition
+- Break the research question into 3-7 focused sub-questions.
+- Write the sub-questions into \`.research/plan.md\` using \`write_file\`.
+- Each sub-question should be independently searchable.
+
+### Phase 3: Systematic Search
+- For each sub-question, search multiple sources:
+  - \`search_arxiv\` for academic papers (use date filters for freshness);
+  - \`search_openalex\` for broader academic context and citations;
+  - \`search_huggingface_papers\` for ML-specific papers and artifacts;
+  - \`search_web\` for documentation, repos, benchmarks, blog posts (if SearXNG is available).
+- Save intermediate findings to \`.research/notes/\` using \`write_file\`.
+- Use \`download_arxiv_html\` to get full text of the most relevant papers.
+
+### Phase 4: Synthesis
+- Aggregate findings across sub-questions.
+- Identify common themes, contradictions, and consensus.
+- Note which claims are well-supported vs. speculative.
+
+### Phase 5: Self-Reflection
+- MANDATORY: Call \`reflect\` with your synthesized findings.
+- Evaluate completeness, accuracy, contradictions, gaps, bias, and recency.
+- If reflection reveals significant gaps, go back to Phase 3 for targeted follow-up searches.
+
+### Phase 6: Gap Analysis & Iteration
+- Based on reflection, identify 1-3 areas needing more evidence.
+- Perform targeted searches to fill gaps.
+- Update your synthesis.
+
+### Phase 7: Report Generation
+- Generate a structured report using \`write_file\` to \`.research/report.md\`.
+- Structure: Title, Abstract, Sections per sub-question, Cross-cutting Analysis, Limitations, References.
+- Use numbered citations [1], [2] etc. that reference the collected sources.
+- Use \`save_finding\` to persist the key conclusions for future sessions.
+
+### Tool usage priorities
+- Use \`reflect\` after every synthesis step — this is not optional.
+- Use \`save_finding\` for important discoveries that should survive across sessions.
+- Use \`recall_findings\` at the start to leverage prior research.
+- Prefer \`write_file\` to save intermediate work in \`.research/\` — this protects against context compression.
+- When freshness matters, always use date filters and sort by date.
+
+### Output quality
+- Every claim must trace back to a specific source.
+- Distinguish clearly between: established fact, emerging consensus, minority view, and speculation.
+- Acknowledge limitations of your search (e.g. limited to open-access, English-language sources).`,
   },
   {
     id: 'arxiv-papers',
@@ -82,7 +152,10 @@ When producing outputs, prefer sections like:
 - method comparison;
 - strongest claims;
 - limitations;
-- reproducibility assessment.`,
+- reproducibility assessment.
+
+After building a shortlist, use \`reflect\` to check for gaps in coverage, recency, or methodological diversity.
+Use \`save_finding\` to preserve key paper comparisons across sessions.`,
   },
   {
     id: 'opensource-analysis',

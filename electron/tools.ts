@@ -4,6 +4,8 @@ import os from 'os'
 import path from 'path'
 import type { AppConfig, CustomTool } from './config'
 import { getWebSearchStatus, loadWebSearchConfig, resolveWebSearchBaseUrl, shouldEnableWebSearchTool } from './searxng'
+import { saveFinding, recallFindings } from './memory'
+import { getSourceTracker } from './sources'
 
 export const TOOL_DEFINITIONS = [
   {
@@ -124,6 +126,72 @@ export const TOOL_DEFINITIONS = [
           time_range: { type: 'string', description: 'Optional time range such as "day", "month", or "year".' },
         },
         required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reflect',
+      description: 'Critically self-evaluate your current findings and reasoning. Call this after synthesizing search results to check for gaps, contradictions, unsupported claims, and missing perspectives before presenting conclusions to the user.',
+      parameters: {
+        type: 'object',
+        properties: {
+          findings: { type: 'string', description: 'Your current findings or conclusions to evaluate.' },
+          criteria: {
+            type: 'string',
+            description: 'Comma-separated evaluation criteria. Options: completeness, accuracy, contradictions, gaps, bias, recency. Default: all.',
+          },
+        },
+        required: ['findings'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_finding',
+      description: 'Save a key research finding to persistent memory. Findings persist across sessions and can be recalled later. Use this to preserve important conclusions, discovered facts, or insights.',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: 'Short topic title for this finding, e.g. "SOTA protein language models 2025".' },
+          content: { type: 'string', description: 'The finding content — key facts, conclusions, or insights to remember.' },
+          tags: { type: 'string', description: 'Optional comma-separated tags for categorization, e.g. "ml,proteins,survey".' },
+        },
+        required: ['topic', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'recall_findings',
+      description: 'Search persistent memory for previously saved research findings. Returns matching findings from prior sessions ranked by relevance.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query to find relevant past findings.' },
+          max_results: { type: 'number', description: 'Maximum results to return (default: 10, max: 20).' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'generate_report',
+      description: 'Generate a structured research report as a Markdown file. Automatically appends a References section from all sources collected during this session. Use this as the final step of a deep research workflow.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Report title.' },
+          content: { type: 'string', description: 'Full report body in Markdown. Use [1], [2] etc. to cite collected sources — they will be resolved automatically in the References section.' },
+          output_path: { type: 'string', description: 'Output file path relative to workspace (default: .research/report.md).' },
+          session_id: { type: 'string', description: 'Internal: session ID for source tracker. Passed automatically.' },
+        },
+        required: ['title', 'content'],
       },
     },
   },
@@ -320,6 +388,14 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return createDir(args.path, workspace)
       case 'delete_file':
         return deleteFile(args.path, workspace)
+      case 'reflect':
+        return reflectOnFindings(args.findings, args.criteria)
+      case 'save_finding':
+        return saveFinding(workspace, args.topic, args.content, args.tags)
+      case 'recall_findings':
+        return recallFindings(workspace, args.query, args.max_results)
+      case 'generate_report':
+        return generateReport(args.title, args.content, args.output_path, args.session_id, workspace)
       default:
         return `Unknown tool: ${name}`
     }
@@ -486,6 +562,76 @@ function normalizeIsoDate(value: string | undefined): string | null {
   const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/)
   if (!match) return null
   return `${match[1]}${match[2]}${match[3]}`
+}
+
+function generateReport(
+  title: string,
+  content: string,
+  outputPath: string | undefined,
+  sessionId: string | undefined,
+  workspace: string,
+): string {
+  const trimmedTitle = String(title ?? '').trim()
+  if (!trimmedTitle) return 'Error: title is required.'
+  const trimmedContent = String(content ?? '').trim()
+  if (!trimmedContent) return 'Error: content is required.'
+
+  const targetPath = resolvePath(outputPath || '.research/report.md', workspace)
+  assertInWorkspace(targetPath, workspace)
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+
+  let references = ''
+  if (sessionId) {
+    try {
+      const tracker = getSourceTracker(sessionId)
+      const refText = tracker.formatForReport()
+      if (refText) references = `\n\n---\n\n## References\n\n${refText}\n`
+    } catch {}
+  }
+
+  const date = new Date().toISOString().slice(0, 10)
+  const report = `# ${trimmedTitle}\n\n*Generated: ${date}*\n\n${trimmedContent}${references}\n`
+
+  fs.writeFileSync(targetPath, report, 'utf-8')
+  const relPath = path.relative(workspace, targetPath)
+  return `Report saved to ${relPath} (${report.length} chars, ${references ? 'with' : 'without'} references section).`
+}
+
+function reflectOnFindings(findings: string, criteria?: string): string {
+  const trimmed = String(findings ?? '').trim()
+  if (!trimmed) return 'Error: findings text is required.'
+
+  const allCriteria = ['completeness', 'accuracy', 'contradictions', 'gaps', 'bias', 'recency']
+  const requested = criteria
+    ? String(criteria).split(',').map((c) => c.trim().toLowerCase()).filter((c) => allCriteria.includes(c))
+    : allCriteria
+  if (requested.length === 0) requested.push(...allCriteria)
+
+  const checklist: string[] = [
+    '## Self-Reflection Checklist\n',
+    'Evaluate the findings below against each criterion. For each, note whether the findings PASS, NEED IMPROVEMENT, or FAIL, and explain why.\n',
+    `### Findings under review\n${trimmed.slice(0, 2000)}${trimmed.length > 2000 ? '\n...[truncated]' : ''}\n`,
+  ]
+
+  const criteriaDescriptions: Record<string, string> = {
+    completeness: 'Are all aspects of the research question addressed? Are there sub-topics that were not explored?',
+    accuracy: 'Are claims supported by the cited sources? Are there unsupported assertions presented as facts?',
+    contradictions: 'Do any findings contradict each other? Are conflicting viewpoints acknowledged and resolved?',
+    gaps: 'What important information is missing? What follow-up searches or analyses would strengthen the conclusions?',
+    bias: 'Is the evidence one-sided? Are alternative perspectives represented? Is there selection bias in sources?',
+    recency: 'Are the sources up-to-date for this topic? Are there more recent developments that should be included?',
+  }
+
+  for (const c of requested) {
+    checklist.push(`### ${c.charAt(0).toUpperCase() + c.slice(1)}`)
+    checklist.push(`${criteriaDescriptions[c]}\n`)
+    checklist.push(`- [ ] Verdict: ___\n- [ ] Notes: ___\n`)
+  }
+
+  checklist.push('### Action Items')
+  checklist.push('Based on the above evaluation, list specific next steps to improve the research quality before presenting final conclusions.\n')
+
+  return checklist.join('\n')
 }
 
 function searchArxiv(
