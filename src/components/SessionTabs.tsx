@@ -9,6 +9,7 @@ interface Props {
   onSwitch: (id: string) => void
   onDelete: (id: string) => void
   onCollapse: () => void
+  appLanguage?: 'ru' | 'en'
 }
 
 export function SessionTabs({
@@ -19,7 +20,9 @@ export function SessionTabs({
   onSwitch,
   onDelete,
   onCollapse,
+  appLanguage = 'ru',
 }: Props) {
+  const L = appLanguage === 'ru'
   const scrollRef = useRef<HTMLDivElement>(null)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number } | null>(null)
@@ -75,7 +78,7 @@ export function SessionTabs({
                 ${busy && !isActive ? 'opacity-40 cursor-not-allowed' : ''}
               `}
             >
-              <span className="max-w-[120px] truncate">{s.title || 'Новый чат'}</span>
+              <span className="max-w-[120px] truncate">{s.title || (L ? 'Новый чат' : 'New chat')}</span>
               {s.messageCount > 0 && (
                 <span className="text-[9px] text-zinc-600">{s.messageCount}</span>
               )}
@@ -103,14 +106,14 @@ export function SessionTabs({
           onClick={onNew}
           disabled={busy}
           className="w-6 h-6 flex items-center justify-center rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-200 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer text-sm transition-colors"
-          title="Новая сессия"
+          title={L ? 'Новая сессия' : 'New session'}
         >
           +
         </button>
         <button
           onClick={onCollapse}
           className="w-6 h-6 flex items-center justify-center rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-200 cursor-pointer text-xs transition-colors"
-          title="Свернуть чат"
+          title={L ? 'Свернуть чат' : 'Collapse chat'}
         >
           ▶
         </button>
@@ -127,7 +130,7 @@ export function SessionTabs({
             disabled={sessions.length <= 1}
             className="w-full px-3 py-1.5 text-left text-[12px] text-red-400 hover:bg-red-500/10 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
           >
-            Удалить сессию
+            {L ? 'Удалить сессию' : 'Delete session'}
           </button>
         </div>
       )}

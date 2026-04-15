@@ -28,9 +28,10 @@ interface Props {
   original: string
   modified: string
   onClose: () => void
+  appLanguage?: 'ru' | 'en'
 }
 
-export function DiffViewer({ filePath, original, modified, onClose }: Props) {
+export function DiffViewer({ filePath, original, modified, onClose, appLanguage = 'ru' }: Props) {
   const language = useMemo(() => {
     const ext = filePath.split('.').pop()?.toLowerCase() ?? ''
     return MONACO_LANG[ext] ?? ext ?? 'plaintext'
@@ -49,7 +50,7 @@ export function DiffViewer({ filePath, original, modified, onClose }: Props) {
           onClick={onClose}
           className="shrink-0 px-2 py-0.5 rounded hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200"
         >
-          Закрыть
+          {appLanguage === 'ru' ? 'Закрыть' : 'Close'}
         </button>
       </div>
       <div className="flex-1 min-h-0">

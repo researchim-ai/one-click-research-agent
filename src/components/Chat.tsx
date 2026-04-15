@@ -35,6 +35,7 @@ interface Props {
   contextUsage?: ContextUsage | null
   externalLinksEnabled?: boolean
   onOpenExternalLink?: (url: string) => void
+  appLanguage?: 'ru' | 'en'
 }
 
 export function Chat({
@@ -49,7 +50,9 @@ export function Chat({
   contextUsage,
   externalLinksEnabled = true,
   onOpenExternalLink,
+  appLanguage = 'ru',
 }: Props) {
+  const L = appLanguage === 'ru'
   const [input, setInput] = useState('')
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([])
   const [showMention, setShowMention] = useState(false)
@@ -228,23 +231,29 @@ export function Chat({
               <div className="text-5xl mb-4">⚡</div>
               <h2 className="text-2xl font-bold text-zinc-200 mb-2">Research Agent</h2>
               <p className="text-base max-w-md mx-auto leading-relaxed mb-6">
-                Локальный AI-агент для исследования и воспроизведения.<br />
-                Анализирует файлы, документы, репозитории и результаты запусков.
+                {L
+                  ? <>Локальный AI-агент для исследования и воспроизведения.<br />Анализирует файлы, документы, репозитории и результаты запусков.</>
+                  : <>Local AI agent for research and reproduction.<br />Analyzes files, documents, repositories, and run results.</>}
               </p>
               {noWorkspace ? (
                 <div className="inline-flex items-center gap-2 px-4 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-sm text-amber-400">
-                  <span>📁</span> Выбери рабочую директорию в боковой панели
+                  <span>📁</span> {L ? 'Выбери рабочую директорию в боковой панели' : 'Select a working directory in the sidebar'}
                 </div>
               ) : (
                 <div className="space-y-2 text-sm text-zinc-500">
-                  <p>Примеры задач:</p>
+                  <p>{L ? 'Примеры задач:' : 'Example tasks:'}</p>
                   <div className="flex flex-wrap justify-center gap-2">
-                    {[
+                    {(L ? [
                       'Изучи проект и опиши архитектуру',
                       'Собери research brief по теме…',
                       'Сравни несколько подходов и выдели риски',
                       'Попробуй воспроизвести paper или open-source проект',
-                    ].map((ex) => (
+                    ] : [
+                      'Explore the project and describe its architecture',
+                      'Compile a research brief on a topic…',
+                      'Compare several approaches and highlight risks',
+                      'Try to reproduce a paper or open-source project',
+                    ]).map((ex) => (
                       <button
                         key={ex}
                         onClick={() => { setInput(ex); textareaRef.current?.focus() }}
@@ -279,7 +288,7 @@ export function Chat({
       {/* Context usage bar */}
       {contextUsage && (
         <div className="border-t border-zinc-800/40 bg-[#0d1117] px-3 py-1 flex items-center gap-2">
-          <span className="text-[10px] text-zinc-600 shrink-0">Контекст</span>
+          <span className="text-[10px] text-zinc-600 shrink-0">{L ? 'Контекст' : 'Context'}</span>
           <div className="flex-1 h-1.5 bg-zinc-800/80 rounded-full overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-500 ${
@@ -311,13 +320,13 @@ export function Chat({
             <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.2s_infinite]" />
             <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.4s_infinite]" />
           </span>
-          <span className="text-[11px] text-zinc-500">Агент работает…</span>
+          <span className="text-[11px] text-zinc-500">{L ? 'Агент работает…' : 'Agent working…'}</span>
           {onCancel && (
             <button
               onClick={onCancel}
               className="ml-auto px-2.5 py-0.5 rounded-full border border-zinc-700 text-[11px] text-zinc-400 hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 cursor-pointer transition-colors"
             >
-              ⏹ Остановить
+              {L ? '⏹ Остановить' : '⏹ Stop'}
             </button>
           )}
         </div>
@@ -340,7 +349,7 @@ export function Chat({
                     <span className="text-purple-400/50">:</span>
                     <span className="text-purple-200/80">{ref.startLine === ref.endLine ? `L${ref.startLine}` : `L${ref.startLine}–${ref.endLine}`}</span>
                     <span className="text-zinc-600 text-[10px] ml-auto shrink-0">
-                      {ref.endLine - ref.startLine + 1} {pluralLines(ref.endLine - ref.startLine + 1)}
+                      {ref.endLine - ref.startLine + 1} {pluralLines(ref.endLine - ref.startLine + 1, appLanguage)}
                     </span>
                     <span className="text-zinc-600 text-[10px]">{expandedRef === i ? '▾' : '▸'}</span>
                   </button>
@@ -396,7 +405,7 @@ export function Chat({
           {showMention && mentionFiles.length > 0 && (
             <div className="absolute bottom-full left-0 right-0 mx-3 mb-1 bg-zinc-900 border border-zinc-700/60 rounded-lg shadow-xl overflow-hidden z-50 max-h-[240px] overflow-y-auto">
               <div className="px-2.5 py-1.5 text-[10px] text-zinc-500 uppercase tracking-wider border-b border-zinc-800/60">
-                Файлы проекта
+                {L ? 'Файлы проекта' : 'Project files'}
               </div>
               {mentionFiles.map((f, i) => (
                 <button
@@ -423,7 +432,11 @@ export function Chat({
               onChange={(e) => handleInput(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={busy || noWorkspace}
-              placeholder={noWorkspace ? 'Сначала выбери проект ←' : hasAttachments ? 'Добавь описание задачи…' : 'Опиши задачу… @ — прикрепить файл'}
+              placeholder={noWorkspace
+                ? (L ? 'Сначала выбери проект ←' : 'Select a project first ←')
+                : hasAttachments
+                  ? (L ? 'Добавь описание задачи…' : 'Describe the task…')
+                  : (L ? 'Опиши задачу… @ — прикрепить файл' : 'Describe a task… @ — attach file')}
               rows={1}
               className="flex-1 bg-transparent px-3 py-2.5 text-[13px] text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none disabled:opacity-50"
             />
@@ -441,7 +454,8 @@ export function Chat({
   )
 }
 
-function pluralLines(n: number): string {
+function pluralLines(n: number, lang: 'ru' | 'en' = 'ru'): string {
+  if (lang === 'en') return n === 1 ? 'line' : 'lines'
   if (n % 10 === 1 && n % 100 !== 11) return 'строка'
   if ([2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100)) return 'строки'
   return 'строк'

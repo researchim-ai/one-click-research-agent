@@ -127,9 +127,11 @@ interface Props {
   onAfterSave?: () => void
   /** Called when user clicks a directory segment in the path breadcrumb (to expand that dir in the sidebar). */
   onBreadcrumbClick?: (dirPath: string) => void
+  appLanguage?: 'ru' | 'en'
 }
 
-export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCode, onOpenFile, onContentChange, onAfterSave, onBreadcrumbClick }: Props) {
+export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCode, onOpenFile, onContentChange, onAfterSave, onBreadcrumbClick, appLanguage = 'ru' }: Props) {
+  const L = appLanguage === 'ru'
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
   const monacoRef = useRef<typeof import('monaco-editor') | null>(null)
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
@@ -272,7 +274,7 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
 
       editor.addAction({
         id: 'editor.save-file',
-        label: 'Сохранить файл',
+        label: L ? 'Сохранить файл' : 'Save file',
         keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
         run: async () => {
           const content = editor.getModel()?.getValue() ?? ''
@@ -442,7 +444,7 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
 
     if (sel) {
       items.push({
-        label: 'Копировать',
+        label: L ? 'Копировать' : 'Copy',
         icon: '📋',
         shortcut: 'Ctrl+C',
         action: () => window.api?.copyToClipboard(sel),
@@ -452,7 +454,7 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
         if (range) {
           const selectedLines = lines.slice(range.startLine - 1, range.endLine).join('\n')
           items.push({
-            label: `Прикрепить к чату (L${range.startLine}–${range.endLine})`,
+            label: L ? `Прикрепить к чату (L${range.startLine}–${range.endLine})` : `Attach to chat (L${range.startLine}–${range.endLine})`,
             icon: '💬',
             action: () => {
               onAttachCode({
@@ -471,14 +473,14 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
     }
 
     items.push({
-      label: 'Найти (Ctrl+F)',
+      label: L ? 'Найти (Ctrl+F)' : 'Find (Ctrl+F)',
       icon: '🔎',
       shortcut: 'Ctrl+F',
       action: () => editorRef.current?.trigger('keyboard', 'editor.action.startFindAction', {}),
     })
     if (onAfterSave) {
       items.push({
-        label: 'Сохранить (Ctrl+S)',
+        label: L ? 'Сохранить (Ctrl+S)' : 'Save (Ctrl+S)',
         icon: '💾',
         shortcut: 'Ctrl+S',
         action: () => editorRef.current?.getModel() && window.api?.writeFile(file.path, editorRef.current!.getModel()!.getValue()).then(onAfterSave),
@@ -486,29 +488,29 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
     }
     items.push({ label: '', separator: true, action: () => {} })
     items.push({
-      label: 'Выделить всё',
+      label: L ? 'Выделить всё' : 'Select all',
       icon: '▣',
       shortcut: 'Ctrl+A',
       action: () => editorRef.current?.trigger('keyboard', 'editor.action.selectAll', {}),
     })
     items.push({ label: '', separator: true, action: () => {} })
     items.push({
-      label: 'Копировать путь к файлу',
+      label: L ? 'Копировать путь к файлу' : 'Copy file path',
       icon: '📋',
       action: () => window.api?.copyToClipboard(file.path),
     })
     items.push({
-      label: 'Копировать относительный путь',
+      label: L ? 'Копировать относительный путь' : 'Copy relative path',
       icon: '📋',
       action: () => window.api?.copyToClipboard(relPath(file.path)),
     })
     items.push({
-      label: 'Показать в проводнике',
+      label: L ? 'Показать в проводнике' : 'Show in explorer',
       icon: '📂',
       action: () => window.api?.revealInExplorer(file.path),
     })
     return items
-  }, [file, getSelection, getSelectionRange, lines, onAttachCode, onAfterSave, relPath])
+  }, [file, getSelection, getSelectionRange, lines, onAttachCode, onAfterSave, relPath, L])
 
   const monacoLang = MONACO_LANG[file.language] ?? file.language ?? 'plaintext'
 
@@ -580,7 +582,7 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
             fixedOverflowWidgets: true,
             overflowWidgetsDomNode: typeof document !== 'undefined' ? document.body : undefined,
           }}
-          loading={<div className="flex items-center justify-center h-full bg-[#0d1117] text-zinc-500">Загрузка редактора…</div>}
+          loading={<div className="flex items-center justify-center h-full bg-[#0d1117] text-zinc-500">{L ? 'Загрузка редактора…' : 'Loading editor…'}</div>}
         />
       </div>
 
@@ -588,10 +590,10 @@ export const CodeEditor = memo(function CodeEditor({ file, workspace, onAttachCo
         <span>{file.language}</span>
         <span>{file.lines} lines</span>
         <span>{formatSize(file.size)}</span>
-        {onOpenFile && <span className="text-zinc-600 text-[10px]">Ctrl+Click по импорту — открыть файл</span>}
-        {TS_JS_LANGS.includes(file.language) && <span className="text-zinc-600 text-[10px]">Ctrl+Click — подсказка</span>}
-        {file.language === PYTHON_LANG && <span className="text-zinc-600 text-[10px]">Ctrl+Click по импорту — в определение</span>}
-        {onAfterSave && <span className="text-zinc-600 text-[10px]">Ctrl+S — сохранить</span>}
+        {onOpenFile && <span className="text-zinc-600 text-[10px]">{L ? 'Ctrl+Click по импорту — открыть файл' : 'Ctrl+Click on import — open file'}</span>}
+        {TS_JS_LANGS.includes(file.language) && <span className="text-zinc-600 text-[10px]">{L ? 'Ctrl+Click — подсказка' : 'Ctrl+Click — hint'}</span>}
+        {file.language === PYTHON_LANG && <span className="text-zinc-600 text-[10px]">{L ? 'Ctrl+Click по импорту — в определение' : 'Ctrl+Click on import — go to definition'}</span>}
+        {onAfterSave && <span className="text-zinc-600 text-[10px]">{L ? 'Ctrl+S — сохранить' : 'Ctrl+S — save'}</span>}
         <span className="ml-auto">UTF-8</span>
       </div>
 

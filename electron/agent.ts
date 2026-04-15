@@ -180,7 +180,7 @@ export const DEFAULT_SYSTEM_PROMPT = `You are a local-first research agent runni
 - Keep the visible answer clean: no \`<think>\` tags.
 - Be concise and practical.
 - Use markdown.
-- Respond in the same language the user writes in.
+- Respond in the language specified in the Environment section.
 - If the task is ambiguous, state your interpretation and proceed conservatively.`
 
 export const DEFAULT_SUMMARIZE_PROMPT = `You are compacting a local research agent's conversation history. Create a STRUCTURED summary so the agent can continue the investigation without losing context.
@@ -230,7 +230,9 @@ function getOsInfo(): string {
   const shell = isWin ? 'PowerShell/cmd' : (process.env.SHELL?.split('/').pop() ?? 'bash')
   const now = new Date()
   const isoDate = now.toISOString().slice(0, 10)
-  return `\n\n## Environment\n- **OS**: ${osName} (${process.arch})\n- **Shell**: ${shell}\n- **Today**: ${isoDate}\n` +
+  const lang = doGetConfig().appLanguage ?? 'ru'
+  const langLabel = lang === 'ru' ? 'Russian (русский)' : 'English'
+  return `\n\n## Environment\n- **OS**: ${osName} (${process.arch})\n- **Shell**: ${shell}\n- **Today**: ${isoDate}\n- **Response language**: ${langLabel} — you MUST respond in this language.\n` +
     (isWin
       ? '- Use Windows-compatible commands: `dir` instead of `ls`, `type` instead of `cat`, `del` instead of `rm`, `mkdir` (works on both), `move` instead of `mv`, `copy` instead of `cp`\n- Use `\\\\` or `/` for path separators in commands\n- PowerShell commands like `Get-ChildItem`, `Get-Content` also work\n'
       : '- Standard Unix commands available: `ls`, `cat`, `rm`, `mv`, `cp`, `grep`, `find`, etc.\n')

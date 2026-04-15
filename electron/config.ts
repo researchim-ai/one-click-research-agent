@@ -5,6 +5,7 @@ import type { GpuMode } from './types'
 import type { ResearchPresetId } from '../research-presets'
 
 export type WebSearchProvider = 'disabled' | 'managed-searxng' | 'custom-searxng'
+export type AppLanguage = 'ru' | 'en'
 
 export interface CustomTool {
   id: string
@@ -24,6 +25,7 @@ export interface AppConfig {
   externalLinksEnabled: boolean
   webSearchProvider: WebSearchProvider
   searxngBaseUrl: string | null
+  appLanguage: AppLanguage
   customTools: CustomTool[]
   systemPrompt: string | null
   summarizePrompt: string | null
@@ -48,6 +50,7 @@ const DEFAULT_CONFIG: AppConfig = {
   externalLinksEnabled: true,
   webSearchProvider: 'disabled',
   searxngBaseUrl: null,
+  appLanguage: 'ru',
   customTools: [],
   systemPrompt: null,
   summarizePrompt: null,

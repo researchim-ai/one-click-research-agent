@@ -7,6 +7,8 @@ interface Props {
   downloadProgress: DownloadProgress | null
   buildStatus: string | null
   onComplete: () => void
+  appLanguage?: 'ru' | 'en'
+  onLanguageChange?: (lang: 'ru' | 'en') => void
 }
 
 type Phase = 'idle' | 'installing' | 'search' | 'downloading' | 'starting' | 'done' | 'error'
@@ -23,8 +25,8 @@ const CTX_OPTIONS = [
   { value: 4096,   label: '4K' },
 ]
 
-function formatSize(mb: number): string {
-  return (mb / 1024).toFixed(1) + ' ГБ'
+function formatSize(mb: number, lang: 'ru' | 'en' = 'ru'): string {
+  return (mb / 1024).toFixed(1) + (lang === 'ru' ? ' ГБ' : ' GB')
 }
 
 function formatCtx(tokens: number): string {
@@ -53,7 +55,8 @@ function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): 
   return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
 }
 
-export function SetupWizard({ status, downloadProgress, buildStatus, onComplete }: Props) {
+export function SetupWizard({ status, downloadProgress, buildStatus, onComplete, appLanguage = 'ru', onLanguageChange }: Props) {
+  const L = appLanguage === 'ru'
   const [phase, setPhase] = useState<Phase>('idle')
   const [error, setError] = useState<string | null>(null)
   const [logs, setLogs] = useState<string[]>([])
@@ -205,46 +208,46 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
       })
 
       if (!status?.llamaReady) {
-        addLog('\u{1F50D} Определение оптимального бинарника для вашей системы…')
+        addLog(L ? '\u{1F50D} Определение оптимального бинарника для вашей системы…' : '\u{1F50D} Detecting optimal binary for your system…')
         await window.api.ensureLlama()
-        addLog('\u2705 llama-server установлен!')
+        addLog(L ? '\u2705 llama-server установлен!' : '\u2705 llama-server installed!')
       } else {
-        addLog('\u2705 llama-server уже установлен — пропускаем')
+        addLog(L ? '\u2705 llama-server уже установлен — пропускаем' : '\u2705 llama-server already installed — skipping')
       }
 
       if (useSearxngSearch) {
         setPhase('search')
         if (nextWebSearchProvider === 'managed-searxng') {
-          addLog('\u{1F50D} Подготавливаем локальный SearXNG через Docker…')
+          addLog(L ? '\u{1F50D} Подготавливаем локальный SearXNG через Docker…' : '\u{1F50D} Preparing local SearXNG via Docker…')
         } else {
-          addLog('\u{1F50D} Проверяем доступность внешнего SearXNG…')
+          addLog(L ? '\u{1F50D} Проверяем доступность внешнего SearXNG…' : '\u{1F50D} Checking external SearXNG availability…')
         }
         const webSearchStatus = await window.api.ensureWebSearch({
           webSearchProvider: nextWebSearchProvider,
           searxngBaseUrl: savedSearxngBaseUrl,
         })
-        addLog(`\u2705 Web search готов: ${webSearchStatus.effectiveBaseUrl ?? webSearchStatus.detail}`)
+        addLog(L ? `\u2705 Web search готов: ${webSearchStatus.effectiveBaseUrl ?? webSearchStatus.detail}` : `\u2705 Web search ready: ${webSearchStatus.effectiveBaseUrl ?? webSearchStatus.detail}`)
       }
 
       setPhase('downloading')
       if (!status?.modelDownloaded) {
-        addLog(`\u{1F4E5} Начинаем скачивание модели (${selectedQuant})…`)
+        addLog(L ? `\u{1F4E5} Начинаем скачивание модели (${selectedQuant})…` : `\u{1F4E5} Starting model download (${selectedQuant})…`)
         const modelPath = await window.api.downloadModel()
-        addLog(`\u2705 Модель скачана: ${modelPath.split(/[\\/]/).pop()}`)
+        addLog(L ? `\u2705 Модель скачана: ${modelPath.split(/[\\/]/).pop()}` : `\u2705 Model downloaded: ${modelPath.split(/[\\/]/).pop()}`)
       } else {
-        addLog('\u2705 Модель уже скачана — пропускаем')
+        addLog(L ? '\u2705 Модель уже скачана — пропускаем' : '\u2705 Model already downloaded — skipping')
       }
 
       setPhase('starting')
-      addLog('\u{1F680} Запускаем llama-server…')
+      addLog(L ? '\u{1F680} Запускаем llama-server…' : '\u{1F680} Starting llama-server…')
       await window.api.startServer()
-      addLog('\u2705 Сервер запущен и готов к работе!')
+      addLog(L ? '\u2705 Сервер запущен и готов к работе!' : '\u2705 Server started and ready!')
 
       setPhase('done')
     } catch (e: any) {
       const msg = e.message ?? String(e)
       setError(msg)
-      addLog(`\u274C Ошибка: ${msg}`)
+      addLog(L ? `\u274C Ошибка: ${msg}` : `\u274C Error: ${msg}`)
       setPhase('error')
     }
   }
@@ -252,14 +255,14 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   const elapsed = startTime ? Math.round((Date.now() - startTime) / 1000) : 0
   const elapsedStr = elapsed > 0 ? `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}` : ''
 
-  const selectedSize = selected ? formatSize(selected.sizeMb) : '~20 ГБ'
+  const selectedSize = selected ? formatSize(selected.sizeMb, appLanguage) : (L ? '~20 ГБ' : '~20 GB')
   const maxCtx = selected?.maxCtx ?? 262144
   const selectableMaxCtx = selected?.selectableMaxCtx ?? maxCtx
   const displayCtx = formatCtx(selectedCtx)
   const availableCtxOptions = CTX_OPTIONS.filter((o) => o.value <= selectableMaxCtx)
   const gpuSummary = hasMultipleGpus
     ? selectedGpuMode === 'split'
-      ? 'все GPU'
+      ? (L ? 'все GPU' : 'all GPUs')
       : selectedGpu
         ? `GPU ${selectedGpu.index}`
         : 'GPU'
@@ -270,8 +273,8 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   const steps = [
     {
       key: 'install',
-      label: 'Скачивание llama-server',
-      desc: 'Готовый бинарник с GitHub Releases (~30–200 МБ)',
+      label: L ? 'Скачивание llama-server' : 'Downloading llama-server',
+      desc: L ? 'Готовый бинарник с GitHub Releases (~30–200 МБ)' : 'Pre-built binary from GitHub Releases (~30–200 MB)',
       active: phase === 'installing',
       done: phase !== 'idle' && phase !== 'installing' && phase !== 'error',
       detail: phase === 'installing' ? buildStatus : null,
@@ -279,18 +282,18 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
     ...(useSearxngSearch ? [{
       key: 'search',
       label: savedWebSearchProvider === 'custom-searxng' && savedSearxngBaseUrl
-        ? 'Проверка SearXNG'
-        : 'Установка SearXNG',
+        ? (L ? 'Проверка SearXNG' : 'Checking SearXNG')
+        : (L ? 'Установка SearXNG' : 'Installing SearXNG'),
       desc: savedWebSearchProvider === 'custom-searxng' && savedSearxngBaseUrl
-        ? `Проверка внешнего backend (${savedSearxngBaseUrl})`
-        : 'Локальный managed SearXNG через Docker',
+        ? (L ? `Проверка внешнего backend (${savedSearxngBaseUrl})` : `Checking external backend (${savedSearxngBaseUrl})`)
+        : (L ? 'Локальный managed SearXNG через Docker' : 'Local managed SearXNG via Docker'),
       active: phase === 'search',
       done: ['downloading', 'starting', 'done'].includes(phase),
-      detail: phase === 'search' ? 'Подготовка web search backend…' : null,
+      detail: phase === 'search' ? (L ? 'Подготовка web search backend…' : 'Preparing web search backend…') : null,
     }] : []),
     {
       key: 'download',
-      label: 'Скачивание модели',
+      label: L ? 'Скачивание модели' : 'Downloading model',
       desc: `Qwen3.5-${selectedQuant.startsWith('9B-') ? '9B' : '35B-A3B'} · ${selectedQuant.replace(/^9B-/, '').replace('UD-', '')} (~${selectedSize}) · ctx ${displayCtx}`,
       active: phase === 'downloading',
       done: ['starting', 'done'].includes(phase),
@@ -298,11 +301,11 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
     },
     {
       key: 'server',
-      label: 'Запуск inference-сервера',
-      desc: 'Загрузка модели в VRAM и старт API',
+      label: L ? 'Запуск inference-сервера' : 'Starting inference server',
+      desc: L ? 'Загрузка модели в VRAM и старт API' : 'Loading model into VRAM and starting API',
       active: phase === 'starting',
       done: phase === 'done',
-      detail: phase === 'starting' ? (buildStatus ?? 'Ожидание готовности…') : null,
+      detail: phase === 'starting' ? (buildStatus ?? (L ? 'Ожидание готовности…' : 'Waiting for readiness…')) : null,
     },
   ]
 
@@ -311,6 +314,22 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
   return (
     <div className="flex-1 flex items-center justify-center p-6 overflow-y-auto">
       <div className="max-w-2xl w-full">
+
+        {/* Language toggle */}
+        <div className="flex justify-end gap-2 mb-3">
+          <button
+            onClick={() => onLanguageChange?.('ru')}
+            className={`px-2.5 py-1 text-xs rounded-lg border transition-colors cursor-pointer ${appLanguage === 'ru' ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : 'border-zinc-700 text-zinc-500 hover:border-zinc-500'}`}
+          >
+            RU
+          </button>
+          <button
+            onClick={() => onLanguageChange?.('en')}
+            className={`px-2.5 py-1 text-xs rounded-lg border transition-colors cursor-pointer ${appLanguage === 'en' ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : 'border-zinc-700 text-zinc-500 hover:border-zinc-500'}`}
+          >
+            EN
+          </button>
+        </div>
 
         {/* Header */}
         <div className="text-center mb-8">
@@ -324,7 +343,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
             <span className="text-zinc-500">{'·'}</span>{' '}
             ctx {displayCtx}
             {gpuSummary && <><span className="text-zinc-500">{' · '}</span>{gpuSummary}</>}
-            <span className="text-zinc-500">{'·'}</span> локально через llama.cpp
+            <span className="text-zinc-500">{'·'}</span> {L ? 'локально через llama.cpp' : 'local via llama.cpp'}
           </p>
         </div>
 
@@ -366,7 +385,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 {step.key === 'download' && step.active && downloadProgress && downloadProgress.totalMb > 0 && (
                   <div className="mt-3">
                     <div className="flex justify-between text-xs text-zinc-500 mb-1">
-                      <span>{downloadProgress.downloadedMb.toLocaleString()} / {downloadProgress.totalMb.toLocaleString()} МБ</span>
+                      <span>{downloadProgress.downloadedMb.toLocaleString()} / {downloadProgress.totalMb.toLocaleString()} {L ? 'МБ' : 'MB'}</span>
                       <span>{downloadProgress.percent.toFixed(1)}%</span>
                     </div>
                     <div className="w-full h-2.5 bg-zinc-800 rounded-full overflow-hidden">
@@ -381,21 +400,21 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 {step.key === 'install' && step.active && (
                   <div className="mt-2 flex items-center gap-2">
                     <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                    <span className="text-xs text-zinc-500">Обычно это занимает менее минуты…</span>
+                    <span className="text-xs text-zinc-500">{L ? 'Обычно это занимает менее минуты…' : 'This usually takes less than a minute…'}</span>
                   </div>
                 )}
 
                 {step.key === 'search' && step.active && (
                   <div className="mt-2 flex items-center gap-2">
                     <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                    <span className="text-xs text-zinc-500">Поднимаем и проверяем backend web search…</span>
+                    <span className="text-xs text-zinc-500">{L ? 'Поднимаем и проверяем backend web search…' : 'Starting and verifying web search backend…'}</span>
                   </div>
                 )}
 
                 {step.key === 'server' && step.active && (
                   <div className="mt-2 flex items-center gap-2">
                     <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                    <span className="text-xs text-zinc-500">Загрузка модели в память…</span>
+                    <span className="text-xs text-zinc-500">{L ? 'Загрузка модели в память…' : 'Loading model into memory…'}</span>
                   </div>
                 )}
               </div>
@@ -406,7 +425,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
         {/* Error */}
         {error && (
           <div className="mb-4 px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
-            <span className="font-semibold">Ошибка:</span> {error}
+            <span className="font-semibold">{L ? 'Ошибка:' : 'Error:'}</span> {error}
           </div>
         )}
 
@@ -414,7 +433,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
         {logs.length > 0 && (
           <div className="mb-6">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-zinc-500 uppercase tracking-wider font-semibold">Лог</span>
+              <span className="text-xs text-zinc-500 uppercase tracking-wider font-semibold">{L ? 'Лог' : 'Log'}</span>
               {elapsedStr && <span className="text-xs text-zinc-600 font-mono">{elapsedStr}</span>}
             </div>
             <div
@@ -449,9 +468,9 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
               <div className="mb-4 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
                 <div className="flex items-center justify-between gap-3 mb-3">
                   <div>
-                    <div className="text-sm font-medium text-zinc-200">Запуск на GPU</div>
+                    <div className="text-sm font-medium text-zinc-200">{L ? 'Запуск на GPU' : 'Run on GPU'}</div>
                     <div className="text-[11px] text-zinc-500 mt-0.5">
-                      Выбери, на какой видеокарте запускать `llama.cpp`
+                      {L ? 'Выбери, на какой видеокарте запускать `llama.cpp`' : 'Choose which GPU to run `llama.cpp` on'}
                     </div>
                   </div>
                   <div className="text-[10px] px-2 py-1 rounded-lg bg-zinc-800 text-zinc-400">
@@ -476,7 +495,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                           : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
                       }`}
                     >
-                      Одна GPU
+                      {L ? 'Одна GPU' : 'Single GPU'}
                     </button>
                     <button
                       onClick={async () => {
@@ -489,7 +508,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                           : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
                       }`}
                     >
-                      Все GPU
+                      {L ? 'Все GPU' : 'All GPUs'}
                     </button>
                   </div>
                 )}
@@ -514,14 +533,14 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                           {selectedGpuIndex === gpu.index && <span className="text-blue-400 text-sm">✓</span>}
                         </div>
                         <div className="text-[11px] text-zinc-500 mt-1">
-                          Свободно {formatSize(gpu.vramFreeMb)} из {formatSize(gpu.vramTotalMb)}
+                          {L ? 'Свободно' : 'Free'} {formatSize(gpu.vramFreeMb, appLanguage)} {L ? 'из' : 'of'} {formatSize(gpu.vramTotalMb, appLanguage)}
                         </div>
                       </button>
                     ))}
                   </div>
                 ) : (
                   <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
-                    Будут использованы все доступные GPU. Этот режим может быть быстрее, но стабильность зависит от драйвера и backend `llama.cpp`.
+                    {L ? 'Будут использованы все доступные GPU. Этот режим может быть быстрее, но стабильность зависит от драйвера и backend `llama.cpp`.' : 'All available GPUs will be used. This mode may be faster, but stability depends on the driver and `llama.cpp` backend.'}
                   </div>
                 )}
               </div>
@@ -548,7 +567,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 {dropdownOpen && variants.length > 0 && (
                   <div className="absolute bottom-full left-0 mb-2 w-[340px] max-h-[400px] overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50 z-50">
                     <div className="px-3 py-2 border-b border-zinc-800">
-                      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">Квантизация модели</span>
+                      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">{L ? 'Квантизация модели' : 'Model quantization'}</span>
                     </div>
                     {[
                       { title: 'Qwen3.5-9B', items: variants.filter((v) => v.quant.startsWith('9B-')) },
@@ -583,7 +602,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                                   </span>
                                   {v.recommended && (
                                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium shrink-0">
-                                      рек.
+                                      {L ? 'рек.' : 'rec.'}
                                     </span>
                                   )}
                                   {isSel && (
@@ -591,9 +610,9 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                                   )}
                                 </div>
                                 <div className={`text-[11px] leading-tight mt-0.5 ${v.fits ? 'text-zinc-500' : 'text-zinc-700'}`}>
-                                  {formatSize(v.sizeMb)}
+                                  {formatSize(v.sizeMb, appLanguage)}
                                   {v.fits && <> {'\u00b7'} ctx {formatCtx(v.maxCtx)} {'\u00b7'} {v.mode === 'full_gpu' ? 'GPU' : v.mode === 'hybrid' ? 'GPU+CPU' : 'CPU'}</>}
-                                  {!v.fits && <> {'\u00b7'} не хватает памяти</>}
+                                  {!v.fits && <> {'\u00b7'} {L ? 'не хватает памяти' : 'not enough memory'}</>}
                                 </div>
                               </div>
                             </button>
@@ -613,7 +632,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-zinc-200 font-medium">{displayCtx}</div>
-                    <div className="text-[11px] text-zinc-500 leading-tight">контекст</div>
+                    <div className="text-[11px] text-zinc-500 leading-tight">{L ? 'контекст' : 'context'}</div>
                   </div>
                   <svg className={`w-3.5 h-3.5 text-zinc-500 shrink-0 transition-transform ${ctxDropdownOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
@@ -623,24 +642,24 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 {ctxDropdownOpen && (
                   <div className="absolute bottom-full left-0 mb-2 w-[160px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50 z-50">
                     <div className="px-3 py-2 border-b border-zinc-800">
-                      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">Контекст</span>
+                      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">{L ? 'Контекст' : 'Context'}</span>
                     </div>
                     {selected && (
                       <div className="px-3 py-2 border-b border-zinc-800 text-[10px] text-zinc-500">
-                        Рекомендовано: {formatCtx(maxCtx)}
+                        {L ? 'Рекомендовано' : 'Recommended'}: {formatCtx(maxCtx)}
                         {selectableMaxCtx > maxCtx && (
                           <>
                             <span className="text-zinc-600"> · </span>
-                            Доступно с offload: {formatCtx(selectableMaxCtx)}
+                            {L ? 'Доступно с offload' : 'Available with offload'}: {formatCtx(selectableMaxCtx)}
                           </>
                         )}
                       </div>
                     )}
                     {selected && selected.fullGpuMaxCtx > 0 && selected.fullGpuMaxCtx < selectableMaxCtx && (
                       <div className="px-3 py-2 border-b border-zinc-800 text-[10px] text-zinc-500">
-                        <span className="text-blue-400">Синий</span> GPU
+                        <span className="text-blue-400">{L ? 'Синий' : 'Blue'}</span> GPU
                         <span className="text-zinc-600"> · </span>
-                        <span className="text-amber-400">Янтарный</span> GPU+CPU
+                        <span className="text-amber-400">{L ? 'Янтарный' : 'Amber'}</span> GPU+CPU
                       </div>
                     )}
                     {availableCtxOptions.map((opt) => (
@@ -677,7 +696,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 onClick={handleStart}
                 className="flex-1 py-4 rounded-xl font-semibold text-base bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white shadow-lg shadow-blue-500/20 hover:shadow-blue-500/30 transition-all cursor-pointer active:scale-[0.98]"
               >
-                {'\u{1F680}'} Запустить
+                {'\u{1F680}'} {L ? 'Запустить' : 'Launch'}
               </button>
             </div>
             <label className="mt-4 flex items-start gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 cursor-pointer hover:border-zinc-700 transition-colors">
@@ -688,9 +707,9 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
                 className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-blue-500 accent-blue-500"
               />
               <div>
-                <div className="text-sm font-medium text-zinc-200">Использовать web search через SearXNG</div>
+                <div className="text-sm font-medium text-zinc-200">{L ? 'Использовать web search через SearXNG' : 'Use web search via SearXNG'}</div>
                 <div className="text-[11px] text-zinc-500 mt-1">
-                  Если включено, агент получит `search_web`. Для первого запуска будет использоваться локальный managed `SearXNG`, а если у тебя уже сохранен свой URL, он останется использоваться.
+                  {L ? 'Если включено, агент получит `search_web`. Для первого запуска будет использоваться локальный managed `SearXNG`, а если у тебя уже сохранен свой URL, он останется использоваться.' : 'When enabled, the agent gets `search_web`. On first launch a local managed `SearXNG` is used; if you already have a saved URL, it will continue to be used.'}
                 </div>
               </div>
             </label>
@@ -698,7 +717,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
               onClick={onComplete}
               className="w-full mt-3 py-2.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
             >
-              Пропустить (если всё уже настроено)
+              {L ? 'Пропустить (если всё уже настроено)' : 'Skip (if already configured)'}
             </button>
           </div>
         )}
@@ -708,7 +727,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
             onClick={onComplete}
             className="w-full py-4 rounded-xl font-semibold text-base bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white shadow-lg shadow-emerald-500/20 transition-all cursor-pointer active:scale-[0.98]"
           >
-            {'\u2728'} Начать работу
+            {'\u2728'} {L ? 'Начать работу' : 'Get started'}
           </button>
         )}
 
@@ -718,20 +737,20 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete 
               onClick={handleStart}
               className="flex-1 py-3 rounded-xl font-semibold text-sm bg-blue-600 hover:bg-blue-500 text-white transition-colors cursor-pointer"
             >
-              {'\u{1F504}'} Попробовать снова
+              {'\u{1F504}'} {L ? 'Попробовать снова' : 'Try again'}
             </button>
             <button
               onClick={onComplete}
               className="flex-1 py-3 rounded-xl font-semibold text-sm bg-zinc-800 border border-zinc-700 hover:border-zinc-500 text-zinc-300 transition-colors cursor-pointer"
             >
-              Пропустить
+              {L ? 'Пропустить' : 'Skip'}
             </button>
           </div>
         )}
 
         {isRunning && (
           <div className="text-center text-xs text-zinc-600 mt-4">
-            Не закрывай окно. {elapsedStr && `Прошло: ${elapsedStr}`}
+            {L ? 'Не закрывай окно.' : "Don't close this window."} {elapsedStr && (L ? `Прошло: ${elapsedStr}` : `Elapsed: ${elapsedStr}`)}
           </div>
         )}
       </div>

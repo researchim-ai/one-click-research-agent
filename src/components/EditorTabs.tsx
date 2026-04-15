@@ -10,6 +10,7 @@ interface Props {
   onClose: (path: string) => void
   onCloseAll?: () => void
   onCloseOthers?: (keepPath: string) => void
+  appLanguage?: 'ru' | 'en'
 }
 
 const EXT_COLORS: Record<string, string> = {
@@ -39,7 +40,8 @@ function LangDot({ language }: { language: string }) {
   return <span className={`text-[8px] ${color}`}>●</span>
 }
 
-export const EditorTabs = memo(function EditorTabs({ files, activeFilePath, workspace, onSelect, onClose, onCloseAll, onCloseOthers }: Props) {
+export const EditorTabs = memo(function EditorTabs({ files, activeFilePath, workspace, onSelect, onClose, onCloseAll, onCloseOthers, appLanguage = 'ru' }: Props) {
+  const L = appLanguage === 'ru'
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; file: OpenFile } | null>(null)
 
   if (files.length === 0) return null
@@ -59,18 +61,18 @@ export const EditorTabs = memo(function EditorTabs({ files, activeFilePath, work
 
   const buildMenu = (file: OpenFile): MenuItem[] => {
     const items: MenuItem[] = [
-      { label: 'Закрыть', icon: '×', shortcut: 'Ctrl+W', action: () => onClose(file.path) },
+      { label: L ? 'Закрыть' : 'Close', icon: '×', shortcut: 'Ctrl+W', action: () => onClose(file.path) },
     ]
     if (onCloseOthers) {
-      items.push({ label: 'Закрыть остальные', icon: '⊘', action: () => onCloseOthers(file.path) })
+      items.push({ label: L ? 'Закрыть остальные' : 'Close others', icon: '⊘', action: () => onCloseOthers(file.path) })
     }
     if (onCloseAll) {
-      items.push({ label: 'Закрыть все', icon: '⊗', action: () => onCloseAll() })
+      items.push({ label: L ? 'Закрыть все' : 'Close all', icon: '⊗', action: () => onCloseAll() })
     }
     items.push({ label: '', separator: true, action: () => {} })
-    items.push({ label: 'Копировать путь', icon: '📋', action: () => window.api.copyToClipboard(file.path) })
-    items.push({ label: 'Копировать относительный путь', icon: '📋', action: () => window.api.copyToClipboard(relPath(file.path)) })
-    items.push({ label: 'Показать в проводнике', icon: '📂', action: () => window.api.revealInExplorer(file.path) })
+    items.push({ label: L ? 'Копировать путь' : 'Copy path', icon: '📋', action: () => window.api.copyToClipboard(file.path) })
+    items.push({ label: L ? 'Копировать относительный путь' : 'Copy relative path', icon: '📋', action: () => window.api.copyToClipboard(relPath(file.path)) })
+    items.push({ label: L ? 'Показать в проводнике' : 'Show in explorer', icon: '📂', action: () => window.api.revealInExplorer(file.path) })
     return items
   }
 
