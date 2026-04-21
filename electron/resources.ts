@@ -1,6 +1,6 @@
 import { execSync } from 'child_process'
 import os from 'os'
-import type { GpuInfo, SystemResources, ServerLaunchArgs, BinarySelection, ModelVariant, ModelVariantInfo, GpuMode } from './types'
+import type { GpuInfo, SystemResources, ServerLaunchArgs, BinarySelection, ModelVariant, ModelVariantInfo, ModelFamily, GpuMode } from './types'
 import { readGGUFMetadata, deriveArchInfo, defaultArchInfo, type ModelArchInfo } from './gguf'
 
 export function detectGpus(): GpuInfo[] {
@@ -164,44 +164,98 @@ export function getArch(): ModelArchInfo {
 // Model variant catalog
 // ---------------------------------------------------------------------------
 
-const REPO_9B = 'unsloth/Qwen3.5-9B-GGUF'
+const REPO_9B   = 'unsloth/Qwen3.5-9B-GGUF'
+const REPO_35B  = 'unsloth/Qwen3.5-35B-A3B-GGUF'
+const REPO_36B  = 'unsloth/Qwen3.6-35B-A3B-GGUF'
+
+export const FAMILY_QWEN35_9B  = 'qwen3.5-9b'
+export const FAMILY_QWEN35_35B = 'qwen3.5-35b'
+export const FAMILY_QWEN36_35B = 'qwen3.6-35b'
+
+export const MODEL_FAMILIES: ModelFamily[] = [
+  {
+    id: FAMILY_QWEN35_9B,
+    label: 'Qwen3.5-9B',
+    description: 'Dense 9B — быстрый, помещается в 16 GB VRAM',
+    repoId: REPO_9B,
+    defaultQuant: '9B-UD-Q4_K_XL',
+    filenameTag: '9b',
+  },
+  {
+    id: FAMILY_QWEN35_35B,
+    label: 'Qwen3.5-35B-A3B',
+    description: 'MoE 35B (A3B) — баланс качества и скорости',
+    repoId: REPO_35B,
+    defaultQuant: 'UD-Q4_K_XL',
+    filenameTag: '3.5-35b',
+    recommended: true,
+  },
+  {
+    id: FAMILY_QWEN36_35B,
+    label: 'Qwen3.6-35B-A3B',
+    description: 'MoE 35B (A3B) — новая ревизия Qwen3.6',
+    repoId: REPO_36B,
+    defaultQuant: '36-UD-Q4_K_XL',
+    filenameTag: '3.6-35b',
+  },
+]
+
+export function getModelFamily(id: string): ModelFamily | null {
+  return MODEL_FAMILIES.find((f) => f.id === id) ?? null
+}
+
+export function getModelFamilyForVariant(variant: ModelVariant): ModelFamily | null {
+  return getModelFamily(variant.family)
+}
 
 export const MODEL_VARIANTS: ModelVariant[] = [
   // --- Qwen3.5-9B (dense, fast, fits on 16 GB) ---
-  { quant: '9B-UD-IQ2_XXS',  bits: 2, label: '9B  IQ2_XXS — минимальный', sizeMb: 3266,  quality: 1,  repoId: REPO_9B },
-  { quant: '9B-UD-IQ2_M',    bits: 2, label: '9B  IQ2_M',                 sizeMb: 3738,  quality: 2,  repoId: REPO_9B },
-  { quant: '9B-UD-IQ3_XXS',  bits: 3, label: '9B  IQ3_XXS',              sizeMb: 4116,  quality: 3,  repoId: REPO_9B },
-  { quant: '9B-UD-Q2_K_XL',  bits: 2, label: '9B  Q2_K_XL',              sizeMb: 4219,  quality: 3,  repoId: REPO_9B },
-  { quant: '9B-UD-Q3_K_XL',  bits: 3, label: '9B  Q3_K_XL',              sizeMb: 5171,  quality: 5,  repoId: REPO_9B },
-  { quant: '9B-UD-Q4_K_XL',  bits: 4, label: '9B  Q4_K_XL — рекоменд.',  sizeMb: 6113,  quality: 7,  repoId: REPO_9B },
-  { quant: '9B-UD-Q5_K_XL',  bits: 5, label: '9B  Q5_K_XL',              sizeMb: 6902,  quality: 8,  repoId: REPO_9B },
-  { quant: '9B-UD-Q6_K_XL',  bits: 6, label: '9B  Q6_K_XL — высокое',    sizeMb: 8971,  quality: 9,  repoId: REPO_9B },
-  { quant: '9B-UD-Q8_K_XL',  bits: 8, label: '9B  Q8_K_XL — максимум',   sizeMb: 11500, quality: 10, repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-IQ2_XXS',  bits: 2, label: '9B  IQ2_XXS — минимальный', sizeMb: 3266,  quality: 1,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-IQ2_M',    bits: 2, label: '9B  IQ2_M',                 sizeMb: 3738,  quality: 2,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-IQ3_XXS',  bits: 3, label: '9B  IQ3_XXS',              sizeMb: 4116,  quality: 3,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q2_K_XL',  bits: 2, label: '9B  Q2_K_XL',              sizeMb: 4219,  quality: 3,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q3_K_XL',  bits: 3, label: '9B  Q3_K_XL',              sizeMb: 5171,  quality: 5,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q4_K_XL',  bits: 4, label: '9B  Q4_K_XL — рекоменд.',  sizeMb: 6113,  quality: 7,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q5_K_XL',  bits: 5, label: '9B  Q5_K_XL',              sizeMb: 6902,  quality: 8,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q6_K_XL',  bits: 6, label: '9B  Q6_K_XL — высокое',    sizeMb: 8971,  quality: 9,  repoId: REPO_9B },
+  { family: FAMILY_QWEN35_9B, quant: '9B-UD-Q8_K_XL',  bits: 8, label: '9B  Q8_K_XL — максимум',   sizeMb: 11500, quality: 10, repoId: REPO_9B },
 
   // --- Qwen3.5-35B-A3B (MoE, мощнее, нужно больше RAM) ---
-  { quant: 'UD-IQ2_XXS',     bits: 2, label: '35B IQ2_XXS — минимальный', sizeMb: 9994,  quality: 11 },
-  { quant: 'UD-Q2_K_XL',     bits: 2, label: '35B Q2_K_XL',              sizeMb: 13210, quality: 12 },
-  { quant: 'UD-IQ3_XXS',     bits: 3, label: '35B IQ3_XXS',              sizeMb: 14438, quality: 13 },
-  { quant: 'UD-IQ3_S',       bits: 3, label: '35B IQ3_S',                sizeMb: 15565, quality: 14 },
-  { quant: 'UD-Q3_K_M',      bits: 3, label: '35B Q3_K_M',               sizeMb: 17101, quality: 15 },
-  { quant: 'UD-Q3_K_XL',     bits: 3, label: '35B Q3_K_XL',              sizeMb: 17613, quality: 15 },
-  { quant: 'UD-Q4_K_M',      bits: 4, label: '35B Q4_K_M — баланс',      sizeMb: 20378, quality: 17 },
-  { quant: 'UD-Q4_K_XL',     bits: 4, label: '35B Q4_K_XL — рекоменд.',   sizeMb: 21094, quality: 18 },
-  { quant: 'UD-Q5_K_XL',     bits: 5, label: '35B Q5_K_XL — высокое',     sizeMb: 25498, quality: 19 },
-  { quant: 'UD-Q6_K_XL',     bits: 6, label: '35B Q6_K_XL',              sizeMb: 31027, quality: 20 },
-  { quant: 'UD-Q8_K_XL',     bits: 8, label: '35B Q8_K_XL — максимум',    sizeMb: 39629, quality: 21 },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-IQ2_XXS',     bits: 2, label: '35B IQ2_XXS — минимальный', sizeMb: 9994,  quality: 11, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q2_K_XL',     bits: 2, label: '35B Q2_K_XL',              sizeMb: 13210, quality: 12, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-IQ3_XXS',     bits: 3, label: '35B IQ3_XXS',              sizeMb: 14438, quality: 13, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-IQ3_S',       bits: 3, label: '35B IQ3_S',                sizeMb: 15565, quality: 14, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q3_K_M',      bits: 3, label: '35B Q3_K_M',               sizeMb: 17101, quality: 15, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q3_K_XL',     bits: 3, label: '35B Q3_K_XL',              sizeMb: 17613, quality: 15, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q4_K_M',      bits: 4, label: '35B Q4_K_M — баланс',      sizeMb: 20378, quality: 17, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q4_K_XL',     bits: 4, label: '35B Q4_K_XL — рекоменд.',   sizeMb: 21094, quality: 18, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q5_K_XL',     bits: 5, label: '35B Q5_K_XL — высокое',     sizeMb: 25498, quality: 19, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q6_K_XL',     bits: 6, label: '35B Q6_K_XL',              sizeMb: 31027, quality: 20, repoId: REPO_35B },
+  { family: FAMILY_QWEN35_35B, quant: 'UD-Q8_K_XL',     bits: 8, label: '35B Q8_K_XL — максимум',    sizeMb: 39629, quality: 21, repoId: REPO_35B },
+
+  // --- Qwen3.6-35B-A3B (новая ревизия той же MoE архитектуры) ---
+  // Sizes are ~identical к соответствующим квантам Qwen3.5-35B-A3B.
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-IQ2_XXS',  bits: 2, label: '35B 3.6 IQ2_XXS — минимальный', sizeMb: 9994,  quality: 11, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-IQ2_M',    bits: 2, label: '35B 3.6 IQ2_M',                 sizeMb: 11600, quality: 12, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q2_K_XL',  bits: 2, label: '35B 3.6 Q2_K_XL',              sizeMb: 13210, quality: 12, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-IQ3_XXS',  bits: 3, label: '35B 3.6 IQ3_XXS',              sizeMb: 14438, quality: 13, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-IQ3_S',    bits: 3, label: '35B 3.6 IQ3_S',                sizeMb: 15565, quality: 14, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q3_K_M',   bits: 3, label: '35B 3.6 Q3_K_M',               sizeMb: 17101, quality: 15, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q3_K_XL',  bits: 3, label: '35B 3.6 Q3_K_XL',              sizeMb: 17613, quality: 15, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q4_K_M',   bits: 4, label: '35B 3.6 Q4_K_M — баланс',      sizeMb: 20378, quality: 17, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q4_K_XL',  bits: 4, label: '35B 3.6 Q4_K_XL — рекоменд.',   sizeMb: 21094, quality: 18, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q5_K_XL',  bits: 5, label: '35B 3.6 Q5_K_XL — высокое',     sizeMb: 25498, quality: 19, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q6_K_XL',  bits: 6, label: '35B 3.6 Q6_K_XL',              sizeMb: 31027, quality: 20, repoId: REPO_36B },
+  { family: FAMILY_QWEN36_35B, quant: '36-UD-Q8_K_XL',  bits: 8, label: '35B 3.6 Q8_K_XL — максимум',    sizeMb: 39629, quality: 21, repoId: REPO_36B },
 ]
 
-// Per-layer VRAM for weight offloading (scales with model file size)
-// 35B: Q4_K_XL ≈ 21 GB, ~1.2 GB embeddings+output, 40 layers → ~500 MB/layer
-// 9B:  Q4_K_XL ≈ 6 GB, 36 layers → ~150 MB/layer
-const LAYER_REFS: Record<string, { modelMb: number; layerMb: number }> = {
-  '35b': { modelMb: 21094, layerMb: 500 },
-  '9b':  { modelMb: 6113,  layerMb: 150 },
-}
-
-function is9B(variant: ModelVariant): boolean {
-  return variant.quant.startsWith('9B-')
+// Per-layer VRAM for weight offloading (scales with model file size).
+// 35B MoE: Q4_K_XL ≈ 21 GB, ~1.2 GB embeddings+output, 40 layers → ~500 MB/layer
+// 9B dense: Q4_K_XL ≈ 6 GB, 36 layers → ~150 MB/layer
+const LAYER_REFS_BY_FAMILY: Record<string, { modelMb: number; layerMb: number }> = {
+  [FAMILY_QWEN35_9B]:  { modelMb: 6113,  layerMb: 150 },
+  [FAMILY_QWEN35_35B]: { modelMb: 21094, layerMb: 500 },
+  [FAMILY_QWEN36_35B]: { modelMb: 21094, layerMb: 500 },
 }
 
 function modelMemoryMb(variant: ModelVariant): number {
@@ -209,7 +263,7 @@ function modelMemoryMb(variant: ModelVariant): number {
 }
 
 function layerVramMb(variant: ModelVariant): number {
-  const ref = is9B(variant) ? LAYER_REFS['9b'] : LAYER_REFS['35b']
+  const ref = LAYER_REFS_BY_FAMILY[variant.family] ?? LAYER_REFS_BY_FAMILY[FAMILY_QWEN35_35B]
   return Math.round(ref.layerMb * (variant.sizeMb / ref.modelMb))
 }
 
@@ -494,7 +548,9 @@ function selectPresetForTargetCtx(
 }
 
 function selectPreset(ramTotalMb: number, freeVramMb: number, isLaptop: boolean): Preset {
-  const defaultVariant = MODEL_VARIANTS.find((v) => v.quant === 'UD-Q4_K_XL')!
+  const defaultVariant =
+    MODEL_VARIANTS.find((v) => v.family === FAMILY_QWEN35_35B && v.quant === 'UD-Q4_K_XL')
+    ?? MODEL_VARIANTS[0]
   const memMb = modelMemoryMb(defaultVariant)
   const layMb = layerVramMb(defaultVariant)
   return selectPresetForSize(ramTotalMb, freeVramMb, isLaptop, memMb, memMb, layMb)

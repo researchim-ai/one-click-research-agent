@@ -5,42 +5,74 @@ import path from 'path'
 import os from 'os'
 import type { DownloadProgress, ModelVariant } from './types'
 import * as config from './config'
-import { MODEL_VARIANTS } from './resources'
+import { MODEL_VARIANTS, MODEL_FAMILIES, getModelFamily } from './resources'
 
-const DEFAULT_REPO_ID = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 const DEFAULT_QUANT = 'UD-Q4_K_XL'
+const DEFAULT_REPO_ID = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 
 function normalizeToken(value: string): string {
   return value.toLowerCase().replace(/-/g, '_')
 }
 
-function is9BQuant(quant: string): boolean {
-  return quant.startsWith('9B-')
+function findVariant(quant: string): ModelVariant | null {
+  return MODEL_VARIANTS.find((v: ModelVariant) => v.quant === quant) ?? null
 }
 
-function matchesQuantFile(filename: string, quant: string): boolean {
-  const normalized = normalizeToken(filename)
-  const quantNorm = normalizeToken(quant)
-  if (!normalized.includes(quantNorm)) return false
+function rawQuantSegment(quant: string): string {
+  // Strip family-specific prefix (9B-, 36-) to get the canonical UD-* segment.
+  return quant.replace(/^9B-/, '').replace(/^36-/, '')
+}
 
-  const is9BFile = normalized.includes('9b')
-  return is9BQuant(quant) ? is9BFile : !is9BFile
+function filenameTagForVariant(variant: ModelVariant | null): string | null {
+  if (!variant) return null
+  return getModelFamily(variant.family)?.filenameTag ?? null
+}
+
+function fileMatchesFamilyTag(filename: string, tag: string | null): boolean {
+  if (!tag) return true
+  return normalizeToken(filename).includes(normalizeToken(tag))
+}
+
+function matchesQuantFile(filename: string, quant: string, variant: ModelVariant | null): boolean {
+  const normalized = normalizeToken(filename)
+  const rawQuantNorm = normalizeToken(rawQuantSegment(quant))
+  if (!normalized.includes(rawQuantNorm)) return false
+
+  // Family-aware disambiguation: filename must carry the family tag (e.g. '3.5-35b'
+  // vs '3.6-35b' vs '9b'). If no variant is known, fall back to substring-only.
+  const tag = filenameTagForVariant(variant)
+  if (!fileMatchesFamilyTag(filename, tag)) return false
+
+  return true
 }
 
 function findInstalledModelFile(files: string[], quant: string): string | null {
-  const exactFamilyMatch = files.find((file) => matchesQuantFile(file, quant))
-  if (exactFamilyMatch) return exactFamilyMatch
+  const variant = findVariant(quant)
+  const exact = files.find((file) => matchesQuantFile(file, quant, variant))
+  if (exact) return exact
 
-  const quantNorm = normalizeToken(quant)
-  return files.find((file) => normalizeToken(file).includes(quantNorm)) ?? null
+  // If the variant is known and has a known family, NEVER cross-match files
+  // that belong to a different family (e.g. Qwen3.6 selected, but only a
+  // Qwen3.5 file is on disk). Otherwise auto-setup would silently run the
+  // wrong model instead of downloading the one the user picked.
+  if (variant && getModelFamily(variant.family)) return null
+
+  // Legacy / unknown variants: fall back to a quant substring match so old
+  // configs still resolve to something sensible.
+  const rawQuantNorm = normalizeToken(rawQuantSegment(quant))
+  return files.find((file) => normalizeToken(file).includes(rawQuantNorm)) ?? null
 }
 
 function getRepoId(quant?: string): string {
   const q = quant ?? selectedQuant
-  const variant = MODEL_VARIANTS.find((v: ModelVariant) => v.quant === q)
+  const variant = findVariant(q)
   if (variant?.repoId) return variant.repoId
+  const fam = variant ? getModelFamily(variant.family) : null
+  if (fam?.repoId) return fam.repoId
   return DEFAULT_REPO_ID
 }
+
+export { MODEL_FAMILIES }
 const MAX_RETRIES = 3
 const RETRY_BASE_MS = 2000
 
@@ -93,13 +125,16 @@ async function findModelFilename(quant?: string): Promise<string> {
   const url = `https://huggingface.co/api/models/${repoId}`
   const body = await fetchJson(url)
   const siblings: HfSibling[] = body.siblings ?? []
-  const quantNorm = q.toLowerCase().replace(/-/g, '_')
-  const match = siblings
-    .filter((s) => s.rfilename.endsWith('.gguf'))
-    .find((s) => s.rfilename.toLowerCase().replace(/-/g, '_').includes(quantNorm))
+  const rawQuantNorm = normalizeToken(rawQuantSegment(q))
+  const ggufs = siblings.filter((s) => s.rfilename.endsWith('.gguf'))
+  // Prefer top-level files (no directory separator) — subfolders like BF16/
+  // hold ancillary weights we don't want to pick up by accident.
+  const topLevel = ggufs.filter((s) => !s.rfilename.includes('/'))
+  const pool = topLevel.length > 0 ? topLevel : ggufs
+  const match = pool.find((s) => normalizeToken(s.rfilename).includes(rawQuantNorm))
 
   if (!match) {
-    const available = siblings.filter((s) => s.rfilename.endsWith('.gguf')).map((s) => s.rfilename)
+    const available = pool.map((s) => s.rfilename)
     throw new Error(`Quant '${q}' not found. Available: ${available.join(', ')}`)
   }
   return match.rfilename

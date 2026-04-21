@@ -6,6 +6,7 @@ interface ElectronAPI {
   getModelVariants(
     override?: Pick<import('../electron/config').AppConfig, 'gpuMode' | 'gpuIndex'>
   ): Promise<import('../electron/types').ModelVariantInfo[]>
+  getModelFamilies(): Promise<import('../electron/types').ModelFamily[]>
   getWebSearchStatus(
     override?: Pick<import('../electron/config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
   ): Promise<import('../electron/types').WebSearchStatus>

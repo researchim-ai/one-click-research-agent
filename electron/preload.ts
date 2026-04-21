@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('api', {
   detectResources: (): Promise<SystemResources> => ipcRenderer.invoke('detect-resources'),
   getModelVariants: (override?: { gpuMode?: import('./types').GpuMode; gpuIndex?: number | null }): Promise<any[]> =>
     ipcRenderer.invoke('get-model-variants', override),
+  getModelFamilies: (): Promise<import('./types').ModelFamily[]> =>
+    ipcRenderer.invoke('get-model-families'),
   getWebSearchStatus: (
     override?: Pick<import('./config').AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>
   ): Promise<import('./types').WebSearchStatus> => ipcRenderer.invoke('get-web-search-status', override),

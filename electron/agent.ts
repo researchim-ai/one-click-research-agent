@@ -760,6 +760,38 @@ interface StreamResult {
   estimatedOutputTokens: number
 }
 
+/**
+ * Checks if the llama-server is still responsive. Used to diagnose network
+ * errors from `fetch` (e.g. "fetch failed", "terminated") which typically
+ * indicate the server crashed or closed the TCP connection mid-stream.
+ */
+async function pingLlamaServer(apiUrl: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    const base = apiUrl.replace(/\/v1\/chat\/completions\/?$/, '')
+    const ctrl = new AbortController()
+    const to = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const r = await fetch(`${base}/health`, { signal: ctrl.signal })
+      return r.ok
+    } finally {
+      clearTimeout(to)
+    }
+  } catch {
+    return false
+  }
+}
+
+/** True for low-level network errors (server crashed / socket torn down). */
+function isNetworkStreamError(e: any): boolean {
+  const name = e?.name ?? ''
+  const msg = (e?.message ?? String(e ?? '')).toLowerCase()
+  const causeCode = e?.cause?.code ?? ''
+  if (name === 'TypeError' && (msg.includes('fetch failed') || msg.includes('terminated'))) return true
+  if (msg.includes('socket hang up')) return true
+  if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(causeCode)) return true
+  return false
+}
+
 async function streamLlmResponse(
   apiUrl: string,
   msgs: Message[],
@@ -2312,6 +2344,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       const errMsg = e.message ?? String(e)
       const isAbort = e?.name === 'AbortError' || errMsg.includes('aborted')
       const isContextError = errMsg.includes('500') || errMsg.includes('400') || errMsg.includes('context')
+      const isNetErr = !isContextError && !isAbort && isNetworkStreamError(e)
 
       if (isAbort && !isContextError) {
         // Idle timeout or network abort — not user-initiated
@@ -2321,7 +2354,43 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         return 'Error: connection lost'
       }
 
-      if (isContextError) {
+      if (isNetErr) {
+        // TCP-level failure (undici "fetch failed" / "terminated" / ECONNRESET).
+        // Almost always means llama-server crashed / closed the socket mid-stream.
+        debugLog('ERROR', `Network-level stream failure: name=${e?.name}, msg=${errMsg}, cause=${e?.cause?.code ?? '-'}`)
+        doEmit({ type: 'status', content: '🔌 Соединение с llama-server прервано — проверяю состояние сервера…' })
+        // Give the server a moment to recover (or crash cleanly)
+        await new Promise((r) => setTimeout(r, 1500))
+        const alive = await pingLlamaServer(apiUrl)
+        if (!alive) {
+          doEmit({
+            type: 'error',
+            content: '❌ llama-server не отвечает (возможно упал из-за нехватки памяти при текущем контексте). Откройте Настройки → «Перезапустить сервер», уменьшите контекст или max_tokens и повторите запрос.',
+          })
+          session.updatedAt = Date.now()
+          doSaveSession(session)
+          return 'Error: llama-server is not responding'
+        }
+        doEmit({ type: 'status', content: '🔁 Сервер снова доступен — повторяю запрос…' })
+        try {
+          const retryController = new AbortController()
+          currentAbort = retryController
+          streamResult = await streamLlmResponse(apiUrl, messages, fullResponse, retryController.signal, effectiveMaxTokens)
+        } catch (retryErr: any) {
+          const retryMsg = retryErr?.message ?? String(retryErr)
+          if (isNetworkStreamError(retryErr)) {
+            doEmit({
+              type: 'error',
+              content: '❌ Соединение с llama-server снова оборвалось после переподключения. Похоже на повторный крэш сервера — попробуйте уменьшить контекст/max_tokens в настройках и перезапустить сервер.',
+            })
+          } else {
+            doEmit({ type: 'error', content: `LLM request failed after reconnect: ${retryMsg}` })
+          }
+          session.updatedAt = Date.now()
+          doSaveSession(session)
+          return `Error: ${retryMsg}`
+        }
+      } else if (isContextError) {
         // Extract real n_ctx from server error and auto-correct our tracking
         const ctxMatch = errMsg.match(/n_ctx[":=\s]*(\d+)/)
         if (ctxMatch) {

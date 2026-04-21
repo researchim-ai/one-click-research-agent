@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
-import type { ModelVariantInfo, ToolInfo, SystemResources, GpuMode, WebSearchStatus } from '../../electron/types'
+import type { ModelVariantInfo, ModelFamily, ToolInfo, SystemResources, GpuMode, WebSearchStatus } from '../../electron/types'
 import type { AppConfig, AppLanguage, CustomTool, WebSearchProvider } from '../../electron/config'
 import { DEFAULT_PRESET_ID, RESEARCH_PRESETS, type ResearchPresetId } from '../../research-presets'
 
@@ -49,6 +49,30 @@ function pickQuantForVariants(variants: ModelVariantInfo[], preferredQuant: stri
     ?? preferredQuant
 }
 
+function variantsForFamily(variants: ModelVariantInfo[], familyId: string): ModelVariantInfo[] {
+  return variants.filter((v) => v.family === familyId)
+}
+
+function pickQuantForFamily(
+  variants: ModelVariantInfo[],
+  family: ModelFamily,
+  preferredQuant: string,
+): string {
+  const pool = variantsForFamily(variants, family.id)
+  if (pool.length === 0) return preferredQuant
+  const preferred = pool.find((v) => v.quant === preferredQuant && v.fits)
+  if (preferred) return preferred.quant
+  const defaultFit = pool.find((v) => v.quant === family.defaultQuant && v.fits)
+  if (defaultFit) return defaultFit.quant
+  return pool.find((v) => v.recommended)?.quant
+    ?? pool.find((v) => v.fits)?.quant
+    ?? family.defaultQuant
+}
+
+function displayQuant(quant: string): string {
+  return quant.replace(/^9B-/, '').replace(/^36-/, '').replace(/^UD-/, '')
+}
+
 function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): boolean {
   return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
 }
@@ -77,6 +101,8 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const [tab, setTab] = useState<Tab>('model')
   const [cfg, setCfg] = useState<AppConfig | null>(null)
   const [variants, setVariants] = useState<ModelVariantInfo[]>([])
+  const [families, setFamilies] = useState<ModelFamily[]>([])
+  const [selectedFamilyId, setSelectedFamilyId] = useState<string>('')
   const [resources, setResources] = useState<SystemResources | null>(null)
   const [tools, setTools] = useState<ToolInfo[]>([])
   const [selectedQuant, setSelectedQuant] = useState('')
@@ -129,7 +155,8 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       window.api.detectResources(),
       window.api.getTools(),
       window.api.getPrompts(),
-    ]).then(async ([c, r, t, p]) => {
+      window.api.getModelFamilies(),
+    ]).then(async ([c, r, t, p, fams]) => {
       const gpuMode = c.gpuMode ?? 'single'
       const gpuIndex = c.gpuIndex ?? r.gpus[0]?.index ?? 0
       const v = await window.api.getModelVariants({ gpuMode, gpuIndex })
@@ -137,12 +164,18 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setResources(r)
       setVariants(v)
       setTools(t)
+      setFamilies(fams)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
       const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
       setSelectedQuant(quant)
-      const variant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
-      const max = variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768
+      const activeVariant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
+      const familyId = activeVariant?.family
+        ?? fams.find((f) => f.recommended)?.id
+        ?? fams[0]?.id
+        ?? ''
+      setSelectedFamilyId(familyId)
+      const max = activeVariant?.selectableMaxCtx ?? activeVariant?.maxCtx ?? 32768
       setSelectedCtx((c.ctxSize && c.ctxSize > 0) ? Math.min(c.ctxSize, max) : max)
       setDirty(false)
 
@@ -201,14 +234,21 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
     gpuIndex: number,
     preferredQuant = selectedQuant,
     preferredCtx = selectedCtx,
+    preferredFamilyId = selectedFamilyId,
   ) => {
     const nextVariants = await window.api.getModelVariants({ gpuMode, gpuIndex })
     setVariants(nextVariants)
-    const nextQuant = pickQuantForVariants(nextVariants, preferredQuant)
+    const family = families.find((f) => f.id === preferredFamilyId) ?? null
+    const nextQuant = family
+      ? pickQuantForFamily(nextVariants, family, preferredQuant)
+      : pickQuantForVariants(nextVariants, preferredQuant)
     setSelectedQuant(nextQuant)
     const nextVariant = nextVariants.find((variant) => variant.quant === nextQuant)
     const nextMaxCtx = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
     setSelectedCtx(Math.min(preferredCtx, nextMaxCtx))
+    if (nextVariant?.family && nextVariant.family !== preferredFamilyId) {
+      setSelectedFamilyId(nextVariant.family)
+    }
   }
 
   const handleSave = async () => {
@@ -307,6 +347,11 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
       setSelectedQuant(quant)
       const variant = v.find((entry) => entry.quant === quant)
+      const famIdForReset = variant?.family
+        ?? families.find((f) => f.recommended)?.id
+        ?? families[0]?.id
+        ?? ''
+      setSelectedFamilyId(famIdForReset)
       setSelectedCtx(Math.min(32768, variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768))
       setSelectedPreset(DEFAULT_PRESET_ID)
       setMaxIterations(c.maxIterations ?? 200)
@@ -390,6 +435,8 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
             <ModelTab
               appLanguage={appLanguage}
               variants={variants}
+              families={families}
+              selectedFamilyId={selectedFamilyId}
               availableGpus={availableGpus}
               hasMultipleGpus={hasMultipleGpus}
               selectedQuant={selectedQuant}
@@ -398,7 +445,23 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
               selectedGpuIndex={selectedGpuIndex}
               maxCtx={maxCtx}
               selectableMaxCtx={selectableMaxCtx}
-              onQuantChange={(q) => { setSelectedQuant(q); setDirty(true) }}
+              onFamilyChange={(familyId) => {
+                const family = families.find((f) => f.id === familyId)
+                if (!family) return
+                setSelectedFamilyId(familyId)
+                const nextQuant = pickQuantForFamily(variants, family, selectedQuant)
+                setSelectedQuant(nextQuant)
+                const nextVariant = variants.find((v) => v.quant === nextQuant)
+                const nextMaxCtx = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
+                setSelectedCtx((prev) => Math.min(prev, nextMaxCtx))
+                setDirty(true)
+              }}
+              onQuantChange={(q) => {
+                setSelectedQuant(q)
+                const nextVariant = variants.find((v) => v.quant === q)
+                if (nextVariant?.family) setSelectedFamilyId(nextVariant.family)
+                setDirty(true)
+              }}
               onCtxChange={(c: number) => { setSelectedCtx(c); setDirty(true) }}
               onGpuModeChange={async (gpuMode) => {
                 const nextGpuIndex = availableGpus.some((gpu) => gpu.index === selectedGpuIndex)
@@ -569,12 +632,15 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 // ---------------------------------------------------------------------------
 
 function ModelTab({
-  appLanguage, variants, availableGpus, hasMultipleGpus,
+  appLanguage, variants, families, selectedFamilyId,
+  availableGpus, hasMultipleGpus,
   selectedQuant, selectedCtx, selectedGpuMode, selectedGpuIndex, maxCtx, selectableMaxCtx,
-  onQuantChange, onCtxChange, onGpuModeChange, onGpuIndexChange,
+  onFamilyChange, onQuantChange, onCtxChange, onGpuModeChange, onGpuIndexChange,
 }: {
   appLanguage: AppLanguage
   variants: ModelVariantInfo[]
+  families: ModelFamily[]
+  selectedFamilyId: string
   availableGpus: SystemResources['gpus']
   hasMultipleGpus: boolean
   selectedQuant: string
@@ -583,12 +649,14 @@ function ModelTab({
   selectedGpuIndex: number
   maxCtx: number
   selectableMaxCtx: number
+  onFamilyChange: (familyId: string) => void
   onQuantChange: (q: string) => void
   onCtxChange: (c: number) => void
   onGpuModeChange: (mode: GpuMode) => void | Promise<void>
   onGpuIndexChange: (index: number) => void | Promise<void>
 }) {
   const selectedVariant = variants.find((variant) => variant.quant === selectedQuant) ?? null
+  const familyVariants = variantsForFamily(variants, selectedFamilyId)
 
   return (
     <div className="space-y-6">
@@ -652,63 +720,102 @@ function ModelTab({
       )}
 
       <SettingsSection
-        title={appLanguage === 'ru' ? 'Модель и квантизация' : 'Model & quantization'}
-        description={appLanguage === 'ru' ? 'Здесь выбирается семейство модели, степень квантования и рекомендуемый режим загрузки.' : 'Select the model family, quantization level, and recommended loading mode.'}
+        title={appLanguage === 'ru' ? 'Модель' : 'Model'}
+        description={appLanguage === 'ru'
+          ? 'Сначала выбери семейство модели — это определяет репозиторий на Hugging Face и набор доступных квантов.'
+          : 'First pick a model family — this determines the Hugging Face repository and the set of available quants.'}
+      >
+        <label className="block text-sm font-medium text-zinc-300 mb-3">{appLanguage === 'ru' ? 'Семейство модели' : 'Model family'}</label>
+        <div className="space-y-1 rounded-xl border border-zinc-800 p-1">
+          {families.map((fam) => {
+            const famVariants = variantsForFamily(variants, fam.id)
+            const anyFit = famVariants.some((v) => v.fits)
+            const isSel = fam.id === selectedFamilyId
+            return (
+              <button
+                key={fam.id}
+                onClick={() => onFamilyChange(fam.id)}
+                className={`w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 transition-colors cursor-pointer ${
+                  isSel
+                    ? 'bg-blue-500/15 border border-blue-500/30'
+                    : 'hover:bg-zinc-800/80 border border-transparent'
+                }`}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-zinc-200">{fam.label}</span>
+                    {fam.recommended && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium">
+                        {appLanguage === 'ru' ? 'рек.' : 'rec.'}
+                      </span>
+                    )}
+                    {!anyFit && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 font-medium">
+                        {appLanguage === 'ru' ? 'мало памяти' : 'tight memory'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-0.5 truncate">{fam.description}</div>
+                </div>
+                {isSel && <span className="text-blue-400 shrink-0 text-sm">✓</span>}
+              </button>
+            )
+          })}
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title={appLanguage === 'ru' ? 'Квантизация' : 'Quantization'}
+        description={appLanguage === 'ru'
+          ? 'Уровень квантования для выбранного семейства. Ниже биты = меньше памяти и качества, выше биты = больше.'
+          : 'Quantization level for the selected family. Fewer bits = less memory and quality, more bits = the opposite.'}
       >
         <label className="block text-sm font-medium text-zinc-300 mb-3">{appLanguage === 'ru' ? 'Квантизация модели' : 'Model quantization'}</label>
         <div className="space-y-1 max-h-[360px] overflow-y-auto rounded-xl border border-zinc-800 p-1">
-          {(() => {
-            const groups: { title: string; items: typeof variants }[] = [
-              { title: appLanguage === 'ru' ? 'Qwen3.5-9B (быстрая, компактная)' : 'Qwen3.5-9B (fast, compact)', items: variants.filter((v) => v.quant.startsWith('9B-')) },
-              { title: appLanguage === 'ru' ? 'Qwen3.5-35B-A3B (MoE, мощнее)' : 'Qwen3.5-35B-A3B (MoE, more powerful)', items: variants.filter((v) => !v.quant.startsWith('9B-')) },
-            ]
-            return groups.map((g) => g.items.length === 0 ? null : (
-              <div key={g.title}>
-                <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-zinc-500 uppercase tracking-wide">{g.title}</div>
-                {g.items.map((v) => {
-                  const isSel = v.quant === selectedQuant
-                  const colorClass = BITS_COLOR[v.bits] ?? 'text-zinc-400'
-                  const displayQuant = v.quant.replace(/^9B-/, '').replace('UD-', '')
-                  return (
-                    <button
-                      key={v.quant}
-                      disabled={!v.fits}
-                      onClick={() => onQuantChange(v.quant)}
-                      className={`w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 transition-colors cursor-pointer ${
-                        !v.fits
-                          ? 'opacity-30 cursor-not-allowed'
-                          : isSel
-                            ? 'bg-blue-500/15 border border-blue-500/30'
-                            : 'hover:bg-zinc-800/80 border border-transparent'
-                      }`}
-                    >
-                      <div className={`w-7 text-center text-xs font-bold ${colorClass}`}>
-                        {v.bits}b
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className={`text-sm font-medium ${v.fits ? 'text-zinc-200' : 'text-zinc-600'}`}>
-                            {displayQuant}
-                          </span>
-                          {v.recommended && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium">
-                              {appLanguage === 'ru' ? 'рек.' : 'rec.'}
-                            </span>
-                          )}
-                        </div>
-                        <div className={`text-[11px] mt-0.5 ${v.fits ? 'text-zinc-500' : 'text-zinc-700'}`}>
-                          {formatSize(v.sizeMb, appLanguage)}
-                          {v.fits && <> · {appLanguage === 'ru' ? 'макс.' : 'max'} ctx {formatCtx(v.maxCtx)} · {v.mode === 'full_gpu' ? 'GPU' : v.mode === 'hybrid' ? 'GPU+CPU' : 'CPU'}</>}
-                          {!v.fits && (appLanguage === 'ru' ? ' · не хватает памяти' : ' · not enough memory')}
-                        </div>
-                      </div>
-                      {isSel && <span className="text-blue-400 shrink-0 text-sm">✓</span>}
-                    </button>
-                  )
-                })}
-              </div>
-            ))
-          })()}
+          {familyVariants.length === 0 ? (
+            <div className="px-3 py-3 text-sm text-zinc-500">
+              {appLanguage === 'ru' ? 'Нет доступных квантов для выбранного семейства.' : 'No available quants for the selected family.'}
+            </div>
+          ) : familyVariants.map((v) => {
+            const isSel = v.quant === selectedQuant
+            const colorClass = BITS_COLOR[v.bits] ?? 'text-zinc-400'
+            return (
+              <button
+                key={v.quant}
+                disabled={!v.fits}
+                onClick={() => onQuantChange(v.quant)}
+                className={`w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 transition-colors cursor-pointer ${
+                  !v.fits
+                    ? 'opacity-30 cursor-not-allowed'
+                    : isSel
+                      ? 'bg-blue-500/15 border border-blue-500/30'
+                      : 'hover:bg-zinc-800/80 border border-transparent'
+                }`}
+              >
+                <div className={`w-7 text-center text-xs font-bold ${colorClass}`}>
+                  {v.bits}b
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-sm font-medium ${v.fits ? 'text-zinc-200' : 'text-zinc-600'}`}>
+                      {displayQuant(v.quant)}
+                    </span>
+                    {v.recommended && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium">
+                        {appLanguage === 'ru' ? 'рек.' : 'rec.'}
+                      </span>
+                    )}
+                  </div>
+                  <div className={`text-[11px] mt-0.5 ${v.fits ? 'text-zinc-500' : 'text-zinc-700'}`}>
+                    {formatSize(v.sizeMb, appLanguage)}
+                    {v.fits && <> · {appLanguage === 'ru' ? 'макс.' : 'max'} ctx {formatCtx(v.maxCtx)} · {v.mode === 'full_gpu' ? 'GPU' : v.mode === 'hybrid' ? 'GPU+CPU' : 'CPU'}</>}
+                    {!v.fits && (appLanguage === 'ru' ? ' · не хватает памяти' : ' · not enough memory')}
+                  </div>
+                </div>
+                {isSel && <span className="text-blue-400 shrink-0 text-sm">✓</span>}
+              </button>
+            )
+          })}
         </div>
       </SettingsSection>
 

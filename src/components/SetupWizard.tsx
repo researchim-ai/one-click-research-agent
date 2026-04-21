@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import type { AppStatus, DownloadProgress, GpuMode, ModelVariantInfo, SystemResources } from '../../electron/types'
+import type { AppStatus, DownloadProgress, GpuMode, ModelFamily, ModelVariantInfo, SystemResources } from '../../electron/types'
 import type { WebSearchProvider } from '../../electron/config'
 
 interface Props {
@@ -51,6 +51,30 @@ function pickQuantForVariants(variants: ModelVariantInfo[], preferredQuant: stri
     ?? preferredQuant
 }
 
+function variantsForFamily(variants: ModelVariantInfo[], familyId: string): ModelVariantInfo[] {
+  return variants.filter((v) => v.family === familyId)
+}
+
+function pickQuantForFamily(
+  variants: ModelVariantInfo[],
+  family: ModelFamily,
+  preferredQuant: string,
+): string {
+  const pool = variantsForFamily(variants, family.id)
+  if (pool.length === 0) return preferredQuant
+  const preferred = pool.find((v) => v.quant === preferredQuant && v.fits)
+  if (preferred) return preferred.quant
+  const defaultFit = pool.find((v) => v.quant === family.defaultQuant && v.fits)
+  if (defaultFit) return defaultFit.quant
+  return pool.find((v) => v.recommended)?.quant
+    ?? pool.find((v) => v.fits)?.quant
+    ?? family.defaultQuant
+}
+
+function displayQuant(quant: string): string {
+  return quant.replace(/^9B-/, '').replace(/^36-/, '').replace(/^UD-/, '')
+}
+
 function isFullGpuCtx(optionValue: number, selected?: ModelVariantInfo | null): boolean {
   return optionValue <= (selected?.fullGpuMaxCtx ?? 0)
 }
@@ -64,11 +88,15 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
   const logRef = useRef<HTMLDivElement>(null)
 
   const [variants, setVariants] = useState<ModelVariantInfo[]>([])
+  const [families, setFamilies] = useState<ModelFamily[]>([])
+  const [selectedFamilyId, setSelectedFamilyId] = useState<string>('')
   const [resources, setResources] = useState<SystemResources | null>(null)
   const [selectedQuant, setSelectedQuant] = useState(DEFAULT_QUANT)
   const [selectedCtx, setSelectedCtx] = useState<number>(32768)
   const [selectedGpuMode, setSelectedGpuMode] = useState<GpuMode>('single')
   const [selectedGpuIndex, setSelectedGpuIndex] = useState<number>(0)
+  const [familyDropdownOpen, setFamilyDropdownOpen] = useState(false)
+  const familyDropdownRef = useRef<HTMLDivElement>(null)
   const [useSearxngSearch, setUseSearxngSearch] = useState(false)
   const [savedWebSearchProvider, setSavedWebSearchProvider] = useState<WebSearchProvider>('disabled')
   const [savedSearxngBaseUrl, setSavedSearxngBaseUrl] = useState<string | null>(null)
@@ -81,13 +109,15 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
     Promise.all([
       window.api.getConfig(),
       window.api.detectResources(),
-    ]).then(async ([cfg, detected]) => {
+      window.api.getModelFamilies(),
+    ]).then(async ([cfg, detected, fams]) => {
       const gpuMode = cfg.gpuMode ?? 'single'
       const gpuIndex = cfg.gpuIndex ?? detected.gpus[0]?.index ?? 0
       const v = await window.api.getModelVariants({ gpuMode, gpuIndex })
 
       setResources(detected)
       setVariants(v)
+      setFamilies(fams)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
       const currentProvider = cfg.webSearchProvider ?? (cfg.searxngBaseUrl ? 'custom-searxng' : 'disabled')
@@ -96,9 +126,14 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
       setUseSearxngSearch(currentProvider !== 'disabled')
       const quant = pickQuantForVariants(v, cfg.lastQuant || DEFAULT_QUANT)
       setSelectedQuant(quant)
+      const activeVariant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
+      const familyId = activeVariant?.family
+        ?? fams.find((f) => f.recommended)?.id
+        ?? fams[0]?.id
+        ?? ''
+      setSelectedFamilyId(familyId)
       window.api.selectModelVariant(quant).catch(() => {})
-      const variant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
-      const max = variant?.selectableMaxCtx ?? variant?.maxCtx ?? 32768
+      const max = activeVariant?.selectableMaxCtx ?? activeVariant?.maxCtx ?? 32768
       if (cfg.ctxSize && cfg.ctxSize > 0) {
         setSelectedCtx(Math.min(cfg.ctxSize, max))
       } else {
@@ -116,12 +151,16 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
       if (ctxDropdownRef.current && !ctxDropdownRef.current.contains(e.target as Node)) {
         setCtxDropdownOpen(false)
       }
+      if (familyDropdownRef.current && !familyDropdownRef.current.contains(e.target as Node)) {
+        setFamilyDropdownOpen(false)
+      }
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
   const selected = variants.find((v) => v.quant === selectedQuant)
+  const selectedFamily = families.find((f) => f.id === selectedFamilyId) ?? null
   const availableGpus = resources?.gpus ?? []
   const hasMultipleGpus = availableGpus.length > 1
   const selectedGpu = availableGpus.find((gpu) => gpu.index === selectedGpuIndex) ?? availableGpus[0] ?? null
@@ -131,13 +170,20 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
     gpuIndex: number,
     preferredQuant = selectedQuant,
     preferredCtx = selectedCtx,
+    preferredFamilyId = selectedFamilyId,
   ) => {
     const nextVariants = await window.api.getModelVariants({ gpuMode, gpuIndex })
     setVariants(nextVariants)
-    const nextQuant = pickQuantForVariants(nextVariants, preferredQuant)
+    const family = families.find((f) => f.id === preferredFamilyId) ?? null
+    const nextQuant = family
+      ? pickQuantForFamily(nextVariants, family, preferredQuant)
+      : pickQuantForVariants(nextVariants, preferredQuant)
     setSelectedQuant(nextQuant)
-    window.api.selectModelVariant(nextQuant).catch(() => {})
     const nextVariant = nextVariants.find((variant) => variant.quant === nextQuant)
+    if (nextVariant?.family && nextVariant.family !== preferredFamilyId) {
+      setSelectedFamilyId(nextVariant.family)
+    }
+    window.api.selectModelVariant(nextQuant).catch(() => {})
     const nextMaxCtx = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
     const nextCtx = Math.min(preferredCtx, nextMaxCtx)
     setSelectedCtx(nextCtx)
@@ -153,11 +199,27 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
     setSelectedQuant(quant)
     setDropdownOpen(false)
     const v = variants.find((vi) => vi.quant === quant)
+    if (v?.family) setSelectedFamilyId(v.family)
     const newMax = v?.selectableMaxCtx ?? v?.maxCtx ?? 32768
     const newCtx = Math.min(selectedCtx, newMax)
     setSelectedCtx(newCtx)
     await window.api.selectModelVariant(quant).catch(() => {})
     await window.api.saveConfig({ lastQuant: quant, ctxSize: newCtx }).catch(() => {})
+  }
+
+  const handleSelectFamily = async (familyId: string) => {
+    const family = families.find((f) => f.id === familyId)
+    if (!family) return
+    setSelectedFamilyId(familyId)
+    setFamilyDropdownOpen(false)
+    const nextQuant = pickQuantForFamily(variants, family, selectedQuant)
+    setSelectedQuant(nextQuant)
+    const nextVariant = variants.find((v) => v.quant === nextQuant)
+    const newMax = nextVariant?.selectableMaxCtx ?? nextVariant?.maxCtx ?? 32768
+    const newCtx = Math.min(selectedCtx, newMax)
+    setSelectedCtx(newCtx)
+    await window.api.selectModelVariant(nextQuant).catch(() => {})
+    await window.api.saveConfig({ lastQuant: nextQuant, ctxSize: newCtx }).catch(() => {})
   }
 
   const handleSelectCtx = async (value: number) => {
@@ -230,8 +292,11 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
       }
 
       setPhase('downloading')
-      if (!status?.modelDownloaded) {
-        addLog(L ? `\u{1F4E5} Начинаем скачивание модели (${selectedQuant})…` : `\u{1F4E5} Starting model download (${selectedQuant})…`)
+      // Re-query status for the CURRENTLY selected variant (user may have
+      // switched model family after the initial status was computed).
+      const freshStatus = await window.api.getStatus().catch(() => null)
+      if (!freshStatus?.modelDownloaded) {
+        addLog(L ? `\u{1F4E5} Начинаем скачивание модели (${selectedFamily?.label ?? ''} · ${displayQuant(selectedQuant)})…` : `\u{1F4E5} Starting model download (${selectedFamily?.label ?? ''} · ${displayQuant(selectedQuant)})…`)
         const modelPath = await window.api.downloadModel()
         addLog(L ? `\u2705 Модель скачана: ${modelPath.split(/[\\/]/).pop()}` : `\u2705 Model downloaded: ${modelPath.split(/[\\/]/).pop()}`)
       } else {
@@ -294,7 +359,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
     {
       key: 'download',
       label: L ? 'Скачивание модели' : 'Downloading model',
-      desc: `Qwen3.5-${selectedQuant.startsWith('9B-') ? '9B' : '35B-A3B'} · ${selectedQuant.replace(/^9B-/, '').replace('UD-', '')} (~${selectedSize}) · ctx ${displayCtx}`,
+      desc: `${selectedFamily?.label ?? 'Qwen'} · ${displayQuant(selectedQuant)} (~${selectedSize}) · ctx ${displayCtx}`,
       active: phase === 'downloading',
       done: ['starting', 'done'].includes(phase),
       detail: phase === 'downloading' ? downloadProgress?.status : null,
@@ -336,10 +401,9 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
           <div className="text-6xl mb-3">{'⚡'}</div>
           <h1 className="text-3xl font-bold text-zinc-100 mb-2">One-Click Research Agent</h1>
           <p className="text-zinc-400">
-            Qwen3.5 <span className="text-zinc-500">{'·'}</span>{' '}
-            <span className="text-zinc-300">{selectedQuant.replace(/^9B-/, '').replace('UD-', '')}</span>{' '}
+            <span className="text-zinc-300">{selectedFamily?.label ?? 'Qwen'}</span>{' '}
             <span className="text-zinc-500">{'·'}</span>{' '}
-            {selectedQuant.startsWith('9B-') ? '9B' : '35B-A3B'}{' '}
+            <span className="text-zinc-300">{displayQuant(selectedQuant)}</span>{' '}
             <span className="text-zinc-500">{'·'}</span>{' '}
             ctx {displayCtx}
             {gpuSummary && <><span className="text-zinc-500">{' · '}</span>{gpuSummary}</>}
@@ -546,7 +610,66 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
               </div>
             )}
 
-            <div className="flex gap-3 items-stretch">
+            <div className="flex gap-3 items-stretch flex-wrap">
+              {/* Model family dropdown */}
+              <div ref={familyDropdownRef} className="relative">
+                <button
+                  onClick={() => setFamilyDropdownOpen((o) => !o)}
+                  className="h-full px-4 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-zinc-500 text-left transition-colors cursor-pointer flex items-center gap-3 min-w-[180px]"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-zinc-200 font-medium truncate">
+                      {selectedFamily?.label ?? (L ? 'Модель' : 'Model')}
+                    </div>
+                    <div className="text-[11px] text-zinc-500 leading-tight truncate">
+                      {selectedFamily?.description ?? (L ? 'выбери семейство' : 'pick a family')}
+                    </div>
+                  </div>
+                  <svg className={`w-4 h-4 text-zinc-500 shrink-0 transition-transform ${familyDropdownOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+
+                {familyDropdownOpen && families.length > 0 && (
+                  <div className="absolute bottom-full left-0 mb-2 w-[300px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50 z-50">
+                    <div className="px-3 py-2 border-b border-zinc-800">
+                      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">{L ? 'Семейство модели' : 'Model family'}</span>
+                    </div>
+                    {families.map((fam) => {
+                      const isSel = fam.id === selectedFamilyId
+                      const famFits = variantsForFamily(variants, fam.id).some((v) => v.fits)
+                      return (
+                        <button
+                          key={fam.id}
+                          onClick={() => handleSelectFamily(fam.id)}
+                          className={`w-full text-left px-3 py-2.5 flex items-center gap-3 transition-colors cursor-pointer ${
+                            isSel ? 'bg-blue-500/10' : 'hover:bg-zinc-800'
+                          }`}
+                        >
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-zinc-200 truncate">{fam.label}</span>
+                              {fam.recommended && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium shrink-0">
+                                  {L ? 'рек.' : 'rec.'}
+                                </span>
+                              )}
+                              {!famFits && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 font-medium shrink-0">
+                                  {L ? 'мало памяти' : 'tight mem'}
+                                </span>
+                              )}
+                              {isSel && <span className="text-blue-400 shrink-0">{'\u2713'}</span>}
+                            </div>
+                            <div className="text-[11px] text-zinc-500 leading-tight mt-0.5 truncate">{fam.description}</div>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
               {/* Variant dropdown */}
               <div ref={dropdownRef} className="relative">
                 <button
@@ -554,7 +677,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
                   className="h-full px-4 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-zinc-500 text-left transition-colors cursor-pointer flex items-center gap-3 min-w-[180px]"
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm text-zinc-200 font-medium truncate">{selectedQuant.replace(/^9B-/, '').replace('UD-', '')}{selectedQuant.startsWith('9B-') ? ' (9B)' : ' (35B)'}</div>
+                    <div className="text-sm text-zinc-200 font-medium truncate">{displayQuant(selectedQuant) || (L ? 'квант' : 'quant')}</div>
                     <div className="text-[11px] text-zinc-500 leading-tight">
                       {selectedSize}
                     </div>
@@ -564,21 +687,14 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
                   </svg>
                 </button>
 
-                {dropdownOpen && variants.length > 0 && (
+                {dropdownOpen && variantsForFamily(variants, selectedFamilyId).length > 0 && (
                   <div className="absolute bottom-full left-0 mb-2 w-[340px] max-h-[400px] overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50 z-50">
                     <div className="px-3 py-2 border-b border-zinc-800">
                       <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold">{L ? 'Квантизация модели' : 'Model quantization'}</span>
                     </div>
-                    {[
-                      { title: 'Qwen3.5-9B', items: variants.filter((v) => v.quant.startsWith('9B-')) },
-                      { title: 'Qwen3.5-35B-A3B', items: variants.filter((v) => !v.quant.startsWith('9B-')) },
-                    ].map((g) => g.items.length === 0 ? null : (
-                      <div key={g.title}>
-                        <div className="px-3 pt-2 pb-1 text-[10px] text-zinc-600 uppercase tracking-wider font-semibold">{g.title}</div>
-                        {g.items.map((v) => {
+                    {variantsForFamily(variants, selectedFamilyId).map((v) => {
                           const isSel = v.quant === selectedQuant
                           const colorClass = BITS_COLOR[v.bits] ?? 'text-zinc-400'
-                          const displayQuant = v.quant.replace(/^9B-/, '').replace('UD-', '')
                           return (
                             <button
                               key={v.quant}
@@ -598,7 +714,7 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
                                   <span className={`text-sm font-medium truncate ${v.fits ? 'text-zinc-200' : 'text-zinc-600'}`}>
-                                    {displayQuant}
+                                    {displayQuant(v.quant)}
                                   </span>
                                   {v.recommended && (
                                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-medium shrink-0">
@@ -618,8 +734,6 @@ export function SetupWizard({ status, downloadProgress, buildStatus, onComplete,
                             </button>
                           )
                         })}
-                      </div>
-                    ))}
                   </div>
                 )}
               </div>

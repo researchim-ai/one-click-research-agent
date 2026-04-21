@@ -174,7 +174,9 @@ When producing outputs, prefer sections like:
 - reproducibility assessment.
 
 After building a shortlist, use \`reflect\` to check for gaps in coverage, recency, or methodological diversity.
-Use \`save_finding\` to preserve key paper comparisons across sessions.`,
+Use \`save_finding\` to preserve key paper comparisons across sessions.
+Use \`fetch_url\` to pull full-text HTML/PDF from any project page; \`parse_document\` when the user attaches a PDF.
+Before producing a final report, call \`verify_sources\` and then \`export_report\` to produce PDF/DOCX/BibTeX output.`,
   },
   {
     id: 'opensource-analysis',
@@ -220,7 +222,15 @@ Focus on:
 Do not overstate claims. Clearly separate:
 - reported results;
 - inferred interpretation;
-- unresolved questions.`,
+- unresolved questions.
+
+Preferred search entry points:
+- \`search_pubmed\` for biomedical literature (Europe PMC);
+- \`search_openalex\` and \`search_crossref\` for citation-aware discovery;
+- \`smart_search\` when you want the router to pick the right engines automatically;
+- \`fetch_url\` / \`parse_document\` to pull full text of papers and supplementary materials.
+
+Always finish with \`reflect\` and, before a final report, \`verify_sources\`.`,
   },
   {
     id: 'mathematics',
@@ -243,7 +253,10 @@ Prefer outputs like:
 - assumptions;
 - proof skeleton;
 - key insight;
-- unresolved steps.`,
+- unresolved steps.
+
+Preferred tools: \`search_arxiv\`, \`search_semantic_scholar\`, \`search_crossref\`, \`fetch_url\` for primary sources; \`parse_document\` for attached PDFs.
+Use \`reflect\` to stress-test each proof step and \`save_finding\` to memorize reusable lemmas.`,
   },
   {
     id: 'finance',
@@ -262,7 +275,10 @@ Focus on:
 - explicit traceability from source to conclusion.
 
 Never present outputs as guaranteed financial advice.
-Use cautious language and highlight uncertainty.`,
+Use cautious language and highlight uncertainty.
+
+Preferred tools: \`search_web\` (SearXNG) for filings / reports / market commentary; \`search_openalex\` and \`search_crossref\` for academic finance; \`fetch_url\` + \`parse_document\` for reports in PDF/DOCX.
+Use \`verify_sources\` before reporting numbers — broken citations are especially dangerous for finance claims.`,
   },
   {
     id: 'paper-reproduction',
@@ -288,7 +304,9 @@ Prefer outputs like:
 - required assets;
 - executed steps;
 - observed result;
-- reproducibility verdict.`,
+- reproducibility verdict.
+
+Preferred tools: \`fetch_url\` for README / release notes / issues; \`parse_document\` for the paper PDF; \`screenshot_page\` to capture visual results; \`plan_research\` to keep the reproduction checklist in sync with reality; \`export_report\` when the user wants a shareable reproduction log.`,
   },
 ]
 

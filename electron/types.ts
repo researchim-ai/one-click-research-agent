@@ -88,6 +88,17 @@ export interface ModelVariant {
   sizeMb: number
   quality: number
   repoId?: string
+  family: string
+}
+
+export interface ModelFamily {
+  id: string
+  label: string
+  description: string
+  repoId: string
+  defaultQuant: string
+  filenameTag: string
+  recommended?: boolean
 }
 
 export interface ModelVariantInfo extends ModelVariant {

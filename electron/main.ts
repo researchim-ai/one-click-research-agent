@@ -24,7 +24,7 @@ if (process.env.ELECTRON_NO_SANDBOX || process.argv.includes('--no-sandbox')) {
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   app.disableHardwareAcceleration()
 }
-import { detect, evaluateVariants, loadModelArch, getArch, applyGpuPreferences } from './resources'
+import { detect, evaluateVariants, loadModelArch, getArch, applyGpuPreferences, MODEL_FAMILIES } from './resources'
 import * as modelManager from './model-manager'
 import * as serverManager from './server-manager'
 import * as config from './config'
@@ -354,6 +354,8 @@ function registerIpcHandlers() {
     ))
   })
 
+  ipcMain.handle('get-model-families', () => MODEL_FAMILIES)
+
   ipcMain.handle(
     'get-web-search-status',
     (_e, override?: Pick<config.AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>) =>
@@ -434,12 +436,19 @@ function registerIpcHandlers() {
   ipcMain.handle('restart-server', async (_e) => {
     serverManager.stop()
     await new Promise((r) => setTimeout(r, 2000))
-    const modelPath = modelManager.getModelPath()
-    if (!modelPath) throw new Error('Модель не скачана')
     if (!serverManager.isReady()) throw new Error('llama-server не установлен')
+    let modelPath = modelManager.getModelPath()
+    if (!modelPath) {
+      // No file on disk for the currently selected variant — e.g. the user
+      // just switched model family in Settings. Download it before restarting
+      // so switching "just works" without a separate step.
+      if (!mainWindow) throw new Error('No window')
+      console.log(`[restart-server] Model not found for quant=${modelManager.getSelectedQuant()}, downloading…`)
+      modelPath = await modelManager.download(mainWindow)
+    }
     loadModelArch(modelPath)
     const ctxSize = config.get('ctxSize')
-    console.log(`[restart-server] Requested ctx=${ctxSize}, quant=${modelManager.getSelectedQuant()}`)
+    console.log(`[restart-server] Requested ctx=${ctxSize}, quant=${modelManager.getSelectedQuant()}, modelPath=${modelPath}`)
     serverManager.start(modelPath, mainWindow ?? undefined, undefined, modelManager.getSelectedQuant(), ctxSize)
     await serverManager.waitReady(300, mainWindow ?? undefined)
     const actualCtx = serverManager.getCtxSize()
