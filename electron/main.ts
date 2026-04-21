@@ -30,6 +30,10 @@ import * as serverManager from './server-manager'
 import * as config from './config'
 import { getBuiltinToolDefinitions } from './tools'
 import { ensureWebSearchBackend, getWebSearchStatus } from './searxng'
+import { getSourceTracker } from './sources'
+import * as embed from './embed'
+import * as planner from './planner'
+import * as knowledgeIndex from './knowledge-index'
 import {
   runAgent, resetAgent, setWorkspace, cancelAgent,
   createSession, switchSession, listSessions, deleteSession,
@@ -560,6 +564,98 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('reset-agent', (_e, workspace: string) => resetAgent(workspace))
+
+  // Research / sources / plan / knowledge-index IPC
+  ipcMain.handle('get-session-sources', (_e, sessionId: string) => {
+    if (!sessionId) return []
+    try { return getSourceTracker(sessionId).exportForIpc() } catch { return [] }
+  })
+
+  ipcMain.handle('get-research-plan', (_e, workspace: string) => {
+    if (!workspace) return { items: [], progress: { total: 0, done: 0, pct: 0 } }
+    try {
+      const items = planner.parsePlan(workspace)
+      return { items, progress: planner.planProgress(items) }
+    } catch { return { items: [], progress: { total: 0, done: 0, pct: 0 } } }
+  })
+
+  ipcMain.handle('list-research-artifacts', (_e, workspace: string) => {
+    if (!workspace) return []
+    const root = path.join(workspace, '.research')
+    if (!fs.existsSync(root)) return []
+    const out: Array<{ relPath: string; size: number; mtime: number; kind: string }> = []
+    const walk = (dir: string) => {
+      let entries: fs.Dirent[]
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+      for (const e of entries) {
+        const full = path.join(dir, e.name)
+        if (e.isDirectory()) walk(full)
+        else {
+          try {
+            const st = fs.statSync(full)
+            const ext = path.extname(e.name).toLowerCase()
+            const kind = ext === '.md' ? 'markdown'
+              : ext === '.pdf' ? 'pdf'
+              : ext === '.docx' ? 'docx'
+              : ext === '.bib' ? 'bibtex'
+              : ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif' || ext === '.webp' ? 'image'
+              : ext === '.html' || ext === '.htm' ? 'html'
+              : 'other'
+            out.push({ relPath: path.relative(workspace, full), size: st.size, mtime: st.mtimeMs, kind })
+          } catch {}
+        }
+      }
+    }
+    walk(root)
+    out.sort((a, b) => b.mtime - a.mtime)
+    return out
+  })
+
+  ipcMain.handle('embed-status', () => ({
+    isRunning: embed.isRunning(),
+    modelDownloaded: embed.isDefaultModelDownloaded(),
+    modelPath: embed.getActiveModelPath(),
+    defaultModelPath: embed.getDefaultEmbedModelPath(),
+    apiUrl: embed.embedApiUrl(),
+  }))
+
+  ipcMain.handle('embed-download-model', async (ev) => {
+    try {
+      const target = await embed.downloadDefaultModel((pct) => {
+        try { ev.sender.send('embed-download-progress', pct) } catch {}
+      })
+      return { ok: true, path: target }
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e) }
+    }
+  })
+
+  ipcMain.handle('embed-start', async (_e, modelPath?: string) => {
+    try { await embed.startEmbedServer(modelPath || undefined); return { ok: true } }
+    catch (e: any) { return { ok: false, error: String(e?.message || e), log: embed.getLastLog() } }
+  })
+
+  ipcMain.handle('embed-stop', () => {
+    embed.stopEmbedServer()
+    return { ok: true }
+  })
+
+  ipcMain.handle('knowledge-index-stats', (_e, workspace: string) => {
+    if (!workspace) return { chunks: 0, docs: 0, hasVectors: false }
+    try { return knowledgeIndex.indexStats(workspace) } catch { return { chunks: 0, docs: 0, hasVectors: false } }
+  })
+
+  ipcMain.handle('knowledge-index-rebuild', async (ev, workspace: string) => {
+    if (!workspace) return { ok: false, error: 'no workspace' }
+    try {
+      const count = await knowledgeIndex.rebuildIndex(workspace, (done, total) => {
+        try { ev.sender.send('knowledge-index-progress', { done, total }) } catch {}
+      })
+      return { ok: true, chunks: count }
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e) }
+    }
+  })
   ipcMain.handle('set-workspace', (_e, ws: string) => {
     setWorkspace(ws)
     recentWorkspaces.addRecentWorkspace(ws)

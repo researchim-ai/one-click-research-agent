@@ -36,6 +36,7 @@ interface Props {
   externalLinksEnabled?: boolean
   onOpenExternalLink?: (url: string) => void
   appLanguage?: 'ru' | 'en'
+  onCitationClick?: (n: number) => void
 }
 
 export function Chat({
@@ -51,6 +52,7 @@ export function Chat({
   externalLinksEnabled = true,
   onOpenExternalLink,
   appLanguage = 'ru',
+  onCitationClick,
 }: Props) {
   const L = appLanguage === 'ru'
   const [input, setInput] = useState('')
@@ -277,6 +279,7 @@ export function Chat({
                   onDeny={onApproval ? (id) => onApproval(id, false) : undefined}
                   externalLinksEnabled={externalLinksEnabled}
                   onOpenLink={onOpenExternalLink}
+                  onCitationClick={onCitationClick}
                 />
               </div>
             )

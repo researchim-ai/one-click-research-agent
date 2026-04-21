@@ -1,4 +1,4 @@
-import { getBuiltinToolDefinitions, executeTool, executeCustomTool } from './tools'
+import { getBuiltinToolDefinitions, executeTool, executeToolAsync, executeCustomTool, isAsyncTool } from './tools'
 import type { AgentEvent } from './types'
 import type { AppConfig } from './config'
 import * as crypto from 'crypto'
@@ -2230,6 +2230,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   let lastToolSig = ''
   let sameToolRepeatCount = 0
 
+  let lastReflectInjectedAt = -1
   for (let i = 0; i < getMaxIterations(); i++) {
     if (doIsCancelRequested()) {
       doEmit( { type: 'status', content: '⏹ Запрос агента остановлен пользователем' })
@@ -2242,6 +2243,27 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     if (i > 0) {
       doEmit( { type: 'new_turn' })
       fullResponse = ''
+    }
+
+    // Supervisor auto-reflect: every N iterations, nudge the agent to pause and self-check
+    const superCfg = doGetConfig() as any
+    const reflectEvery = Math.max(0, Number(superCfg.supervisorAutoReflectEvery) || 0)
+    const selectedPreset = superCfg.selectedPreset || ''
+    const autoReflectActive = reflectEvery > 0 || selectedPreset === 'deep-research'
+    const effectiveReflectEvery = reflectEvery > 0 ? reflectEvery : 10
+    if (autoReflectActive && i > 0 && i - lastReflectInjectedAt >= effectiveReflectEvery) {
+      const recentReflect = messages.slice(-20).some((m: any) =>
+        (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((tc: any) => tc.function?.name === 'reflect'))
+        || (m.role === 'tool' && typeof m.content === 'string' && m.content.includes('Self-Reflection'))
+      )
+      if (!recentReflect) {
+        messages.push({
+          role: 'user',
+          content: `[Supervisor pause @ iteration ${i}] Stop and self-check: (1) Which sub-questions from the plan are answered? (2) Which sources contradict each other? (3) What critical gaps remain? Call the \`reflect\` tool with your current findings before continuing new searches.`,
+        })
+        lastReflectInjectedAt = i
+        doEmit({ type: 'status', content: `🧭 Supervisor: автоматическая пауза на саморефлексию (итерация ${i})` })
+      }
     }
 
     // Pre-flight: sanitize structure + ensure messages fit in context budget
@@ -2440,10 +2462,13 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           }
 
           let result: string
-          const toolArgs = tc.name === 'generate_report' ? { ...tc.args, session_id: session.id } : tc.args
+          const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report'])
+          const toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
           if (isCustom) {
             const ct = recoveredCustomTools.find((t: any) => t.name === tc.name)
             result = ct ? executeCustomTool(ct, toolArgs, workspace) : `Error: custom tool "${tc.name}" not found`
+          } else if (isAsyncTool(tc.name)) {
+            result = await executeToolAsync(tc.name, toolArgs, workspace, { apiUrl, temperature: getBaseTemperature() })
           } else {
             result = executeTool(tc.name, toolArgs, workspace)
           }
@@ -2607,29 +2632,68 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         consecutiveReReads = 0
       }
 
-      // Inject session_id for generate_report so it can access source tracker
-      if (toolName === 'generate_report') toolArgs = { ...toolArgs, session_id: session.id }
+      // Inject session_id into tools that need access to the per-session source tracker / planner context.
+      const SESSION_AWARE_TOOLS = new Set([
+        'generate_report', 'verify_sources', 'reflect', 'plan_research',
+        'save_finding', 'spawn_sub_researcher', 'export_report',
+      ])
+      if (SESSION_AWARE_TOOLS.has(toolName)) toolArgs = { ...toolArgs, session_id: session.id }
+
+      // Auto verify_sources before generate_report when enabled
+      if (toolName === 'generate_report') {
+        const autoVerify = (doGetConfig() as any).autoVerifyBeforeReport
+        const recentVerify = messages.slice(-30).some((m: any) => m.role === 'tool' && typeof m.content === 'string' && m.content.startsWith('Verified '))
+        if (autoVerify && !recentVerify) {
+          try {
+            const verifyResult = executeTool('verify_sources', { session_id: session.id }, workspace)
+            doEmit({ type: 'tool_call', name: 'verify_sources', args: { session_id: session.id } })
+            doEmit({ type: 'tool_result', name: 'verify_sources', result: verifyResult })
+            messages.push({
+              role: 'user',
+              content: `[Auto verify_sources before generate_report]\n${verifyResult.slice(0, 4000)}`,
+            })
+          } catch {}
+        }
+      }
+
+      // Human-in-the-loop approval for plan_research when enabled
+      const cfgSnap = doGetConfig() as any
+      if (toolName === 'plan_research' && cfgSnap.approvalForPlans) {
+        const approved = await doRequestApproval(toolName, toolArgs)
+        if (!approved) {
+          const denied = '[Denied by user] plan_research was not approved.'
+          messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: denied })
+          doEmit({ type: 'tool_result', name: toolName, result: denied })
+          continue
+        }
+      }
 
       // Request user approval when enabled for file ops or commands (or custom tools)
       let result: string
       const customTools = doGetConfig().customTools
       const isCustom = customTools.some((ct) => ct.name === toolName)
 
+      const runTool = async (): Promise<string> => {
+        if (isCustom) {
+          const ct = customTools.find((t) => t.name === toolName)!
+          return executeCustomTool(ct, toolArgs, workspace)
+        }
+        if (isAsyncTool(toolName)) {
+          return await executeToolAsync(toolName, toolArgs, workspace, { apiUrl, temperature: getBaseTemperature() })
+        }
+        return executeTool(toolName, toolArgs, workspace)
+      }
+
       const needsApproval = needsApprovalForTool(toolName, isCustom)
       if (needsApproval) {
         const approved = await doRequestApproval( toolName, toolArgs)
         if (approved) {
-          if (isCustom) {
-            const ct = customTools.find((t) => t.name === toolName)!
-            result = executeCustomTool(ct, toolArgs, workspace)
-          } else {
-          result = executeTool(toolName, toolArgs, workspace)
-          }
+          result = await runTool()
         } else {
           result = `[Denied by user] Operation "${toolName}" was not approved.`
         }
       } else {
-        result = executeTool(toolName, toolArgs, workspace)
+        result = await runTool()
       }
 
       // Collect sources from search tools

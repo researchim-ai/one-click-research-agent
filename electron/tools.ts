@@ -5,7 +5,18 @@ import path from 'path'
 import type { AppConfig, CustomTool } from './config'
 import { getWebSearchStatus, loadWebSearchConfig, resolveWebSearchBaseUrl, shouldEnableWebSearchTool } from './searxng'
 import { saveFinding, recallFindings } from './memory'
-import { getSourceTracker } from './sources'
+import { getSourceTracker, extractSourcesFromToolResult } from './sources'
+import * as searchCache from './search-cache'
+import * as cfg from './config'
+import { parseDocument, summarizeParsedForPrompt, isDocumentExtension } from './document-parser'
+import { checkUrlHealth, formatHealthBadge } from './url-health'
+import { fetchUrl as fetchUrlImpl, classifyUrl as classifyUrlImpl, extractArxivId } from './url-fetch'
+import { classifyQuery } from './query-router'
+import { writePlan, parsePlan, updatePlanItem, planProgress } from './planner'
+import { runSubResearcher, canSpawnMore } from './sub-researcher'
+import { searchHybrid, indexStats, rebuildIndex, indexText as indexTextHybrid } from './knowledge-index'
+import { exportPdf, exportDocx, exportBibTex } from './export-report'
+import { screenshotPage } from './screenshot'
 
 export const TOOL_DEFINITIONS = [
   {
@@ -333,6 +344,225 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'parse_document',
+      description:
+        'Parse a PDF or DOCX file into plain text and metadata. Use for any binary research document (downloaded arXiv PDFs, attached DOCX reports, etc.). For plain text or markdown use read_file instead.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Relative or absolute path to the document inside the workspace.' },
+          max_pages: { type: 'number', description: 'Optional: only extract the first N pages of a PDF.' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verify_sources',
+      description:
+        'Verify that URLs collected in the current research session are still live. Returns a status (live / archived / dead / hallucinated) for each source and attaches the Wayback Machine snapshot when the original page is unreachable. Use this before producing a final report.',
+      parameters: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+          max_sources: { type: 'number', description: 'Optional: only verify the first N sources (default: all).' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_crossref',
+      description:
+        'Search the Crossref bibliographic database by keyword, returning scholarly works with DOI, authors, venue and publication date. Complements arXiv/OpenAlex for published articles and citation-grade metadata.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query.' },
+          max_results: { type: 'number', description: 'Maximum number of works to return (default: 5, max: 10).' },
+          year_from: { type: 'number', description: 'Optional lower bound for publication year.' },
+          year_to: { type: 'number', description: 'Optional upper bound for publication year.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_semantic_scholar',
+      description:
+        'Search the Semantic Scholar academic graph for papers. Returns titles, authors, venue, year, citation count, and abstract. Good for citation-centric discovery beyond arXiv.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query.' },
+          max_results: { type: 'number', description: 'Maximum number of papers to return (default: 5, max: 10).' },
+          year_from: { type: 'number', description: 'Optional lower bound for publication year.' },
+          year_to: { type: 'number', description: 'Optional upper bound for publication year.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_pubmed',
+      description:
+        'Search Europe PMC / PubMed for biomedical literature. Returns title, authors, journal, and abstract with open-access PDF links when available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Biomedical query, for example "CRISPR off-target review".' },
+          max_results: { type: 'number', description: 'Maximum number of papers to return (default: 5, max: 10).' },
+          year_from: { type: 'number', description: 'Optional lower bound for publication year.' },
+          year_to: { type: 'number', description: 'Optional upper bound for publication year.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'smart_search',
+      description:
+        'Route a query to the most relevant sources automatically (academic / web / biomed / code). Fans out to 2–3 search engines in parallel, deduplicates by URL, and returns a merged result set. Prefer this when you are unsure which specific search tool to call.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query.' },
+          max_per_source: { type: 'number', description: 'Maximum results per source (default: 4, max: 6).' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_knowledge',
+      description:
+        'Hybrid BM25 + vector search over the local research knowledge index (notes, saved findings, downloaded papers). Use this to quickly recall what you already researched before launching fresh web searches.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Natural-language question or keywords.' },
+          k: { type: 'number', description: 'Maximum passages to return (default: 8, max: 20).' },
+          rebuild: { type: 'boolean', description: 'If true, rebuilds the index from scratch before searching. Slow but ensures freshness.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'plan_research',
+      description:
+        'Decompose a broad research question into 3–7 focused sub-questions and persist them to .research/plan.md as a checklist. Call this once at the start of a deep investigation; the file is re-read automatically on every iteration to track progress.',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'The top-level research question.' },
+          sub_questions: { type: 'array', items: { type: 'string' }, description: 'Array of specific sub-questions (3–7 recommended).' },
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+        },
+        required: ['question', 'sub_questions'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_plan_status',
+      description: 'Mark a plan item as done or not done. Item ids are the "Q1", "Q2", "Q1.1" prefixes defined in plan.md.',
+      parameters: {
+        type: 'object',
+        properties: {
+          item_id: { type: 'string', description: 'Plan item id, for example "Q2" or "Q1.3".' },
+          done: { type: 'boolean', description: 'New checkbox state.' },
+        },
+        required: ['item_id', 'done'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'spawn_sub_researcher',
+      description:
+        'Delegate a focused sub-question to an isolated sub-researcher agent. Returns a short synthesized report and automatically feeds discovered sources into the parent session. Max 3 concurrent sub-researchers — use sparingly for independent branches of the plan.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'Well-scoped sub-question for the sub-researcher.' },
+          max_iters: { type: 'number', description: 'Maximum tool-call iterations the sub-agent can perform (default: 6).' },
+          session_id: { type: 'string', description: 'Internal: parent session id. Passed automatically.' },
+        },
+        required: ['task'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_url',
+      description:
+        'Fetch a web page and return readable markdown via Mozilla Readability. Automatically handles arXiv abstract/PDF URLs. For binary PDF responses the returned result instructs you to use download_arxiv_pdf + parse_document.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Full https(s):// URL.' },
+          format: { type: 'string', description: 'Output format: "markdown" (default), "text", or "html".' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'screenshot_page',
+      description:
+        'Render a URL in a headless browser and save a PNG screenshot to .research/screenshots/. Useful for SPA pages, figures, dashboards, or visual evidence. Does NOT require external Playwright; uses the built-in Electron BrowserWindow.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Full URL to capture.' },
+          output_path: { type: 'string', description: 'Optional path inside the workspace. Default: .research/screenshots/<slug>.png' },
+          full_page: { type: 'boolean', description: 'If true, resize window to capture the full page height.' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'export_report',
+      description:
+        'Export a report markdown file into PDF, DOCX, or BibTeX. PDF renders via the built-in Chromium engine; DOCX uses a pure-JS writer; BibTeX is built from collected session sources.',
+      parameters: {
+        type: 'object',
+        properties: {
+          markdown_path: { type: 'string', description: 'Path to the source .md (default: .research/report.md).' },
+          format: { type: 'string', enum: ['pdf', 'docx', 'bibtex'], description: 'Output format.' },
+          output_path: { type: 'string', description: 'Optional output path.' },
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically for bibtex.' },
+        },
+        required: ['format'],
+      },
+    },
+  },
 ]
 
 const IGNORED_DIRS = new Set([
@@ -363,17 +593,35 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'write_file':
         return writeFile(args.path, args.content, workspace)
       case 'search_arxiv':
-        return searchArxiv(args.query, args.max_results, args.from_date, args.to_date, args.sort_by, args.sort_order)
+        return searchArxiv(args.query, args.max_results, args.from_date, args.to_date, args.sort_by, args.sort_order, args.start)
       case 'search_huggingface_papers':
         return searchHuggingFacePapers(args.query, args.max_results)
       case 'search_openalex':
         return searchOpenAlex(args.query, args.max_results, args.year_from, args.year_to)
       case 'search_web':
         return searchWeb(args.query, args.max_results, args.categories, args.language, args.time_range)
+      case 'search_crossref':
+        return searchCrossref(args.query, args.max_results, args.year_from, args.year_to)
+      case 'search_semantic_scholar':
+        return searchSemanticScholar(args.query, args.max_results, args.year_from, args.year_to)
+      case 'search_pubmed':
+        return searchPubMed(args.query, args.max_results, args.year_from, args.year_to)
+      case 'smart_search':
+        return smartSearch(args.query, args.max_per_source, workspace)
       case 'download_arxiv_html':
         return downloadArxivHtml(args.arxiv_id, args.output_path, workspace)
       case 'download_arxiv_pdf':
         return downloadArxivPdf(args.arxiv_id, args.output_path, workspace)
+      case 'parse_document':
+        return parseDocumentTool(args.path, workspace, args.max_pages)
+      case 'verify_sources':
+        return verifySources(args.session_id, args.max_sources)
+      case 'plan_research':
+        return planResearch(args.question, args.sub_questions, workspace, args.session_id)
+      case 'update_plan_status':
+        return updatePlanStatus(args.item_id, args.done, workspace)
+      case 'fetch_url':
+        return fetchUrlTool(args.url, args.format, workspace)
       case 'edit_file':
         return editFile(args.path, args.old_string, args.new_string, workspace)
       case 'append_file':
@@ -389,19 +637,95 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'delete_file':
         return deleteFile(args.path, workspace)
       case 'reflect':
-        return reflectOnFindings(args.findings, args.criteria)
+        return reflectOnFindings(args.findings, args.criteria, args.session_id)
       case 'save_finding':
-        return saveFinding(workspace, args.topic, args.content, args.tags)
+        return saveFindingWithIndex(workspace, args.topic, args.content, args.tags, args.session_id)
       case 'recall_findings':
-        return recallFindings(workspace, args.query, args.max_results)
+        return recallFindingsHybrid(workspace, args.query, args.max_results)
       case 'generate_report':
         return generateReport(args.title, args.content, args.output_path, args.session_id, workspace)
       default:
-        return `Unknown tool: ${name}`
+        return `Tool "${name}" is async-only; call executeToolAsync instead, or this tool does not exist.`
     }
   } catch (e: any) {
     return `Error: ${e.message}`
   }
+}
+
+const ASYNC_ONLY_TOOLS = new Set([
+  'search_knowledge',
+  'spawn_sub_researcher',
+  'screenshot_page',
+  'export_report',
+  'recall_findings',
+])
+
+export function isAsyncTool(name: string): boolean {
+  return ASYNC_ONLY_TOOLS.has(name)
+}
+
+export async function executeToolAsync(name: string, args: Record<string, any>, workspace: string, ctx?: { apiUrl?: string; temperature?: number }): Promise<string> {
+  if (!workspace) return 'Error: workspace not set. Please set a workspace directory first.'
+  try {
+    switch (name) {
+      case 'search_knowledge':
+        return await searchKnowledgeTool(args.query, args.k, args.rebuild, workspace)
+      case 'spawn_sub_researcher':
+        return await spawnSubResearcherTool(args.task, args.max_iters, args.session_id, ctx?.apiUrl, ctx?.temperature, workspace)
+      case 'screenshot_page':
+        return await screenshotPageTool(args.url, args.output_path, args.full_page, workspace)
+      case 'export_report':
+        return await exportReportTool(args.markdown_path, args.format, args.output_path, args.session_id, workspace)
+      case 'recall_findings':
+        return await recallFindingsAsync(workspace, args.query, args.max_results)
+      default:
+        // Fallback to synchronous executor
+        return executeTool(name, args, workspace)
+    }
+  } catch (e: any) {
+    return `Error: ${e.message}`
+  }
+}
+
+function saveFindingWithIndex(workspace: string, topic: string, content: string, tags: string | undefined, _sessionId: string | undefined): string {
+  const result = saveFinding(workspace, topic, content, tags)
+  try {
+    if (!result.startsWith('Error')) {
+      indexTextHybrid(workspace, `finding:${Date.now()}`, `${topic}\n\n${content}`).catch(() => {})
+    }
+  } catch {}
+  return result
+}
+
+/**
+ * Hybrid recall (async): query both the plain findings log and the workspace
+ * knowledge index (BM25 + optional vectors), fuse results via Reciprocal Rank
+ * Fusion inside `searchHybrid` and present a single ranked list.
+ */
+async function recallFindingsAsync(workspace: string, query: string, maxResults?: number): Promise<string> {
+  const keywordResult = recallFindings(workspace, query, maxResults)
+  try {
+    const stats = indexStats(workspace)
+    if (stats.chunks === 0) return keywordResult
+
+    const k = Math.max(1, Math.min(20, Number(maxResults) || 10))
+    const hits = await searchHybrid(workspace, query, k)
+    if (hits.length === 0) return keywordResult
+
+    const lines: string[] = ['', '--- Hybrid index hits (BM25 + vectors) ---']
+    hits.forEach((h, i) => {
+      const src = String((h.chunk as any).doc ?? (h.chunk as any).docId ?? '').replace(/^.*\//, '')
+      const snippet = h.chunk.text.slice(0, 280).replace(/\s+/g, ' ')
+      lines.push(`${i + 1}. [${src}] ${snippet}${h.chunk.text.length > 280 ? '…' : ''}`)
+    })
+    return `${keywordResult}\n${lines.join('\n')}`
+  } catch {
+    return keywordResult
+  }
+}
+
+function recallFindingsHybrid(workspace: string, query: string, maxResults?: number): string {
+  return recallFindings(workspace, query, maxResults)
 }
 
 function readFile(filePath: string, workspace: string, offset?: number, limit?: number): string {
@@ -473,7 +797,14 @@ export function getBuiltinToolDefinitions(cfg?: Pick<AppConfig, 'webSearchProvid
     webSearchProvider: cfg?.webSearchProvider ?? (cfg?.searxngBaseUrl ? 'custom-searxng' : 'disabled'),
     searxngBaseUrl: cfg?.searxngBaseUrl ?? null,
   })
-  return TOOL_DEFINITIONS.filter((tool) => tool.function.name !== 'search_web' || searchEnabled)
+  return TOOL_DEFINITIONS.filter((tool) => {
+    if (tool.function.name === 'search_web' && !searchEnabled) return false
+    if (tool.function.name === 'smart_search' && !searchEnabled) {
+      // smart_search still works with academic-only sources, so we keep it
+      return true
+    }
+    return true
+  })
 }
 
 function escapeXml(text: string): string {
@@ -597,7 +928,7 @@ function generateReport(
   return `Report saved to ${relPath} (${report.length} chars, ${references ? 'with' : 'without'} references section).`
 }
 
-function reflectOnFindings(findings: string, criteria?: string): string {
+function reflectOnFindings(findings: string, criteria?: string, sessionId?: string): string {
   const trimmed = String(findings ?? '').trim()
   if (!trimmed) return 'Error: findings text is required.'
 
@@ -607,8 +938,24 @@ function reflectOnFindings(findings: string, criteria?: string): string {
     : allCriteria
   if (requested.length === 0) requested.push(...allCriteria)
 
+  // Gather source context for LLM critic
+  let sourcesContext = ''
+  if (sessionId) {
+    try {
+      const tracker = getSourceTracker(sessionId)
+      if (tracker.count() > 0) {
+        sourcesContext = '\n\n' + tracker.formatForSystemPrompt(3000)
+      }
+    } catch {}
+  }
+
+  // Try LLM-based critic via llama-server
+  const llmCritic = tryLlmCritic(trimmed, requested, sourcesContext)
+  if (llmCritic) return llmCritic
+
+  // Fallback: static checklist
   const checklist: string[] = [
-    '## Self-Reflection Checklist\n',
+    '## Self-Reflection Checklist (static fallback)\n',
     'Evaluate the findings below against each criterion. For each, note whether the findings PASS, NEED IMPROVEMENT, or FAIL, and explain why.\n',
     `### Findings under review\n${trimmed.slice(0, 2000)}${trimmed.length > 2000 ? '\n...[truncated]' : ''}\n`,
   ]
@@ -634,6 +981,72 @@ function reflectOnFindings(findings: string, criteria?: string): string {
   return checklist.join('\n')
 }
 
+/**
+ * Call the running llama-server synchronously (via child Node process) with a
+ * structured critic prompt. Returns null on any failure — caller falls back to
+ * the static checklist.
+ */
+function tryLlmCritic(findings: string, criteria: string[], sourcesContext: string): string | null {
+  const apiUrl = 'http://127.0.0.1:7863'
+  const prompt = `You are a rigorous research critic. Review the findings below and produce concise structured markdown feedback.
+
+# Criteria to evaluate
+${criteria.map((c) => `- ${c}`).join('\n')}
+
+# Findings under review
+${findings.slice(0, 6000)}${findings.length > 6000 ? '\n... [truncated]' : ''}${sourcesContext}
+
+# Required output format (return EXACTLY this structure, nothing else)
+
+## Strengths
+- 3–5 bullet points.
+
+## Gaps
+- Missing sub-topics, under-explored angles, absent stakeholders.
+
+## Contradictions
+- Conflicts between findings or between findings and cited sources (or "None detected.").
+
+## Weak Sources
+- Sources that look speculative, outdated, or uncited (or "None detected.").
+
+## Action Items
+- Concrete next search queries or verification steps (3–5 max).
+
+Be direct, specific, and evidence-based. Do not repeat the findings verbatim.`
+
+  const script = `
+(async () => {
+  const res = await fetch(process.argv[1] + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'local',
+      messages: [
+        { role: 'system', content: 'You are a rigorous research critic. Follow the requested output format exactly.' },
+        { role: 'user', content: process.argv[2] },
+      ],
+      temperature: 0.3,
+      max_tokens: 900,
+    }),
+  })
+  if (!res.ok) { console.error('HTTP ' + res.status); process.exit(1) }
+  const json = await res.json()
+  process.stdout.write(String(json?.choices?.[0]?.message?.content || ''))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  try {
+    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt], {
+      encoding: 'utf-8',
+      timeout: 90000,
+      maxBuffer: 1024 * 1024 * 2,
+      env: { ...process.env, FORCE_COLOR: '0', ELECTRON_RUN_AS_NODE: '1' },
+    }).trim()
+    if (out.length < 50) return null
+    return `## Self-Reflection (LLM critic)\n\n${out}`
+  } catch { return null }
+}
+
 function searchArxiv(
   query: string,
   maxResults?: number,
@@ -641,11 +1054,13 @@ function searchArxiv(
   toDate?: string,
   sortBy?: string,
   sortOrder?: string,
+  start?: number,
 ): string {
   const trimmedQuery = String(query ?? '').trim()
   if (!trimmedQuery) return 'Error: query is required.'
 
   const limit = clampSearchLimit(maxResults)
+  const startOffset = Number.isFinite(Number(start)) ? Math.max(0, Math.trunc(Number(start))) : 0
   const inferredWindow = inferDateWindow(trimmedQuery)
   const freshnessHints = detectFreshnessHints(trimmedQuery)
   const normalizedFrom = normalizeIsoDate(fromDate) ?? inferredWindow.fromDate
@@ -669,7 +1084,8 @@ const sortBy = process.argv[3] || 'relevance'
 const sortOrder = process.argv[4] || 'descending'
 const dateFilter = process.argv[5] || ''
 const searchQuery = dateFilter ? '(all:' + query + ')' + dateFilter : 'all:' + query
-const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=0&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
+const startOffset = Number(process.argv[6] || '0')
+const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=' + startOffset + '&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
 fetch(url, {
   headers: { 'User-Agent': 'one-click-research-agent/0.1' },
 }).then(async (res) => {
@@ -684,7 +1100,7 @@ fetch(url, {
 
   let xml = ''
   try {
-    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter])
+    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)])
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e)
     return `Error: failed to search arXiv. ${stderr.trim()}`
@@ -1278,6 +1694,446 @@ function deleteFile(filePath: string, workspace: string): string {
   if (stat.isDirectory()) return `Error: ${filePath} is a directory. Use execute_command with "rm -r" instead.`
   fs.unlinkSync(p)
   return `Deleted: ${filePath}`
+}
+
+// ---------------------------------------------------------------------------
+// New research tools (Wave 1-6)
+// ---------------------------------------------------------------------------
+
+function parseDocumentTool(filePath: string, workspace: string, maxPages?: number): string {
+  if (!filePath) return 'Error: path is required.'
+  const p = resolvePath(filePath, workspace)
+  assertInWorkspace(p, workspace)
+  if (!fs.existsSync(p)) return `File not found: ${filePath}`
+  const ext = path.extname(p).toLowerCase()
+  if (!isDocumentExtension(ext)) return `parse_document supports .pdf/.docx/.doc only. For ${ext} use read_file.`
+  try {
+    const parsed = parseDocument(p, maxPages)
+    const header = parsed.pages ? `Parsed ${filePath} — ${parsed.pages} pages, ${parsed.text.length} chars.\n\n` : `Parsed ${filePath} — ${parsed.text.length} chars.\n\n`
+    const body = summarizeParsedForPrompt(parsed, 24000)
+    return header + body
+  } catch (e: any) {
+    return `Error: parse_document failed. ${e?.message || e}`
+  }
+}
+
+function verifySources(sessionId: string | undefined, maxSources?: number): string {
+  if (!sessionId) return 'Error: no session context. verify_sources is only usable from within an agent session.'
+  const tracker = getSourceTracker(sessionId)
+  const all = tracker.getAll()
+  if (all.length === 0) return 'No sources collected in this session yet — nothing to verify.'
+  const limit = Math.max(1, Math.min(all.length, Number(maxSources) || all.length))
+  const toCheck = all.slice(0, limit)
+  const lines: string[] = [`Verified ${toCheck.length} source(s):`]
+  const counts = { live: 0, archived: 0, dead: 0, hallucinated: 0, unknown: 0 }
+  for (const src of toCheck) {
+    const h = checkUrlHealth(src.url)
+    tracker.updateHealth(src.url, h)
+    counts[h.status] = (counts[h.status] || 0) + 1
+    const extra = h.archivedUrl ? ` → archived: ${h.archivedUrl}` : (h.error ? ` (${h.error.slice(0, 80)})` : '')
+    lines.push(`[${src.idx}] ${formatHealthBadge(h)}${h.httpStatus ? ` (HTTP ${h.httpStatus})` : ''} — ${src.url}${extra}`)
+  }
+  lines.push('')
+  lines.push(`Summary: live=${counts.live}, archived=${counts.archived}, dead=${counts.dead}, hallucinated=${counts.hallucinated}, unknown=${counts.unknown}`)
+  return lines.join('\n')
+}
+
+function planResearch(question: string, subQuestions: unknown, workspace: string, sessionId: string | undefined): string {
+  const q = String(question ?? '').trim()
+  if (!q) return 'Error: question is required.'
+  const list = Array.isArray(subQuestions) ? subQuestions.map((s) => String(s || '').trim()).filter(Boolean) : []
+  if (list.length === 0) return 'Error: sub_questions must be a non-empty array.'
+  if (list.length > 10) list.length = 10
+  try {
+    writePlan(workspace, q, list)
+  } catch (e: any) {
+    return `Error: failed to write plan. ${e?.message || e}`
+  }
+  const preview = list.map((s, i) => `  ${i + 1}. ${s}`).join('\n')
+  return `Plan saved to .research/plan.md\n${preview}\n\nNext steps: investigate each sub-question (optionally via spawn_sub_researcher), then use update_plan_status to mark items done.`
+}
+
+function updatePlanStatus(itemId: string, done: boolean, workspace: string): string {
+  if (!itemId) return 'Error: item_id is required.'
+  const ok = updatePlanItem(workspace, String(itemId), Boolean(done))
+  if (!ok) return `Could not find plan item "${itemId}" in .research/plan.md. Make sure plan_research was called first and the id exists (e.g. "Q2").`
+  const items = parsePlan(workspace)
+  const progress = planProgress(items)
+  return `Updated "${itemId}" → ${done ? 'done' : 'open'}. Progress: ${progress.done}/${progress.total} (${progress.pct}%).`
+}
+
+function searchCrossref(query: string, maxResults?: number, yearFrom?: number, yearTo?: number): string {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const limit = clampSearchLimit(maxResults)
+  const cacheParams = { q: q.toLowerCase(), limit, yearFrom: yearFrom ?? null, yearTo: yearTo ?? null }
+  const cached = searchCache.get('search_crossref', cacheParams)
+  if (cached) return `[cached]\n${cached}`
+
+  const config = (() => { try { return cfg.load() } catch { return null } })()
+  const mailto = config?.crossrefMailto ? String(config.crossrefMailto).trim() : ''
+  const params = new URLSearchParams()
+  params.set('query', q)
+  params.set('rows', String(limit))
+  const filters: string[] = []
+  if (Number.isFinite(Number(yearFrom))) filters.push(`from-pub-date:${Math.trunc(Number(yearFrom))}-01-01`)
+  if (Number.isFinite(Number(yearTo))) filters.push(`until-pub-date:${Math.trunc(Number(yearTo))}-12-31`)
+  if (filters.length) params.set('filter', filters.join(','))
+  if (mailto) params.set('mailto', mailto)
+
+  const script = `
+(async () => {
+  const url = 'https://api.crossref.org/works?' + process.argv[1]
+  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1 (${mailto || 'mailto:researcher@example.com'})' } })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(JSON.stringify(await r.json()))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  let payload: any
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
+    return `Error: Crossref search failed. ${String(e?.stderr || e?.message || e).trim()}`
+  }
+  const items: any[] = Array.isArray(payload?.message?.items) ? payload.message.items : []
+  if (items.length === 0) return `No Crossref works found for "${q}".`
+  const lines = items.slice(0, limit).map((it: any, idx: number) => {
+    const title = Array.isArray(it.title) ? it.title[0] : (it.title || 'Untitled')
+    const doi = it.DOI ? `https://doi.org/${it.DOI}` : ''
+    const urlRaw = it.URL || doi
+    const journal = Array.isArray(it['container-title']) ? it['container-title'][0] : ''
+    const publisher = it.publisher || ''
+    const type = it.type || ''
+    const issued = it.issued?.['date-parts']?.[0]?.join('-') || ''
+    const authors = Array.isArray(it.author)
+      ? it.author.map((a: any) => `${a.given || ''} ${a.family || ''}`.trim()).filter(Boolean).slice(0, 10).join(', ')
+      : ''
+    return [
+      `${idx + 1}. ${title}`,
+      doi ? `   DOI: ${doi}` : null,
+      urlRaw ? `   URL: ${urlRaw}` : null,
+      authors ? `   Authors: ${authors}` : null,
+      journal ? `   Journal: ${journal}` : null,
+      publisher ? `   Publisher: ${publisher}` : null,
+      type ? `   Type: ${type}` : null,
+      issued ? `   Published: ${issued}` : null,
+    ].filter(Boolean).join('\n')
+  })
+  const out = `Found ${Math.min(items.length, limit)} Crossref work(s) for "${q}":\n\n${lines.join('\n\n')}`
+  searchCache.set('search_crossref', cacheParams, out)
+  return out
+}
+
+function searchSemanticScholar(query: string, maxResults?: number, yearFrom?: number, yearTo?: number): string {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const limit = clampSearchLimit(maxResults)
+  const cacheParams = { q: q.toLowerCase(), limit, yearFrom: yearFrom ?? null, yearTo: yearTo ?? null }
+  const cached = searchCache.get('search_semantic_scholar', cacheParams)
+  if (cached) return `[cached]\n${cached}`
+
+  const config = (() => { try { return cfg.load() } catch { return null } })()
+  const apiKey = config?.semanticScholarApiKey ? String(config.semanticScholarApiKey).trim() : ''
+  const params = new URLSearchParams()
+  params.set('query', q)
+  params.set('limit', String(limit))
+  params.set('fields', 'title,authors,year,venue,abstract,citationCount,url,externalIds,publicationDate')
+  if (Number.isFinite(Number(yearFrom)) || Number.isFinite(Number(yearTo))) {
+    const from = Number.isFinite(Number(yearFrom)) ? String(Math.trunc(Number(yearFrom))) : ''
+    const to = Number.isFinite(Number(yearTo)) ? String(Math.trunc(Number(yearTo))) : ''
+    params.set('year', `${from}-${to}`)
+  }
+
+  const headerLiteral = apiKey ? `, 'x-api-key': '${apiKey.replace(/'/g, "\\'")}'` : ''
+  const script = `
+(async () => {
+  const url = 'https://api.semanticscholar.org/graph/v1/paper/search?' + process.argv[1]
+  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1'${headerLiteral} } })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(JSON.stringify(await r.json()))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  let payload: any
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    if (stderr.includes('HTTP 403') || stderr.includes('HTTP 429')) {
+      return `Semantic Scholar is rate-limited or unavailable (${stderr.match(/HTTP \d+/)?.[0] || 'network error'}). Try search_crossref or search_openalex instead.`
+    }
+    return `Error: Semantic Scholar search failed. ${stderr}`
+  }
+  const items: any[] = Array.isArray(payload?.data) ? payload.data : []
+  if (items.length === 0) return `No Semantic Scholar papers found for "${q}".`
+  const lines = items.slice(0, limit).map((it: any, idx: number) => {
+    const title = it.title || 'Untitled'
+    const year = it.year ? String(it.year) : ''
+    const venue = it.venue || ''
+    const url = it.url || (it.externalIds?.DOI ? `https://doi.org/${it.externalIds.DOI}` : '')
+    const authors = Array.isArray(it.authors)
+      ? it.authors.map((a: any) => a?.name).filter(Boolean).slice(0, 10).join(', ')
+      : ''
+    const abstract = String(it.abstract || '').replace(/\s+/g, ' ').slice(0, 400)
+    const cites = Number.isFinite(Number(it.citationCount)) ? String(it.citationCount) : ''
+    return [
+      `${idx + 1}. ${title}`,
+      year ? `   Year: ${year}` : null,
+      url ? `   URL: ${url}` : null,
+      authors ? `   Authors: ${authors}` : null,
+      venue ? `   Venue: ${venue}` : null,
+      cites ? `   Citations: ${cites}` : null,
+      abstract ? `   Abstract: ${abstract}` : null,
+    ].filter(Boolean).join('\n')
+  })
+  const out = `Found ${Math.min(items.length, limit)} Semantic Scholar paper(s) for "${q}":\n\n${lines.join('\n\n')}`
+  searchCache.set('search_semantic_scholar', cacheParams, out)
+  return out
+}
+
+function searchPubMed(query: string, maxResults?: number, yearFrom?: number, yearTo?: number): string {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const limit = clampSearchLimit(maxResults)
+  const cacheParams = { q: q.toLowerCase(), limit, yearFrom: yearFrom ?? null, yearTo: yearTo ?? null }
+  const cached = searchCache.get('search_pubmed', cacheParams)
+  if (cached) return `[cached]\n${cached}`
+
+  let effectiveQuery = q
+  const yearFilter: string[] = []
+  if (Number.isFinite(Number(yearFrom))) yearFilter.push(`PUB_YEAR:[${Math.trunc(Number(yearFrom))} TO *]`)
+  if (Number.isFinite(Number(yearTo))) yearFilter.push(`PUB_YEAR:[* TO ${Math.trunc(Number(yearTo))}]`)
+  if (yearFilter.length) effectiveQuery = `(${q}) AND (${yearFilter.join(' AND ')})`
+
+  const params = new URLSearchParams()
+  params.set('query', effectiveQuery)
+  params.set('format', 'json')
+  params.set('pageSize', String(limit))
+  params.set('resultType', 'core')
+
+  const script = `
+(async () => {
+  const url = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?' + process.argv[1]
+  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(JSON.stringify(await r.json()))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  let payload: any
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
+    return `Error: Europe PMC (PubMed) search failed. ${String(e?.stderr || e?.message || e).trim()}`
+  }
+  const items: any[] = Array.isArray(payload?.resultList?.result) ? payload.resultList.result : []
+  if (items.length === 0) return `No PubMed / Europe PMC papers found for "${q}".`
+  const lines = items.slice(0, limit).map((it: any, idx: number) => {
+    const title = String(it.title || 'Untitled').trim().replace(/\.$/, '')
+    const journal = it.journalInfo?.journal?.title || it.journalTitle || ''
+    const pubDate = String(it.firstPublicationDate || it.pubYear || '').trim()
+    const pmid = it.pmid || ''
+    const doi = it.doi ? `https://doi.org/${it.doi}` : ''
+    const url = doi || (pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : '')
+    const authors = String(it.authorString || '').trim()
+    const abstract = String(it.abstractText || '').replace(/\s+/g, ' ').slice(0, 400)
+    return [
+      `${idx + 1}. ${title}`,
+      pubDate ? `   Published: ${pubDate}` : null,
+      authors ? `   Authors: ${authors}` : null,
+      journal ? `   Journal: ${journal}` : null,
+      url ? `   URL: ${url}` : null,
+      doi ? `   DOI: ${doi}` : null,
+      abstract ? `   Abstract: ${abstract}` : null,
+    ].filter(Boolean).join('\n')
+  })
+  const out = `Found ${Math.min(items.length, limit)} PubMed / Europe PMC paper(s) for "${q}":\n\n${lines.join('\n\n')}`
+  searchCache.set('search_pubmed', cacheParams, out)
+  return out
+}
+
+function smartSearch(query: string, maxPerSource: number | undefined, workspace: string): string {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const perSource = Math.max(1, Math.min(6, Number(maxPerSource) || 4))
+  const decision = classifyQuery(q)
+  const webSearchAvailable = (() => {
+    try {
+      const conf = loadWebSearchConfig()
+      return !!resolveWebSearchBaseUrl(conf, false)
+    } catch { return false }
+  })()
+
+  const parts: string[] = [`# smart_search "${q}"`]
+  parts.push(`Classifier: ${decision.classes.join(', ')}; sources: ${decision.sources.join(', ')}`)
+  parts.push('')
+  const seenUrls = new Set<string>()
+  const mergedResults: string[] = []
+
+  for (const tool of decision.sources) {
+    let out: string | null = null
+    try {
+      if (tool === 'search_web') {
+        if (!webSearchAvailable) { mergedResults.push(`## search_web\nskipped (SearXNG not configured)`); continue }
+        out = searchWeb(q, perSource, undefined, undefined, undefined)
+      } else if (tool === 'search_arxiv') {
+        out = searchArxiv(q, perSource)
+      } else if (tool === 'search_openalex') {
+        out = searchOpenAlex(q, perSource)
+      } else if (tool === 'search_huggingface_papers') {
+        out = searchHuggingFacePapers(q, perSource)
+      } else if (tool === 'search_crossref') {
+        out = searchCrossref(q, perSource)
+      } else if (tool === 'search_semantic_scholar') {
+        out = searchSemanticScholar(q, perSource)
+      } else if (tool === 'search_pubmed') {
+        out = searchPubMed(q, perSource)
+      }
+    } catch (e: any) { out = `Error: ${e?.message || e}` }
+    if (!out) continue
+    const sources = extractSourcesFromToolResult(tool, out)
+    const unique = sources.filter((s) => {
+      if (!s.url) return false
+      if (seenUrls.has(s.url)) return false
+      seenUrls.add(s.url)
+      return true
+    })
+    mergedResults.push(`## ${tool} (${unique.length} new / ${sources.length} total)\n${out}`)
+  }
+
+  return parts.concat(mergedResults).join('\n\n')
+}
+
+function fetchUrlTool(url: string, format: string | undefined, workspace: string): string {
+  const u = String(url ?? '').trim()
+  if (!u) return 'Error: url is required.'
+  if (!/^https?:\/\//i.test(u)) return 'Error: only http(s) URLs are supported.'
+
+  const fmt = (format === 'html' || format === 'text' || format === 'markdown') ? format : 'markdown'
+  const kind = classifyUrlImpl(u)
+
+  // Delegate arxiv to existing tools for consistent local caching
+  if (kind === 'arxiv-abs') {
+    const id = extractArxivId(u)
+    if (id) {
+      const download = downloadArxivHtml(id, undefined, workspace)
+      return `fetch_url detected arXiv abstract; downloaded HTML locally.\n${download}`
+    }
+  }
+  if (kind === 'arxiv-pdf') {
+    const id = extractArxivId(u)
+    if (id) {
+      const download = downloadArxivPdf(id, undefined, workspace)
+      return `fetch_url detected arXiv PDF; downloaded PDF locally.\n${download}\nNext step: call parse_document on the downloaded file.`
+    }
+  }
+
+  const cacheKey = { url: u, format: fmt }
+  const cached = searchCache.get('fetch_url', cacheKey)
+  if (cached) return `[cached]\n${cached}`
+
+  const result = fetchUrlImpl(u, fmt)
+  if ('error' in result && result.error) {
+    if (result.isBinary && result.contentTypeHint === 'pdf') {
+      return `fetch_url: remote returned a PDF (Content-Type: ${result.contentType}). Use download_arxiv_pdf or save the file with execute_command and parse_document.`
+    }
+    return `Error: fetch_url failed — ${result.error}`
+  }
+  const page = result as any
+  const excerpt = (page.content || '').length > 32000 ? page.content.slice(0, 32000) + '\n… [truncated]' : page.content
+  const header = [
+    `Title: ${page.title}`,
+    `URL: ${page.finalUrl}`,
+    page.byline ? `Byline: ${page.byline}` : null,
+    page.siteName ? `Site: ${page.siteName}` : null,
+    page.publishedTime ? `Published: ${page.publishedTime}` : null,
+    `Format: ${fmt}`,
+    `Length: ${page.length} chars`,
+  ].filter(Boolean).join('\n')
+  const out = `${header}\n\n---\n\n${excerpt}`
+  searchCache.set('fetch_url', cacheKey, out)
+  return out
+}
+
+async function screenshotPageTool(url: string, outputPath: string | undefined, fullPage: boolean | undefined, workspace: string): Promise<string> {
+  const u = String(url ?? '').trim()
+  if (!u) return 'Error: url is required.'
+  if (!/^https?:\/\//i.test(u)) return 'Error: only http(s) URLs are supported.'
+  const slug = u.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_').slice(0, 80) + '.png'
+  const out = outputPath ? resolvePath(outputPath, workspace) : resolvePath(path.join('.research', 'screenshots', slug), workspace)
+  assertInWorkspace(out, workspace)
+  try {
+    const { bytes, title } = await screenshotPage(u, out, !!fullPage)
+    return `Screenshot saved to ${path.relative(workspace, out) || out} (${bytes} bytes). Page title: ${title}`
+  } catch (e: any) {
+    return `Error: screenshot_page failed — ${e?.message || e}`
+  }
+}
+
+async function searchKnowledgeTool(query: string, k: number | undefined, rebuild: boolean | undefined, workspace: string): Promise<string> {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const kk = Math.max(1, Math.min(20, Number(k) || 8))
+  if (rebuild) {
+    try { await rebuildIndex(workspace) } catch (e: any) { return `Error: rebuildIndex failed — ${e?.message || e}` }
+  }
+  const stats = indexStats(workspace)
+  if (stats.chunks === 0) {
+    try { await rebuildIndex(workspace) } catch {}
+  }
+  const results = await searchHybrid(workspace, q, kk)
+  if (results.length === 0) return `No results in local knowledge index for "${q}". (index: ${stats.chunks} chunks, ${stats.docs} docs, vectors: ${stats.hasVectors ? 'yes' : 'no'})`
+  const lines: string[] = [`Found ${results.length} local passages for "${q}" (index: ${indexStats(workspace).chunks} chunks, vectors: ${indexStats(workspace).hasVectors ? 'yes' : 'no'})`, '']
+  results.forEach((r, i) => {
+    const scoreParts: string[] = []
+    if (r.bm25Rank) scoreParts.push(`bm25#${r.bm25Rank}`)
+    if (r.vectorRank) scoreParts.push(`vec#${r.vectorRank}`)
+    lines.push(`${i + 1}. [${r.chunk.doc}] (${scoreParts.join(', ') || 'hybrid'})`)
+    const preview = r.chunk.text.length > 600 ? r.chunk.text.slice(0, 600) + '…' : r.chunk.text
+    lines.push(`   ${preview.replace(/\n/g, ' ')}`)
+    lines.push('')
+  })
+  return lines.join('\n')
+}
+
+async function spawnSubResearcherTool(task: string, maxIters: number | undefined, parentSessionId: string | undefined, apiUrl: string | undefined, temperature: number | undefined, _workspace: string): Promise<string> {
+  if (!parentSessionId) return 'Error: parent session id missing (spawn_sub_researcher is only usable inside an agent session).'
+  const t = String(task ?? '').trim()
+  if (!t) return 'Error: task is required.'
+  if (!apiUrl) return 'Error: LLM api URL unavailable for sub-researcher.'
+  if (!canSpawnMore()) return 'Error: maximum of 3 sub-researchers already running. Wait for one to finish.'
+  const res = await runSubResearcher(
+    { task: t, maxIters, parentSessionId, apiUrl, temperature },
+    (name: string, args: any) => executeTool(name, args, _workspace),
+  )
+  return `[sub_researcher result]\nTask: ${t}\nIterations: ${res.iterations}\nTool calls: ${res.toolCallsMade.join(', ') || 'none'}\nNew sources collected: ${res.sourcesAdded}\n\n${res.report}`
+}
+
+async function exportReportTool(markdownPath: string | undefined, format: string, outputPath: string | undefined, sessionId: string | undefined, workspace: string): Promise<string> {
+  if (!format || !['pdf', 'docx', 'bibtex'].includes(format)) return 'Error: format must be one of pdf, docx, bibtex.'
+  if (format === 'bibtex') {
+    if (!sessionId) return 'Error: session id missing, cannot export BibTeX.'
+    const tracker = getSourceTracker(sessionId)
+    const out = outputPath ? resolvePath(outputPath, workspace) : resolvePath(path.join('.research', 'references.bib'), workspace)
+    assertInWorkspace(out, workspace)
+    try {
+      const n = exportBibTex(tracker, out)
+      return `Wrote ${n} BibTeX entr${n === 1 ? 'y' : 'ies'} to ${path.relative(workspace, out)}.`
+    } catch (e: any) { return `Error: export_report bibtex failed — ${e?.message || e}` }
+  }
+
+  const mdPath = resolvePath(markdownPath || path.join('.research', 'report.md'), workspace)
+  assertInWorkspace(mdPath, workspace)
+  if (!fs.existsSync(mdPath)) return `Error: markdown file not found: ${markdownPath || '.research/report.md'}`
+  const markdownContent = fs.readFileSync(mdPath, 'utf-8')
+  const titleMatch = markdownContent.match(/^#\s+(.+)$/m)
+  const title = titleMatch ? titleMatch[1].trim() : path.basename(mdPath, '.md')
+
+  const defaultOut = format === 'pdf'
+    ? mdPath.replace(/\.md$/, '.pdf')
+    : mdPath.replace(/\.md$/, '.docx')
+  const out = outputPath ? resolvePath(outputPath, workspace) : defaultOut
+  assertInWorkspace(out, workspace)
+  try {
+    if (format === 'pdf') await exportPdf(markdownContent, title, out)
+    else await exportDocx(markdownContent, title, out)
+    const bytes = fs.statSync(out).size
+    return `Exported ${format.toUpperCase()} to ${path.relative(workspace, out)} (${bytes} bytes).`
+  } catch (e: any) {
+    return `Error: export_report ${format} failed — ${e?.message || e}`
+  }
 }
 
 export function executeCustomTool(

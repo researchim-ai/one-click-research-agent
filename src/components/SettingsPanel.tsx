@@ -9,7 +9,7 @@ interface Props {
   initialTab?: string
 }
 
-type Tab = 'model' | 'agent' | 'tools' | 'prompts'
+type Tab = 'model' | 'agent' | 'tools' | 'research' | 'prompts'
 
 const CTX_OPTIONS = [
   { value: 262144, label: '262K' },
@@ -112,7 +112,12 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 
   useEffect(() => {
     if (initialTab) {
-      const mapped = initialTab === 'prompts' ? 'prompts' : initialTab === 'tools' ? 'tools' : initialTab === 'agent' ? 'agent' : 'model'
+      const mapped: Tab =
+        initialTab === 'prompts' ? 'prompts'
+        : initialTab === 'tools' ? 'tools'
+        : initialTab === 'agent' ? 'agent'
+        : initialTab === 'research' ? 'research'
+        : 'model'
       setTab(mapped)
     }
   }, [initialTab, open])
@@ -333,11 +338,13 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const tabs: { key: Tab; label: string }[] = appLanguage === 'ru' ? [
     { key: 'model', label: 'Модель' },
     { key: 'agent', label: 'Агент' },
+    { key: 'research', label: 'Research' },
     { key: 'tools', label: 'Инструменты' },
     { key: 'prompts', label: 'Промпты' },
   ] : [
     { key: 'model', label: 'Model' },
     { key: 'agent', label: 'Agent' },
+    { key: 'research', label: 'Research' },
     { key: 'tools', label: 'Tools' },
     { key: 'prompts', label: 'Prompts' },
   ]
@@ -449,6 +456,9 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
               onDelete={handleDeleteCustomTool}
               onCancelEdit={() => setEditingTool(null)}
             />
+          )}
+          {tab === 'research' && (
+            <ResearchTab appLanguage={appLanguage} cfg={cfg} onCfgChange={(patch) => setCfg({ ...cfg, ...patch } as AppConfig)} />
           )}
           {tab === 'prompts' && (
             <PromptsTab
@@ -1449,6 +1459,282 @@ function PromptsTab({
           <p className="text-[10px] text-zinc-700 mt-1">{L ? 'Используется промпт по умолчанию' : 'Using default prompt'}</p>
         )}
       </SettingsSection>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Research tab — advanced research-agent knobs + embed server + index + workflow
+// ---------------------------------------------------------------------------
+
+function ResearchTab({
+  appLanguage, cfg, onCfgChange,
+}: {
+  appLanguage: AppLanguage
+  cfg: AppConfig
+  onCfgChange: (patch: Partial<AppConfig>) => void
+}) {
+  const L = appLanguage === 'ru'
+  const [saving, setSaving] = useState(false)
+  const [embedState, setEmbedState] = useState<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string } | null>(null)
+  const [embedBusy, setEmbedBusy] = useState<'download' | 'start' | 'stop' | null>(null)
+  const [embedPct, setEmbedPct] = useState<number | null>(null)
+  const [embedError, setEmbedError] = useState<string | null>(null)
+  const [indexStats, setIndexStats] = useState<{ chunks: number; docs: number; hasVectors: boolean } | null>(null)
+  const [indexBusy, setIndexBusy] = useState(false)
+  const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null)
+  const [workspaceForIndex, setWorkspaceForIndex] = useState<string>('')
+
+  const refreshEmbed = async () => {
+    try { setEmbedState(await window.api.embedStatus()) } catch {}
+  }
+  const refreshIndex = async (ws: string) => {
+    if (!ws) { setIndexStats(null); return }
+    try { setIndexStats(await window.api.knowledgeIndexStats(ws)) } catch {}
+  }
+
+  useEffect(() => {
+    refreshEmbed()
+    const offDl = window.api.onEmbedDownloadProgress((pct) => setEmbedPct(pct))
+    const offIdx = window.api.onKnowledgeIndexProgress((p) => setIndexProgress(p))
+    // Best-effort get current workspace from the URL hash or cfg — but cfg has no workspace field,
+    // so we rely on the status bar: the user will see "Index not available" until they pick a workspace.
+    // Use the active session's workspace via a simple probe:
+    ;(async () => {
+      try {
+        const recents = await window.api.getRecentWorkspaces()
+        if (recents && recents[0]) {
+          setWorkspaceForIndex(recents[0])
+          refreshIndex(recents[0])
+        }
+      } catch {}
+    })()
+    return () => { offDl(); offIdx() }
+  }, [])
+
+  const saveCfg = async (patch: Partial<AppConfig>) => {
+    setSaving(true)
+    try {
+      await window.api.saveConfig(patch)
+      onCfgChange(patch)
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Workflow */}
+      <SettingsSection
+        title={L ? 'Рабочий процесс агента' : 'Agent workflow'}
+        description={L ? 'Управление паузами на саморефлексию, автоверификацией источников и human-in-the-loop одобрением планов.' : 'Controls self-reflection pauses, automatic source verification, and human-in-the-loop plan approvals.'}
+      >
+        <div className="space-y-3">
+          <label className="flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!cfg.approvalForPlans}
+              onChange={(e) => saveCfg({ approvalForPlans: e.target.checked })}
+              className="mt-0.5 accent-blue-500"
+            />
+            <div>
+              <div className="text-sm text-zinc-200">{L ? 'Запрашивать подтверждение плана' : 'Require plan approval'}</div>
+              <div className="text-[11px] text-zinc-500">{L ? 'Перед тем как агент запустит план исследования, он покажет его пользователю.' : 'Before the agent starts a research plan, it will show it to you for approval.'}</div>
+            </div>
+          </label>
+          <label className="flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!cfg.autoVerifyBeforeReport}
+              onChange={(e) => saveCfg({ autoVerifyBeforeReport: e.target.checked })}
+              className="mt-0.5 accent-blue-500"
+            />
+            <div>
+              <div className="text-sm text-zinc-200">{L ? 'Проверять ссылки перед отчётом' : 'Verify sources before report'}</div>
+              <div className="text-[11px] text-zinc-500">{L ? 'Автоматически вызывает verify_sources перед generate_report и помечает мёртвые ссылки.' : 'Automatically runs verify_sources before generate_report and flags dead links.'}</div>
+            </div>
+          </label>
+          <div>
+            <div className="text-sm text-zinc-200 mb-1">{L ? 'Саморефлексия supervisor' : 'Supervisor auto-reflection'}</div>
+            <div className="text-[11px] text-zinc-500 mb-2">{L ? 'Каждые N итераций агент сам делает паузу и вызывает reflect. 0 = выключено (deep-research всё равно активирует).' : 'Every N iterations the agent pauses and calls reflect. 0 = off (deep-research enables it anyway).'}</div>
+            <input
+              type="number"
+              min={0}
+              max={50}
+              value={cfg.supervisorAutoReflectEvery ?? 0}
+              onChange={(e) => saveCfg({ supervisorAutoReflectEvery: Math.max(0, Math.min(50, Number(e.target.value) || 0)) })}
+              className="w-28 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Academic API hints */}
+      <SettingsSection
+        title={L ? 'Академические API' : 'Academic APIs'}
+        description={L ? 'Опциональные контактные email и ключи для вежливого использования API Crossref и Semantic Scholar.' : 'Optional contact emails / API keys for polite use of Crossref and Semantic Scholar.'}
+      >
+        <div className="space-y-3">
+          <div>
+            <label className="text-sm text-zinc-200">Crossref <span className="text-zinc-500 text-[11px]">mailto</span></label>
+            <input
+              type="email"
+              placeholder="you@example.com"
+              value={cfg.crossrefMailto ?? ''}
+              onChange={(e) => saveCfg({ crossrefMailto: e.target.value })}
+              className="mt-1 w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+            <p className="text-[11px] text-zinc-500 mt-1">{L ? 'Вежливый пул Crossref даёт более стабильные ответы.' : 'Crossref polite pool gives more stable responses.'}</p>
+          </div>
+          <div>
+            <label className="text-sm text-zinc-200">Semantic Scholar <span className="text-zinc-500 text-[11px]">API key</span></label>
+            <input
+              type="password"
+              placeholder={L ? '(не обязательно)' : '(optional)'}
+              value={cfg.semanticScholarApiKey ?? ''}
+              onChange={(e) => saveCfg({ semanticScholarApiKey: e.target.value })}
+              className="mt-1 w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+            <p className="text-[11px] text-zinc-500 mt-1">{L ? 'Без ключа работает публичный rate-limit.' : 'Without a key, the public rate limit applies.'}</p>
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Embed server */}
+      <SettingsSection
+        title={L ? 'Сервер эмбеддингов' : 'Embedding server'}
+        description={L ? 'Локальный llama-server с моделью bge-m3 для векторного поиска по собранным исследованиям.' : 'Local llama-server running bge-m3 for vector search over collected research.'}
+      >
+        <div className="space-y-3">
+          <label className="flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!cfg.embedEnabled}
+              onChange={(e) => saveCfg({ embedEnabled: e.target.checked })}
+              className="mt-0.5 accent-blue-500"
+            />
+            <div>
+              <div className="text-sm text-zinc-200">{L ? 'Использовать векторные эмбеддинги' : 'Use vector embeddings'}</div>
+              <div className="text-[11px] text-zinc-500">{L ? 'Включает семантический поиск поверх локального BM25 индекса (~540 МБ модель).' : 'Enables semantic search on top of the local BM25 index (~540 MB model).'}</div>
+            </div>
+          </label>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-[11px] space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-zinc-500">{L ? 'Статус:' : 'Status:'}</span>
+              <span className={embedState?.isRunning ? 'text-emerald-400' : 'text-zinc-400'}>
+                {embedState?.isRunning ? (L ? 'запущен' : 'running') : (L ? 'остановлен' : 'stopped')}
+              </span>
+              {embedState?.modelDownloaded ? (
+                <span className="ml-2 text-emerald-400">{L ? '✓ модель скачана' : '✓ model downloaded'}</span>
+              ) : (
+                <span className="ml-2 text-amber-400">{L ? 'модель не скачана' : 'model not downloaded'}</span>
+              )}
+            </div>
+            {embedState?.modelPath && (
+              <div className="text-zinc-600 font-mono truncate">{embedState.modelPath}</div>
+            )}
+            {embedPct !== null && embedBusy === 'download' && (
+              <div className="text-zinc-500">{L ? 'Загрузка:' : 'Downloading:'} {embedPct}%</div>
+            )}
+            {embedError && <div className="text-red-400">{embedError}</div>}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!!embedBusy || embedState?.modelDownloaded}
+              onClick={async () => {
+                setEmbedBusy('download'); setEmbedError(null); setEmbedPct(0)
+                const r = await window.api.embedDownloadModel()
+                setEmbedBusy(null); setEmbedPct(null)
+                if (!r.ok) setEmbedError(r.error || 'download failed')
+                refreshEmbed()
+              }}
+              className="px-3 py-1.5 text-xs rounded-lg bg-blue-600/90 text-white hover:bg-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {L ? 'Скачать bge-m3 (~540МБ)' : 'Download bge-m3 (~540MB)'}
+            </button>
+            <button
+              type="button"
+              disabled={!!embedBusy || !embedState?.modelDownloaded || embedState?.isRunning}
+              onClick={async () => {
+                setEmbedBusy('start'); setEmbedError(null)
+                const r = await window.api.embedStart()
+                setEmbedBusy(null)
+                if (!r.ok) setEmbedError(r.error || 'start failed')
+                refreshEmbed()
+              }}
+              className="px-3 py-1.5 text-xs rounded-lg bg-emerald-600/90 text-white hover:bg-emerald-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {L ? 'Запустить' : 'Start'}
+            </button>
+            <button
+              type="button"
+              disabled={!!embedBusy || !embedState?.isRunning}
+              onClick={async () => {
+                setEmbedBusy('stop'); setEmbedError(null)
+                await window.api.embedStop()
+                setEmbedBusy(null); refreshEmbed()
+              }}
+              className="px-3 py-1.5 text-xs rounded-lg bg-zinc-700 text-zinc-100 hover:bg-zinc-600 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {L ? 'Остановить' : 'Stop'}
+            </button>
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Knowledge index */}
+      <SettingsSection
+        title={L ? 'Индекс знаний' : 'Knowledge index'}
+        description={L ? 'Гибридный BM25 + вектор индекс по .research/ и сохранённым находкам текущего workspace.' : 'Hybrid BM25 + vector index over .research/ and saved findings for the current workspace.'}
+      >
+        <div className="space-y-3">
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-[11px]">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-zinc-500">{L ? 'Workspace:' : 'Workspace:'}</span>
+              <span className="text-zinc-300 font-mono truncate max-w-[260px]" title={workspaceForIndex || '(none)'}>
+                {workspaceForIndex || (L ? '(не выбран)' : '(none)')}
+              </span>
+            </div>
+            {indexStats ? (
+              <div className="mt-2 text-zinc-400">
+                {L ? 'Чанков:' : 'Chunks:'} <span className="font-mono text-zinc-200">{indexStats.chunks}</span>
+                <span className="mx-2">·</span>
+                {L ? 'документов:' : 'documents:'} <span className="font-mono text-zinc-200">{indexStats.docs}</span>
+                <span className="mx-2">·</span>
+                {L ? 'векторы:' : 'vectors:'}{' '}
+                <span className={indexStats.hasVectors ? 'text-emerald-400' : 'text-zinc-500'}>
+                  {indexStats.hasVectors ? (L ? 'есть' : 'present') : (L ? 'нет' : 'none')}
+                </span>
+              </div>
+            ) : (
+              <div className="mt-2 text-zinc-500">{L ? 'Статистика недоступна.' : 'Stats unavailable.'}</div>
+            )}
+            {indexBusy && indexProgress && (
+              <div className="mt-2 text-zinc-500">
+                {L ? 'Индексация:' : 'Indexing:'} {indexProgress.done} / {indexProgress.total}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            disabled={indexBusy || !workspaceForIndex}
+            onClick={async () => {
+              if (!workspaceForIndex) return
+              setIndexBusy(true); setIndexProgress(null)
+              const r = await window.api.knowledgeIndexRebuild(workspaceForIndex)
+              setIndexBusy(false)
+              if (!r.ok) alert(r.error || 'rebuild failed')
+              refreshIndex(workspaceForIndex)
+            }}
+            className="px-3 py-1.5 text-xs rounded-lg bg-blue-600/90 text-white hover:bg-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {L ? 'Перестроить индекс' : 'Rebuild index'}
+          </button>
+        </div>
+      </SettingsSection>
+
+      {saving && (
+        <div className="text-[11px] text-zinc-500">{L ? 'Сохранение…' : 'Saving…'}</div>
+      )}
     </div>
   )
 }

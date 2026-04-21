@@ -39,6 +39,20 @@ export interface AppConfig {
   approvalForFileOps: boolean
   /** Ask before execute_command */
   approvalForCommands: boolean
+  /** Ask the user to approve a generated research plan before sub-agents execute it. */
+  approvalForPlans: boolean
+  /** Automatically call verify_sources before generate_report. */
+  autoVerifyBeforeReport: boolean
+  /** Supervisor inserts a self-reflect nudge every N iterations (deep-research preset). */
+  supervisorAutoReflectEvery: number
+  /** Enable embedding server for hybrid recall/search_knowledge. */
+  embedEnabled: boolean
+  /** Path to GGUF embedding model (defaults to bge-m3 in app data dir). */
+  embedModelPath: string | null
+  /** Optional polite-pool email for Crossref API. */
+  crossrefMailto: string | null
+  /** Optional API key for Semantic Scholar. */
+  semanticScholarApiKey: string | null
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -60,6 +74,13 @@ const DEFAULT_CONFIG: AppConfig = {
   maxEmptyRetries: 3,
   approvalForFileOps: true,
   approvalForCommands: true,
+  approvalForPlans: false,
+  autoVerifyBeforeReport: false,
+  supervisorAutoReflectEvery: 0,
+  embedEnabled: false,
+  embedModelPath: null,
+  crossrefMailto: null,
+  semanticScholarApiKey: null,
 }
 
 export function resetToDefaults(): AppConfig {

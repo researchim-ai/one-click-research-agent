@@ -83,6 +83,19 @@ interface ElectronAPI {
   revealInExplorer(targetPath: string): Promise<void>
   openInTerminalPath(dirPath: string): Promise<string>
 
+  // Research features
+  getSessionSources(sessionId: string): Promise<any[]>
+  getResearchPlan(workspace: string): Promise<{ items: { text: string; done: boolean; line: number }[]; progress: { total: number; done: number; pct: number } }>
+  listResearchArtifacts(workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>>
+  embedStatus(): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }>
+  embedDownloadModel(): Promise<{ ok: boolean; path?: string; error?: string }>
+  embedStart(modelPath?: string): Promise<{ ok: boolean; error?: string; log?: string }>
+  embedStop(): Promise<{ ok: boolean }>
+  onEmbedDownloadProgress(cb: (pct: number) => void): () => void
+  knowledgeIndexStats(workspace: string): Promise<{ chunks: number; docs: number; hasVectors: boolean }>
+  knowledgeIndexRebuild(workspace: string): Promise<{ ok: boolean; chunks?: number; error?: string }>
+  onKnowledgeIndexProgress(cb: (progress: { done: number; total: number }) => void): () => void
+
   // Terminal
   terminalCreate(cwd: string): Promise<string>
   terminalInput(id: string, data: string): void

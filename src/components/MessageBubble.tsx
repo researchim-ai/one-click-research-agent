@@ -1,4 +1,4 @@
-import { memo, useMemo } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -13,19 +13,82 @@ interface Props {
   onDeny?: (id: string) => void
   externalLinksEnabled?: boolean
   onOpenLink?: (url: string) => void
+  onCitationClick?: (n: number) => void
 }
 
 const rehypePlugins = [rehypeHighlight] as any[]
 const remarkPlugins = [remarkGfm] as any[]
 
+/**
+ * Split text into React nodes, converting tokens like "[1]" / "[1, 3-5]" into
+ * inline citation chips. Paired with `SourcesPanel`, so users can see what
+ * `[n]` refers to without leaving the chat.
+ */
+const CITATION_RE = /\[([0-9]{1,3}(?:\s*[,–-]\s*[0-9]{1,3})*)\]/g
+function renderCitationChildren(children: ReactNode, onCitation?: (n: number) => void): ReactNode {
+  if (!onCitation) return children
+  const toChips = (text: string): ReactNode[] => {
+    const out: ReactNode[] = []
+    let last = 0
+    text.replace(CITATION_RE, (match, ids: string, offset: number) => {
+      if (offset > last) out.push(text.slice(last, offset))
+      const nums: number[] = []
+      for (const part of ids.split(',')) {
+        const p = part.trim()
+        const range = p.match(/^(\d+)\s*[–-]\s*(\d+)$/)
+        if (range) {
+          const a = Number(range[1]); const b = Number(range[2])
+          if (a && b && a <= b && b - a < 20) {
+            for (let k = a; k <= b; k++) nums.push(k)
+          }
+        } else {
+          const n = Number(p)
+          if (n) nums.push(n)
+        }
+      }
+      if (nums.length === 0) {
+        out.push(match)
+      } else {
+        out.push(
+          <span key={`${offset}-${match}`} className="inline-flex items-center gap-px align-baseline">
+            {nums.map((n, i) => (
+              <button
+                key={`${offset}-${n}-${i}`}
+                type="button"
+                onClick={() => onCitation(n)}
+                className="mx-px px-1 py-px rounded bg-blue-500/10 border border-blue-500/30 text-[10px] font-mono text-blue-300 hover:bg-blue-500/20 hover:text-blue-200 cursor-pointer"
+                title={`Source [${n}]`}
+              >
+                [{n}]
+              </button>
+            ))}
+          </span>
+        )
+      }
+      last = offset + match.length
+      return match
+    })
+    if (last < text.length) out.push(text.slice(last))
+    return out
+  }
+  const mapNode = (node: ReactNode): ReactNode => {
+    if (typeof node === 'string') return toChips(node)
+    if (Array.isArray(node)) return node.map((n, i) => <span key={i}>{mapNode(n)}</span>)
+    return node
+  }
+  return mapNode(children)
+}
+
 const MemoMarkdown = memo(function MemoMarkdown({
   content,
   externalLinksEnabled,
   onOpenLink,
+  onCitation,
 }: {
   content: string
   externalLinksEnabled: boolean
   onOpenLink?: (url: string) => void
+  onCitation?: (n: number) => void
 }) {
   return (
     <Markdown
@@ -48,6 +111,8 @@ const MemoMarkdown = memo(function MemoMarkdown({
             </button>
           )
         },
+        p: ({ children }) => <p>{renderCitationChildren(children, onCitation)}</p>,
+        li: ({ children }) => <li>{renderCitationChildren(children, onCitation)}</li>,
       }}
     >
       {content}
@@ -61,6 +126,7 @@ export const MessageBubble = memo(function MessageBubble({
   onDeny,
   externalLinksEnabled = true,
   onOpenLink,
+  onCitationClick,
 }: Props) {
   if (message.role === 'status') {
     return (
@@ -137,7 +203,7 @@ export const MessageBubble = memo(function MessageBubble({
 
       {hasContent && (
         <div className="agent-prose mt-1">
-          <MemoMarkdown content={message.content} externalLinksEnabled={externalLinksEnabled} onOpenLink={onOpenLink} />
+          <MemoMarkdown content={message.content} externalLinksEnabled={externalLinksEnabled} onOpenLink={onOpenLink} onCitation={onCitationClick} />
         </div>
       )}
 

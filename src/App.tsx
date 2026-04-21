@@ -10,6 +10,8 @@ import { SetupWizard } from './components/SetupWizard'
 import { StatusBar } from './components/StatusBar'
 import { SessionTabs } from './components/SessionTabs'
 import { SettingsPanel } from './components/SettingsPanel'
+import { SourcesPanel } from './components/SourcesPanel'
+import { ResearchArtifacts } from './components/ResearchArtifacts'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -38,6 +40,10 @@ export function App() {
   const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
   const [appLanguage, setAppLanguage] = useState<'ru' | 'en'>('ru')
   const [pendingExternalUrl, setPendingExternalUrl] = useState<string | null>(null)
+  const [citationHighlight, setCitationHighlight] = useState<{ n: number; token: number } | null>(null)
+  const handleCitationClick = useCallback((n: number) => {
+    setCitationHighlight({ n, token: Date.now() })
+  }, [])
   const [breadcrumbExpandTo, setBreadcrumbExpandTo] = useState<string | null>(null)
   const [fileMenuOpen, setFileMenuOpen] = useState(false)
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
@@ -528,6 +534,20 @@ export function App() {
                   externalLinksEnabled={externalLinksEnabled}
                   onOpenExternalLink={requestOpenExternalLink}
                   appLanguage={appLanguage}
+                  onCitationClick={handleCitationClick}
+                />
+                <ResearchArtifacts
+                  workspace={workspace}
+                  appLanguage={appLanguage}
+                  onOpenFile={openFile}
+                />
+                <SourcesPanel
+                  sessionId={activeSessionId}
+                  workspace={workspace}
+                  appLanguage={appLanguage}
+                  externalLinksEnabled={externalLinksEnabled}
+                  onOpenExternalLink={requestOpenExternalLink}
+                  highlightCitationToken={citationHighlight}
                 />
               </div>
             )}

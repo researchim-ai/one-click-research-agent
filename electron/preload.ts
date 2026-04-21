@@ -112,6 +112,33 @@ contextBridge.exposeInMainWorld('api', {
   winClose: () => ipcRenderer.send('win-close'),
   winIsMaximized: (): Promise<boolean> => ipcRenderer.invoke('win-is-maximized'),
 
+  // Research features: sources / plan / artifacts / embeddings / knowledge index
+  getSessionSources: (sessionId: string): Promise<any[]> => ipcRenderer.invoke('get-session-sources', sessionId),
+  getResearchPlan: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-plan', workspace),
+  listResearchArtifacts: (workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>> =>
+    ipcRenderer.invoke('list-research-artifacts', workspace),
+  embedStatus: (): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }> =>
+    ipcRenderer.invoke('embed-status'),
+  embedDownloadModel: (): Promise<{ ok: boolean; path?: string; error?: string }> =>
+    ipcRenderer.invoke('embed-download-model'),
+  embedStart: (modelPath?: string): Promise<{ ok: boolean; error?: string; log?: string }> =>
+    ipcRenderer.invoke('embed-start', modelPath),
+  embedStop: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('embed-stop'),
+  onEmbedDownloadProgress: (cb: (pct: number) => void) => {
+    const listener = (_: any, pct: number) => cb(pct)
+    ipcRenderer.on('embed-download-progress', listener)
+    return () => { ipcRenderer.removeListener('embed-download-progress', listener) }
+  },
+  knowledgeIndexStats: (workspace: string): Promise<{ chunks: number; docs: number; hasVectors: boolean }> =>
+    ipcRenderer.invoke('knowledge-index-stats', workspace),
+  knowledgeIndexRebuild: (workspace: string): Promise<{ ok: boolean; chunks?: number; error?: string }> =>
+    ipcRenderer.invoke('knowledge-index-rebuild', workspace),
+  onKnowledgeIndexProgress: (cb: (progress: { done: number; total: number }) => void) => {
+    const listener = (_: any, p: { done: number; total: number }) => cb(p)
+    ipcRenderer.on('knowledge-index-progress', listener)
+    return () => { ipcRenderer.removeListener('knowledge-index-progress', listener) }
+  },
+
   // Terminal
   terminalCreate: (cwd: string): Promise<string> => ipcRenderer.invoke('terminal-create', cwd),
   terminalInput: (id: string, data: string) => ipcRenderer.send('terminal-input', id, data),
