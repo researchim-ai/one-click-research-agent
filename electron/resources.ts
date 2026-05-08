@@ -438,6 +438,11 @@ function selectPresetForSize(
   // mmap: only hot pages need physical RAM. For MoE only active experts are
   // accessed, but we use 85% to ensure stable performance without page thrashing.
   const perLayerCpuMb = Math.round(perLayerVramMb * 0.85)
+  // Per-layer estimates intentionally exclude non-block tensors (embeddings,
+  // output head, backend buffers). Hybrid planning must reserve that static
+  // GPU overhead whenever any layers are offloaded; otherwise "all layers on
+  // GPU + huge KV" is overestimated and llama-server can run out of VRAM.
+  const staticGpuOverheadMb = Math.max(0, modelVramMb - perLayerVramMb * arch.blockCount)
 
   // CPU-only (model loaded via mmap)
   if (freeVramMb < 500) {
@@ -472,7 +477,8 @@ function selectPresetForSize(
 
     const cpuModelRam = cpuL * perLayerCpuMb
     const ramKv = ramTotalMb - RAM_OVERHEAD_MB - cpuModelRam
-    const vramKv = freeVramMb - (gpuCapped * perLayerVramMb)
+    const gpuModelMb = gpuCapped * perLayerVramMb + (gpuCapped > 0 ? staticGpuOverheadMb : 0)
+    const vramKv = freeVramMb - gpuModelMb
 
     const ctx = calcContextFromMemory(
       Math.max(0, vramKv), kvOnGpu,
@@ -513,6 +519,7 @@ function selectPresetForTargetCtx(
   if (fullGpuPreset && fullGpuPreset.ctxSize >= clampedTarget) return fullGpuPreset
 
   const perLayerCpuMb = Math.round(perLayerVramMb * 0.85)
+  const staticGpuOverheadMb = Math.max(0, modelVramMb - perLayerVramMb * arch.blockCount)
   let maxLayersOnGpu = Math.min(arch.blockCount, Math.max(0, Math.floor((freeVramMb - options.gpuReserveMb) / perLayerVramMb)))
   if (isLaptop) {
     maxLayersOnGpu = Math.min(maxLayersOnGpu, Math.max(0, Math.floor((freeVramMb - (options.gpuReserveMb + 1500)) / (perLayerVramMb * 1.2))))
@@ -526,7 +533,8 @@ function selectPresetForTargetCtx(
 
     const cpuModelRam = cpuL * perLayerCpuMb
     const ramKv = ramTotalMb - RAM_OVERHEAD_MB - cpuModelRam
-    const vramKv = freeVramMb - (gpuCapped * perLayerVramMb)
+    const gpuModelMb = gpuCapped * perLayerVramMb + (gpuCapped > 0 ? staticGpuOverheadMb : 0)
+    const vramKv = freeVramMb - gpuModelMb
 
     const ctx = calcContextFromMemory(
       Math.max(0, vramKv), kvOnGpu,

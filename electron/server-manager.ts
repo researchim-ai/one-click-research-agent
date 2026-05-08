@@ -10,6 +10,7 @@ import type { ServerLaunchArgs } from './types'
 
 let lastServerLog: string[] = []
 let activeCtxSize = 0
+const SERVER_LOG_FILE = path.join(dataDir(), 'server-debug.log')
 
 const LLAMA_HOST = '127.0.0.1'
 const LLAMA_PORT = 7863
@@ -323,6 +324,13 @@ export function getServerLog(): string[] {
   return lastServerLog
 }
 
+function appendServerDebug(line: string): void {
+  try {
+    fs.mkdirSync(path.dirname(SERVER_LOG_FILE), { recursive: true })
+    fs.appendFileSync(SERVER_LOG_FILE, `[${new Date().toISOString()}] ${line}\n`)
+  } catch {}
+}
+
 export function getCtxSize(): number {
   return activeCtxSize
 }
@@ -393,6 +401,11 @@ export function start(
   if (la.flashAttn) cmdArgs.push('--flash-attn', 'on')
 
   lastServerLog = []
+  appendServerDebug('--- llama-server start ---')
+  appendServerDebug(`bin=${bin}`)
+  appendServerDebug(`args=${cmdArgs.map((a) => JSON.stringify(a)).join(' ')}`)
+  appendServerDebug(`gpuMode=${cfg.gpuMode}, gpuIndex=${cfg.gpuIndex}, detectedGpus=${detected.gpus.map((gpu) => `${gpu.index}:${gpu.name}:${gpu.vramFreeMb}/${gpu.vramTotalMb}MB`).join('; ')}`)
+  appendServerDebug(`launch: nGpuLayers=${la.nGpuLayers}, ctx=${la.ctxSize}, threads=${la.threads}, cache=${la.cacheTypeK}/${la.cacheTypeV}, tensorSplit=${la.tensorSplit ?? '-'}, flashAttn=${la.flashAttn}`)
   if (win) {
     emitBuild(win, `Запуск: ${path.basename(bin)}`)
     emitBuild(win, 'GGML_CUDA_DISABLE_GRAPHS=1 (multi-GPU stability)')
@@ -416,6 +429,7 @@ export function start(
     delete spawnEnv.CUDA_VISIBLE_DEVICES
     delete spawnEnv.GGML_VK_VISIBLE_DEVICES
   }
+  appendServerDebug(`env: CUDA_VISIBLE_DEVICES=${spawnEnv.CUDA_VISIBLE_DEVICES ?? '-'}, GGML_VK_VISIBLE_DEVICES=${spawnEnv.GGML_VK_VISIBLE_DEVICES ?? '-'}, GGML_CUDA_DISABLE_GRAPHS=${spawnEnv.GGML_CUDA_DISABLE_GRAPHS ?? '-'}`)
   serverProcess = spawn(bin, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'], detached: false, env: spawnEnv })
 
   const handleOutput = (data: Buffer) => {
@@ -423,13 +437,18 @@ export function start(
     for (const line of lines) {
       lastServerLog.push(line)
       if (lastServerLog.length > 200) lastServerLog.shift()
+      appendServerDebug(`[server] ${line}`)
       if (win) emitBuild(win, `[server] ${line}`)
     }
   }
 
   serverProcess.stdout?.on('data', handleOutput)
   serverProcess.stderr?.on('data', handleOutput)
-  serverProcess.on('exit', (code) => {
+  serverProcess.on('error', (err) => {
+    appendServerDebug(`[process-error] ${err.message}`)
+  })
+  serverProcess.on('exit', (code, signal) => {
+    appendServerDebug(`[exit] code=${code ?? 'null'} signal=${signal ?? 'null'}`)
     if (win && code !== null && code !== 0) {
       emitBuild(win, `llama-server завершился с кодом ${code}`)
     }

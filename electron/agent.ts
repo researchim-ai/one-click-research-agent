@@ -551,6 +551,10 @@ export function deleteSession(ws: string, id: string): void {
   const map = getSessionsMap(ws)
   map.delete(id)
   deleteSessionFile(ws, id)
+  if (map.size === 0) {
+    createSession(ws)
+    return
+  }
   if (activeIdByWorkspace.get(key) === id) {
     const first = map.keys().next().value
     if (first) activeIdByWorkspace.set(key, first)
@@ -762,8 +766,8 @@ interface StreamResult {
 
 /**
  * Checks if the llama-server is still responsive. Used to diagnose network
- * errors from `fetch` (e.g. "fetch failed", "terminated") which typically
- * indicate the server crashed or closed the TCP connection mid-stream.
+ * errors from `fetch` (e.g. "fetch failed", "terminated"). A transport break
+ * alone is not a root cause, so we only use this as extra diagnostics.
  */
 async function pingLlamaServer(apiUrl: string, timeoutMs = 3000): Promise<boolean> {
   try {
@@ -781,7 +785,7 @@ async function pingLlamaServer(apiUrl: string, timeoutMs = 3000): Promise<boolea
   }
 }
 
-/** True for low-level network errors (server crashed / socket torn down). */
+/** True for low-level transport errors from undici/fetch. */
 function isNetworkStreamError(e: any): boolean {
   const name = e?.name ?? ''
   const msg = (e?.message ?? String(e ?? '')).toLowerCase()
@@ -2356,40 +2360,26 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
       if (isNetErr) {
         // TCP-level failure (undici "fetch failed" / "terminated" / ECONNRESET).
-        // Almost always means llama-server crashed / closed the socket mid-stream.
         debugLog('ERROR', `Network-level stream failure: name=${e?.name}, msg=${errMsg}, cause=${e?.cause?.code ?? '-'}`)
         doEmit({ type: 'status', content: '🔌 Соединение с llama-server прервано — проверяю состояние сервера…' })
-        // Give the server a moment to recover (or crash cleanly)
+        // Give the server a moment before checking health; this distinguishes
+        // a transient transport break from a process that is no longer responsive.
         await new Promise((r) => setTimeout(r, 1500))
         const alive = await pingLlamaServer(apiUrl)
+        debugLog('ERROR', `llama-server health after transport failure: ${alive ? 'ok' : 'unreachable'}`)
         if (!alive) {
           doEmit({
             type: 'error',
-            content: '❌ llama-server не отвечает (возможно упал из-за нехватки памяти при текущем контексте). Откройте Настройки → «Перезапустить сервер», уменьшите контекст или max_tokens и повторите запрос.',
+            content: '❌ llama-server не отвечает после разрыва соединения. Проверьте ~/.one-click-agent/server-debug.log: там записаны команда запуска, stderr/stdout и exit/signal сервера.',
           })
           session.updatedAt = Date.now()
           doSaveSession(session)
           return 'Error: llama-server is not responding'
         }
-        doEmit({ type: 'status', content: '🔁 Сервер снова доступен — повторяю запрос…' })
-        try {
-          const retryController = new AbortController()
-          currentAbort = retryController
-          streamResult = await streamLlmResponse(apiUrl, messages, fullResponse, retryController.signal, effectiveMaxTokens)
-        } catch (retryErr: any) {
-          const retryMsg = retryErr?.message ?? String(retryErr)
-          if (isNetworkStreamError(retryErr)) {
-            doEmit({
-              type: 'error',
-              content: '❌ Соединение с llama-server снова оборвалось после переподключения. Похоже на повторный крэш сервера — попробуйте уменьшить контекст/max_tokens в настройках и перезапустить сервер.',
-            })
-          } else {
-            doEmit({ type: 'error', content: `LLM request failed after reconnect: ${retryMsg}` })
-          }
-          session.updatedAt = Date.now()
-          doSaveSession(session)
-          return `Error: ${retryMsg}`
-        }
+        doEmit({ type: 'error', content: `LLM transport error: ${errMsg}` })
+        session.updatedAt = Date.now()
+        doSaveSession(session)
+        return `Error: ${errMsg}`
       } else if (isContextError) {
         // Extract real n_ctx from server error and auto-correct our tracking
         const ctxMatch = errMsg.match(/n_ctx[":=\s]*(\d+)/)

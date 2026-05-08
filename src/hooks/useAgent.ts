@@ -160,10 +160,22 @@ export function useAgent() {
   const refreshSessions = useCallback(async () => {
     if (!workspace || !window.api) return
     try {
-      const list = await window.api.listSessions(workspace)
+      let list = await window.api.listSessions(workspace)
+      if (list.length === 0) {
+        const id = await window.api.createSession(workspace)
+        list = await window.api.listSessions(workspace)
+        setActiveSessionId(id)
+        setMessages([])
+        assistantRef.current = null
+        idCounter.current = 0
+      } else if (activeSessionId && !list.some((s) => s.id === activeSessionId)) {
+        await window.api.switchSession(workspace, list[0].id)
+        setActiveSessionId(list[0].id)
+        await loadFromMap(list[0].id)
+      }
       setSessions(list)
     } catch {}
-  }, [workspace])
+  }, [workspace, activeSessionId])
 
   // Streaming events (thinking/response) are very frequent — batch with rAF and throttle to avoid blocking editor
   const pendingRafRef = useRef<number | null>(null)
@@ -373,6 +385,7 @@ export function useAgent() {
     if (busy || !workspace) return
     saveCurrentToMap()
     const id = await window.api.createSession(workspace)
+    await window.api.switchSession(workspace, id).catch(() => {})
     setActiveSessionId(id)
     setMessages([])
     assistantRef.current = null
@@ -395,14 +408,17 @@ export function useAgent() {
     await window.api.deleteSession(workspace, id)
     sessionStates.current.delete(id)
 
-    if (id === activeSessionId) {
-      const remaining = sessions.filter((s) => s.id !== id)
-      if (remaining.length > 0) {
-        const next = remaining[0]
+    const list = await window.api.listSessions(workspace)
+    const activeStillExists = activeSessionId && list.some((s) => s.id === activeSessionId)
+    if (id === activeSessionId || !activeStillExists) {
+      const activeId = await window.api.getActiveSessionId(workspace)
+      const next = (activeId && list.find((s) => s.id === activeId)) ?? list[0]
+      if (next) {
         await window.api.switchSession(workspace, next.id)
         setActiveSessionId(next.id)
-        loadFromMap(next.id)
+        await loadFromMap(next.id)
       } else {
+        // Backend should now keep at least one session, but repair defensively.
         const newId = await window.api.createSession(workspace)
         setActiveSessionId(newId)
         setMessages([])
