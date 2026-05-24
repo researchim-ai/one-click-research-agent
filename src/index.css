@@ -259,6 +259,114 @@ body [class*="peekview"] .preview.inline .overflow-guard {
   margin: 12px 0;
 }
 
+/* Full Markdown document preview. Used for README, notes, reports, and research artifacts. */
+.markdown-preview {
+  font-size: 14.5px;
+  line-height: 1.78;
+  color: #d4d4d8;
+}
+.markdown-preview h1 {
+  font-size: 2rem;
+  line-height: 1.15;
+  color: #fafafa;
+  font-weight: 750;
+  letter-spacing: -0.035em;
+  margin: 0 0 1.1rem;
+  padding-bottom: 0.8rem;
+  border-bottom: 1px solid rgba(63, 63, 70, 0.9);
+}
+.markdown-preview h2 {
+  font-size: 1.35rem;
+  color: #f4f4f5;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 2rem 0 0.7rem;
+}
+.markdown-preview h3 {
+  font-size: 1.05rem;
+  color: #e4e4e7;
+  font-weight: 650;
+  margin: 1.4rem 0 0.45rem;
+}
+.markdown-preview p { margin: 0.75rem 0; }
+.markdown-preview strong { color: #f4f4f5; font-weight: 650; }
+.markdown-preview em { color: #c4c4cc; }
+.markdown-preview a {
+  color: #7dd3fc;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.markdown-preview ul,
+.markdown-preview ol {
+  margin: 0.7rem 0 0.9rem;
+  padding-left: 1.55rem;
+}
+.markdown-preview li { margin: 0.32rem 0; }
+.markdown-preview li::marker { color: #60a5fa; }
+.markdown-preview blockquote {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid #3b82f6;
+  background: rgba(30, 41, 59, 0.35);
+  border-radius: 0 0.75rem 0.75rem 0;
+  color: #cbd5e1;
+}
+.markdown-preview code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: #93c5fd;
+  background: rgba(39, 39, 42, 0.75);
+  border: 1px solid rgba(63, 63, 70, 0.8);
+  border-radius: 0.35rem;
+  padding: 0.12rem 0.35rem;
+}
+.markdown-preview pre {
+  position: relative;
+  margin: 1rem 0;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  background: #09090b;
+  border: 1px solid #27272a;
+  border-radius: 0.9rem;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.markdown-preview pre code {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.markdown-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  overflow: hidden;
+  border-radius: 0.75rem;
+}
+.markdown-preview th,
+.markdown-preview td {
+  border: 1px solid #27272a;
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+}
+.markdown-preview th {
+  background: rgba(39, 39, 42, 0.85);
+  color: #f4f4f5;
+  font-weight: 650;
+}
+.markdown-preview td { background: rgba(24, 24, 27, 0.45); }
+.markdown-preview hr {
+  border: 0;
+  border-top: 1px solid #27272a;
+  margin: 1.5rem 0;
+}
+.markdown-preview input[type="checkbox"] {
+  accent-color: #3b82f6;
+  margin-right: 0.35rem;
+}
+
 /* Thinking block — soft, low-contrast italic */
 .thinking-text {
   font-size: 12.5px;

@@ -4,6 +4,7 @@ import { useResizable } from './hooks/useResizable'
 import { Sidebar } from './components/Sidebar'
 import { EditorTabs } from './components/EditorTabs'
 import { CodeEditor } from './components/CodeEditor'
+import { MarkdownViewer } from './components/MarkdownViewer'
 import { Chat, type CodeReference } from './components/Chat'
 import { Terminal } from './components/Terminal'
 import { SetupWizard } from './components/SetupWizard'
@@ -445,7 +446,18 @@ export function App() {
                       onCloseOthers={closeOthers}
                       appLanguage={appLanguage}
                     />
-                    {activeFile ? (
+                    {activeFile?.language === 'markdown' ? (
+                      <MarkdownViewer
+                        file={activeFile}
+                        workspace={workspace}
+                        onAttachCode={addCodeRef}
+                        onOpenFile={openFile}
+                        onContentChange={(content) => updateFileContent(activeFile.path, content)}
+                        onAfterSave={() => refreshFile(activeFile.path)}
+                        onBreadcrumbClick={(dirPath) => setBreadcrumbExpandTo(dirPath)}
+                        appLanguage={appLanguage}
+                      />
+                    ) : activeFile ? (
                       <CodeEditor
                         file={activeFile}
                         workspace={workspace}

@@ -56,7 +56,7 @@ export interface AppConfig {
 }
 
 const DEFAULT_CONFIG: AppConfig = {
-  lastQuant: 'UD-Q4_K_XL',
+  lastQuant: 'UD-Q3_K_XL',
   ctxSize: null,
   gpuMode: 'single',
   gpuIndex: 0,
@@ -112,6 +112,9 @@ export function load(): AppConfig {
       loaded.approvalForFileOps = Boolean(parsed.approvalRequired)
       loaded.approvalForCommands = Boolean(parsed.approvalRequired)
     }
+    if (parsed.lastQuant === 'UD-Q4_K_XL') loaded.lastQuant = 'UD-Q3_K_XL'
+    if (parsed.lastQuant === '9B-UD-Q4_K_XL') loaded.lastQuant = '9B-UD-Q3_K_XL'
+    if (parsed.lastQuant === '36-UD-Q4_K_XL') loaded.lastQuant = '36-UD-Q3_K_XL'
     cached = loaded
     return loaded
   } catch {

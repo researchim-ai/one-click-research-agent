@@ -15,6 +15,27 @@ function getParentPaths(filePath: string): string[] {
   return dirParts.map((_, i) => dirParts.slice(0, i + 1).join(sep))
 }
 
+function flattenVisibleEntries(entries: FileTreeEntry[], expandedPaths: Set<string>): FileTreeEntry[] {
+  const out: FileTreeEntry[] = []
+  const walk = (items: FileTreeEntry[]) => {
+    for (const item of items) {
+      out.push(item)
+      if (item.isDir && expandedPaths.has(item.path) && item.children?.length) walk(item.children)
+    }
+  }
+  walk(entries)
+  return out
+}
+
+function pathDepth(filePath: string): number {
+  return filePath.split(/[\\/]/).filter(Boolean).length
+}
+
+function containsPath(parentPath: string, childPath: string): boolean {
+  const p = parentPath.replace(/[\\/]+$/, '')
+  return childPath === p || childPath.startsWith(`${p}/`) || childPath.startsWith(`${p}\\`)
+}
+
 interface Props {
   workspace: string
   onWorkspaceChange: (ws: string) => void
@@ -109,6 +130,9 @@ function TreeNode({
   gitStatusByPath,
   expandedPaths,
   setExpandedPaths,
+  selectedPaths,
+  focusedPath,
+  onEntryClick,
   activeFilePath,
   L,
 }: {
@@ -126,6 +150,9 @@ function TreeNode({
   gitStatusByPath?: Map<string, string>
   expandedPaths: Set<string>
   setExpandedPaths: (fn: (prev: Set<string>) => Set<string>) => void
+  selectedPaths: Set<string>
+  focusedPath: string | null
+  onEntryClick: (e: MouseEvent, entry: FileTreeEntry) => void
   activeFilePath?: string | null
   L: boolean
 }) {
@@ -141,6 +168,8 @@ function TreeNode({
   const isRenaming = renamingPath === entry.path
   const isCtxCreateTarget = ctxCreateAt?.dirPath === entry.path
   const isActive = activeFilePath != null && entry.path === activeFilePath
+  const isSelected = selectedPaths.has(entry.path)
+  const isFocused = focusedPath === entry.path
 
   useEffect(() => {
     if (isCtxCreateTarget) setExpanded(true)
@@ -187,9 +216,16 @@ function TreeNode({
   if (!entry.isDir) {
     return (
       <button
-        onClick={() => onFileClick(entry.path)}
+        data-file-tree-path={entry.path}
+        onClick={(e) => onEntryClick(e, entry)}
         onContextMenu={handleCtx}
-        className={`w-full flex items-center gap-1.5 py-[3px] px-2 rounded text-xs cursor-pointer select-none text-left group ${isActive ? 'bg-blue-500/20 text-zinc-100' : 'hover:bg-zinc-800/60'}`}
+        className={`w-full flex items-center gap-1.5 py-[3px] px-2 rounded text-xs cursor-pointer select-none text-left group outline-none ${
+          isSelected
+            ? 'bg-blue-500/25 text-zinc-100'
+            : isActive
+              ? 'bg-blue-500/12 text-zinc-100'
+              : 'hover:bg-zinc-800/60'
+        } ${isFocused ? 'ring-1 ring-blue-400/45' : ''}`}
         style={{ paddingLeft: `${depth * 14 + 8}px` }}
       >
         <FileIcon name={entry.name} isDir={false} />
@@ -207,11 +243,17 @@ function TreeNode({
     <div>
       <div
         onContextMenu={handleCtx}
-        className="w-full flex items-center gap-1.5 py-[3px] px-2 hover:bg-zinc-800/60 rounded text-xs select-none group"
+        data-file-tree-path={entry.path}
+        className={`w-full flex items-center gap-1.5 py-[3px] px-2 rounded text-xs select-none group outline-none ${
+          isSelected ? 'bg-blue-500/25 text-zinc-100' : 'hover:bg-zinc-800/60'
+        } ${isFocused ? 'ring-1 ring-blue-400/45' : ''}`}
         style={{ paddingLeft: `${depth * 14 + 8}px` }}
       >
         <button
-          onClick={() => setExpanded(!isExpanded)}
+          onClick={(e) => {
+            onEntryClick(e, entry)
+            if (!e.ctrlKey && !e.metaKey && !e.shiftKey) setExpanded(!isExpanded)
+          }}
           className="flex items-center gap-1.5 flex-1 min-w-0 cursor-pointer text-left"
         >
           <span className="text-zinc-500 text-[10px] w-3 text-center">{isExpanded ? '▼' : '▶'}</span>
@@ -266,6 +308,9 @@ function TreeNode({
               gitStatusByPath={gitStatusByPath}
               expandedPaths={expandedPaths}
               setExpandedPaths={setExpandedPaths}
+              selectedPaths={selectedPaths}
+              focusedPath={focusedPath}
+              onEntryClick={onEntryClick}
               activeFilePath={activeFilePath}
               L={L}
             />
@@ -289,6 +334,13 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
   const [gitNumstat, setGitNumstat] = useState<import('../../electron/git').GitNumstatEntry[]>([])
   const [sourceControlOpen, setSourceControlOpen] = useState(true)
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set())
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set())
+  const [focusedPath, setFocusedPath] = useState<string | null>(null)
+  const [selectionAnchorPath, setSelectionAnchorPath] = useState<string | null>(null)
+  const treeContainerRef = useRef<HTMLDivElement>(null)
+
+  const visibleEntries = useMemo(() => flattenVisibleEntries(tree, expandedPaths), [tree, expandedPaths])
+  const entryByPath = useMemo(() => new Map(visibleEntries.map((entry) => [entry.path, entry])), [visibleEntries])
 
   useEffect(() => {
     if (!expandToPath) return
@@ -314,6 +366,16 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
   }, [workspace])
 
   useEffect(() => { loadTree() }, [loadTree])
+
+  useEffect(() => {
+    const visible = new Set(visibleEntries.map((entry) => entry.path))
+    setSelectedPaths((prev) => {
+      const next = new Set([...prev].filter((path) => visible.has(path)))
+      return next.size === prev.size ? prev : next
+    })
+    if (focusedPath && !visible.has(focusedPath)) setFocusedPath(visibleEntries[0]?.path ?? null)
+    if (selectionAnchorPath && !visible.has(selectionAnchorPath)) setSelectionAnchorPath(null)
+  }, [visibleEntries, focusedPath, selectionAnchorPath])
 
   const loadTreeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const loadTreeRef = useRef(loadTree)
@@ -458,8 +520,218 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
     loadTree()
   }
 
+  const selectRange = useCallback((fromPath: string, toPath: string) => {
+    const from = visibleEntries.findIndex((entry) => entry.path === fromPath)
+    const to = visibleEntries.findIndex((entry) => entry.path === toPath)
+    if (from < 0 || to < 0) return new Set([toPath])
+    const [start, end] = from <= to ? [from, to] : [to, from]
+    return new Set(visibleEntries.slice(start, end + 1).map((entry) => entry.path))
+  }, [visibleEntries])
+
+  const handleEntryClick = useCallback((e: MouseEvent, entry: FileTreeEntry) => {
+    treeContainerRef.current?.focus()
+    setFocusedPath(entry.path)
+
+    if (e.shiftKey) {
+      const anchor = selectionAnchorPath ?? focusedPath ?? entry.path
+      setSelectedPaths(selectRange(anchor, entry.path))
+      setSelectionAnchorPath(anchor)
+      return
+    }
+
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedPaths((prev) => {
+        const next = new Set(prev)
+        if (next.has(entry.path)) next.delete(entry.path)
+        else next.add(entry.path)
+        return next
+      })
+      setSelectionAnchorPath(entry.path)
+      return
+    }
+
+    setSelectedPaths(new Set([entry.path]))
+    setSelectionAnchorPath(entry.path)
+    if (!entry.isDir) onFileClick(entry.path)
+  }, [focusedPath, onFileClick, selectRange, selectionAnchorPath])
+
+  const deleteSelected = useCallback(async () => {
+    const entries = [...selectedPaths]
+      .map((path) => entryByPath.get(path))
+      .filter((entry): entry is FileTreeEntry => !!entry)
+      .filter((entry, _idx, all) => !all.some((other) => other.path !== entry.path && other.isDir && containsPath(other.path, entry.path)))
+      .sort((a, b) => pathDepth(b.path) - pathDepth(a.path))
+
+    if (entries.length === 0) return
+    const label = entries.length === 1
+      ? `"${entries[0].name}"`
+      : L
+        ? `${entries.length} элементов`
+        : `${entries.length} items`
+    const ok = confirm(L
+      ? `Удалить ${label}? Это действие нельзя отменить.`
+      : `Delete ${label}? This cannot be undone.`)
+    if (!ok) return
+
+    for (const entry of entries) {
+      try {
+        await window.api.deletePath(entry.path)
+      } catch (e) {
+        console.error('Delete failed:', entry.path, e)
+      }
+    }
+    setSelectedPaths(new Set())
+    setFocusedPath(null)
+    setSelectionAnchorPath(null)
+    loadTree()
+  }, [L, entryByPath, loadTree, selectedPaths])
+
+  const handleTreeKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement | null
+    if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA') return
+    if (visibleEntries.length === 0) return
+
+    const focusedIdx = Math.max(0, visibleEntries.findIndex((entry) => entry.path === focusedPath))
+    const focusEntryAt = (idx: number, extend = false) => {
+      const entry = visibleEntries[Math.max(0, Math.min(visibleEntries.length - 1, idx))]
+      if (!entry) return
+      setFocusedPath(entry.path)
+      if (extend) {
+        const anchor = selectionAnchorPath ?? focusedPath ?? entry.path
+        setSelectedPaths(selectRange(anchor, entry.path))
+        setSelectionAnchorPath(anchor)
+      } else {
+        setSelectedPaths(new Set([entry.path]))
+        setSelectionAnchorPath(entry.path)
+      }
+      requestAnimationFrame(() => {
+        treeContainerRef.current
+          ?.querySelector<HTMLElement>(`[data-file-tree-path="${CSS.escape(entry.path)}"]`)
+          ?.scrollIntoView({ block: 'nearest' })
+      })
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+      e.preventDefault()
+      setSelectedPaths(new Set(visibleEntries.map((entry) => entry.path)))
+      setFocusedPath(visibleEntries[0]?.path ?? null)
+      setSelectionAnchorPath(visibleEntries[0]?.path ?? null)
+      return
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+      e.preventDefault()
+      const paths = selectedPaths.size > 0 ? [...selectedPaths] : focusedPath ? [focusedPath] : []
+      if (paths.length > 0) window.api.copyToClipboard(paths.join('\n'))
+      return
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      focusEntryAt(focusedIdx + 1, e.shiftKey)
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      focusEntryAt(focusedIdx - 1, e.shiftKey)
+      return
+    }
+    if (e.key === 'Home') {
+      e.preventDefault()
+      focusEntryAt(0, e.shiftKey)
+      return
+    }
+    if (e.key === 'End') {
+      e.preventDefault()
+      focusEntryAt(visibleEntries.length - 1, e.shiftKey)
+      return
+    }
+
+    const current = focusedPath ? entryByPath.get(focusedPath) : visibleEntries[focusedIdx]
+    if (!current) return
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+      e.preventDefault()
+      const dirPath = current.isDir
+        ? current.path
+        : getParentPaths(current.path).at(-1) ?? workspace
+      if (e.shiftKey) setCtxCreateAt({ dirPath, type: 'dir' })
+      else setCtxCreateAt({ dirPath, type: 'file' })
+      setExpandedPaths((prev) => new Set(prev).add(dirPath))
+      return
+    }
+
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      if (current.isDir) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev)
+          if (next.has(current.path)) next.delete(current.path)
+          else next.add(current.path)
+          return next
+        })
+      } else {
+        onFileClick(current.path)
+      }
+      return
+    }
+
+    if (e.key === 'ArrowRight' && current.isDir) {
+      e.preventDefault()
+      setExpandedPaths((prev) => new Set(prev).add(current.path))
+      return
+    }
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      if (current.isDir && expandedPaths.has(current.path)) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev)
+          next.delete(current.path)
+          return next
+        })
+      } else {
+        const parent = getParentPaths(current.path).at(-1)
+        if (parent && entryByPath.has(parent)) focusEntryAt(visibleEntries.findIndex((entry) => entry.path === parent))
+      }
+      return
+    }
+
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault()
+      deleteSelected()
+      return
+    }
+    if (e.key === 'F2') {
+      e.preventDefault()
+      setRenamingPath(current.path)
+      setRenamingOrigName(current.name)
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      setSelectedPaths(new Set())
+      setSelectionAnchorPath(null)
+      return
+    }
+  }, [
+    deleteSelected,
+    entryByPath,
+    expandedPaths,
+    focusedPath,
+    onFileClick,
+    selectRange,
+    selectedPaths,
+    selectionAnchorPath,
+    visibleEntries,
+    workspace,
+  ])
+
   const handleContextMenu = (e: MouseEvent, entry: FileTreeEntry) => {
     e.preventDefault()
+    if (!selectedPaths.has(entry.path)) {
+      setSelectedPaths(new Set([entry.path]))
+      setSelectionAnchorPath(entry.path)
+    }
+    setFocusedPath(entry.path)
     setCtxMenu({ x: e.clientX, y: e.clientY, entry })
   }
 
@@ -473,8 +745,26 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
 
   const buildMenuItems = (entry: FileTreeEntry): MenuItem[] => {
     const items: MenuItem[] = []
+    const isBulkSelection = selectedPaths.size > 1 && selectedPaths.has(entry.path)
 
-    if (!entry.isDir) {
+    if (isBulkSelection) {
+      items.push({
+        label: L ? `Удалить выбранное (${selectedPaths.size})` : `Delete selected (${selectedPaths.size})`,
+        icon: '🗑️',
+        danger: true,
+        shortcut: 'Del',
+        action: () => deleteSelected(),
+      })
+      items.push({
+        label: L ? 'Копировать пути выбранных' : 'Copy selected paths',
+        icon: '📋',
+        shortcut: 'Ctrl+C',
+        action: () => window.api.copyToClipboard([...selectedPaths].join('\n')),
+      })
+      items.push({ label: '', separator: true, action: () => {} })
+    }
+
+    if (!entry.isDir && !isBulkSelection) {
       items.push({
         label: L ? 'Открыть' : 'Open',
         icon: '📄',
@@ -490,7 +780,7 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
       items.push({ label: '', separator: true, action: () => {} })
     }
 
-    if (entry.isDir) {
+    if (entry.isDir && !isBulkSelection) {
       items.push({
         label: L ? 'Новый файл…' : 'New file…',
         icon: '+',
@@ -511,40 +801,44 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
       items.push({ label: '', separator: true, action: () => {} })
     }
 
-    items.push({
-      label: L ? 'Копировать путь' : 'Copy path',
-      icon: '📋',
-      action: () => window.api.copyToClipboard(entry.path),
-    })
-    items.push({
-      label: L ? 'Копировать относительный путь' : 'Copy relative path',
-      icon: '📋',
-      action: () => window.api.copyToClipboard(relPath(entry.path)),
-    })
-    items.push({
-      label: L ? 'Показать в проводнике' : 'Reveal in explorer',
-      icon: '📂',
-      action: () => window.api.revealInExplorer(entry.path),
-    })
+    if (!isBulkSelection) {
+      items.push({
+        label: L ? 'Копировать путь' : 'Copy path',
+        icon: '📋',
+        action: () => window.api.copyToClipboard(entry.path),
+      })
+      items.push({
+        label: L ? 'Копировать относительный путь' : 'Copy relative path',
+        icon: '📋',
+        action: () => window.api.copyToClipboard(relPath(entry.path)),
+      })
+      items.push({
+        label: L ? 'Показать в проводнике' : 'Reveal in explorer',
+        icon: '📂',
+        action: () => window.api.revealInExplorer(entry.path),
+      })
+    }
 
     items.push({ label: '', separator: true, action: () => {} })
 
-    items.push({
-      label: L ? 'Переименовать' : 'Rename',
-      icon: '✏️',
-      shortcut: 'F2',
-      action: () => {
-        setRenamingPath(entry.path)
-        setRenamingOrigName(entry.name)
-      },
-    })
-    items.push({
-      label: L ? 'Удалить' : 'Delete',
-      icon: '🗑️',
-      danger: true,
-      shortcut: 'Del',
-      action: () => handleDelete(entry),
-    })
+    if (!isBulkSelection) {
+      items.push({
+        label: L ? 'Переименовать' : 'Rename',
+        icon: '✏️',
+        shortcut: 'F2',
+        action: () => {
+          setRenamingPath(entry.path)
+          setRenamingOrigName(entry.name)
+        },
+      })
+      items.push({
+        label: L ? 'Удалить' : 'Delete',
+        icon: '🗑️',
+        danger: true,
+        shortcut: 'Del',
+        action: () => handleDelete(entry),
+      })
+    }
 
     return items
   }
@@ -584,7 +878,15 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
       </div>
 
       {/* File tree */}
-      <div className="flex-1 overflow-y-auto py-1">
+      <div
+        ref={treeContainerRef}
+        tabIndex={0}
+        role="tree"
+        aria-label={L ? 'Файлы проекта' : 'Project files'}
+        onKeyDown={handleTreeKeyDown}
+        onClick={() => treeContainerRef.current?.focus()}
+        className="flex-1 overflow-y-auto py-1 outline-none focus-visible:ring-1 focus-visible:ring-blue-500/40"
+      >
         {!workspace && (
           <div className="px-4 py-8 text-center">
             <button onClick={handlePickDir} className="text-sm text-blue-400 hover:text-blue-300 transition-colors cursor-pointer">{L ? '📂 Открыть проект' : '📂 Open project'}</button>
@@ -621,6 +923,9 @@ export const Sidebar = memo(function Sidebar({ workspace, onWorkspaceChange, onF
             gitStatusByPath={gitStatusByPath}
             expandedPaths={expandedPaths}
             setExpandedPaths={setExpandedPaths}
+            selectedPaths={selectedPaths}
+            focusedPath={focusedPath}
+            onEntryClick={handleEntryClick}
             activeFilePath={activeFilePath}
             L={L}
           />

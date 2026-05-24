@@ -167,7 +167,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setFamilies(fams)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
-      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
+      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q3_K_XL')
       setSelectedQuant(quant)
       const activeVariant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
       const familyId = activeVariant?.family
@@ -344,7 +344,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setTools(t)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
-      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q4_K_XL')
+      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q3_K_XL')
       setSelectedQuant(quant)
       const variant = v.find((entry) => entry.quant === quant)
       const famIdForReset = variant?.family

@@ -13,7 +13,7 @@ interface Props {
 
 type Phase = 'idle' | 'installing' | 'search' | 'downloading' | 'starting' | 'done' | 'error'
 
-const DEFAULT_QUANT = 'UD-Q4_K_XL'
+const DEFAULT_QUANT = 'UD-Q3_K_XL'
 
 const CTX_OPTIONS = [
   { value: 262144, label: '262K' },

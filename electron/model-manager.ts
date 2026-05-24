@@ -7,7 +7,7 @@ import type { DownloadProgress, ModelVariant } from './types'
 import * as config from './config'
 import { MODEL_VARIANTS, MODEL_FAMILIES, getModelFamily } from './resources'
 
-const DEFAULT_QUANT = 'UD-Q4_K_XL'
+const DEFAULT_QUANT = 'UD-Q3_K_XL'
 const DEFAULT_REPO_ID = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 
 function normalizeToken(value: string): string {
