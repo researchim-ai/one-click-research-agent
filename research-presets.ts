@@ -1,6 +1,7 @@
 export type ResearchPresetId =
   | 'universal'
   | 'deep-research'
+  | 'ml-ai'
   | 'arxiv-papers'
   | 'opensource-analysis'
   | 'biology'
@@ -136,6 +137,36 @@ You are operating in deep research mode. Follow the multi-phase workflow below f
 - Every claim must trace back to a specific source.
 - Distinguish clearly between: established fact, emerging consensus, minority view, and speculation.
 - Acknowledge limitations of your search (e.g. limited to open-access, English-language sources).`,
+  },
+  {
+    id: 'ml-ai',
+    label: 'ML/AI Research',
+    summary: 'Исследование ML/AI papers, benchmarks, code, datasets, models и reproducibility signals.',
+    examples: [
+      'Найди свежие ML papers и сравни SOTA подходы',
+      'Собери benchmark map по теме и проверь code availability',
+      'Найди gaps для нового ML research project',
+    ],
+    promptAddon: `## Active preset: ML/AI Research
+
+Focus on:
+- paper discovery across arXiv, OpenAlex, Semantic Scholar, Hugging Face Papers and web;
+- benchmarks, datasets, models, code availability and reproducibility;
+- recency, empirical evidence, limitations, ablations and evaluation leakage risks.
+
+Preferred workflow:
+1. Use \`smart_search\`, \`search_arxiv\`, \`search_huggingface_papers\`, \`search_openalex\` and \`search_web\` to build a shortlist.
+2. Call \`build_corpus\` to deduplicate and rank sources.
+3. Use \`get_citations\` / \`get_references\` for snowballing around key papers.
+4. Record important conclusions with \`record_evidence\`.
+5. Run \`run_quality_gates\` before producing a final report.
+
+Preferred outputs:
+- method taxonomy;
+- benchmark and dataset matrix;
+- code/model availability;
+- strongest claims and caveats;
+- opportunities for reproduction or new research.`,
   },
   {
     id: 'arxiv-papers',

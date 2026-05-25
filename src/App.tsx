@@ -13,6 +13,7 @@ import { SessionTabs } from './components/SessionTabs'
 import { SettingsPanel } from './components/SettingsPanel'
 import { SourcesPanel } from './components/SourcesPanel'
 import { ResearchArtifacts } from './components/ResearchArtifacts'
+import { ResearchDashboard } from './components/ResearchDashboard'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -469,12 +470,14 @@ export function App() {
                         appLanguage={appLanguage}
                       />
                     ) : (
-                      <div className="flex-1 flex items-center justify-center text-zinc-600">
-                        <div className="text-center">
-                          <div className="text-4xl mb-3 opacity-30">⚡</div>
-                          <p className="text-sm">{appLanguage === 'ru' ? 'Выбери файл слева' : 'Select a file on the left'}</p>
-                        </div>
-                      </div>
+                      <ResearchDashboard
+                        workspace={workspace}
+                        appLanguage={appLanguage}
+                        onOpenSettings={() => {
+                          setSettingsTab('agent')
+                          setSettingsOpen(true)
+                        }}
+                      />
                     )}
                   </>
                 )}

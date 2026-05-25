@@ -7,8 +7,10 @@ import * as path from 'path'
 import * as os from 'os'
 import { getWebSearchStatus } from './searxng'
 import { getResearchPresetById } from '../research-presets'
+import { formatResearchProfileForPrompt, getResearchProfileByPresetId } from '../research-profiles'
 import { getSourceTracker, extractSourcesFromToolResult } from './sources'
 import { loadPriorKnowledge } from './memory'
+import { skillPackForPreset } from './research-skills'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
 export interface AgentBridge {
@@ -241,6 +243,8 @@ function getOsInfo(): string {
 function getSystemPrompt(): string {
   const cfg = doGetConfig()
   const preset = getResearchPresetById(cfg.selectedPreset)
+  const profile = getResearchProfileByPresetId(cfg.selectedPreset)
+  const skillPack = skillPackForPreset(cfg.selectedPreset)
   const custom = cfg.systemPrompt
   const base = custom || (ctxTokens() < 16384 ? COMPACT_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT)
   const webSearchStatus = getWebSearchStatus(cfg)
@@ -268,7 +272,7 @@ function getSystemPrompt(): string {
       if (knowledge) priorKnowledgeBlock = '\n\n' + knowledge
     }
   } catch {}
-  return base + '\n\n' + preset.promptAddon + webSearchInfo + getOsInfo() + sourcesBlock + priorKnowledgeBlock
+  return base + '\n\n' + preset.promptAddon + '\n\n' + formatResearchProfileForPrompt(profile) + (skillPack ? '\n\n' + skillPack : '') + webSearchInfo + getOsInfo() + sourcesBlock + priorKnowledgeBlock
 }
 
 function getSummarizePrompt(): string {
@@ -2521,7 +2525,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           }
 
           let result: string
-          const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report'])
+          const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report', 'build_corpus', 'record_evidence', 'verify_claims', 'run_quality_gates', 'gate_report'])
           const toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
           if (isCustom) {
             const ct = recoveredCustomTools.find((t: any) => t.name === tc.name)
@@ -2695,6 +2699,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       const SESSION_AWARE_TOOLS = new Set([
         'generate_report', 'verify_sources', 'reflect', 'plan_research',
         'save_finding', 'spawn_sub_researcher', 'export_report',
+        'build_corpus', 'record_evidence', 'verify_claims', 'run_quality_gates', 'gate_report',
       ])
       if (SESSION_AWARE_TOOLS.has(toolName)) toolArgs = { ...toolArgs, session_id: session.id }
 

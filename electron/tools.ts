@@ -17,6 +17,12 @@ import { runSubResearcher, canSpawnMore } from './sub-researcher'
 import { searchHybrid, indexStats, rebuildIndex, indexText as indexTextHybrid } from './knowledge-index'
 import { exportPdf, exportDocx, exportBibTex } from './export-report'
 import { screenshotPage } from './screenshot'
+import { addSourcesToCorpus, listCorpus, queueFullText, rankCorpus, corpusStats } from './corpus'
+import { evidenceMatrix, evidenceStats, listEvidence, recordEvidence, verifyClaims } from './evidence'
+import { formatGateReport, runQualityGates } from './quality-gates'
+import { listResearchSkills, loadResearchSkill, recommendSkills } from './research-skills'
+import { prioritizeIdeas, saveIdea, scoutIdeas } from './idea-scout'
+import { RESEARCH_PROFILES, getResearchProfileByPresetId } from '../research-profiles'
 
 export const TOOL_DEFINITIONS = [
   {
@@ -449,6 +455,185 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'build_corpus',
+      description: 'Build or update .research/corpus.jsonl from the current session sources. Deduplicates by DOI/arXiv/PMID/URL/title and ranks entries for full-text reading.',
+      parameters: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+          tags: { type: 'string', description: 'Optional comma-separated tags for the corpus entries.' },
+          queue_full_text: { type: 'boolean', description: 'If true, mark added corpus items as queued for full-text reading.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_corpus',
+      description: 'List the ranked research corpus from .research/corpus.jsonl, including IDs, scores, identifiers, URLs, and full-text status.',
+      parameters: { type: 'object', properties: { max_items: { type: 'number', description: 'Maximum items to show (default: 20).' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'queue_full_text',
+      description: 'Mark corpus items as queued for full-text reading. Omit ids to queue all candidate items.',
+      parameters: { type: 'object', properties: { ids: { type: 'string', description: 'Optional comma-separated corpus IDs.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_references',
+      description: 'Use OpenAlex to retrieve references cited by a paper/work. Input can be a DOI, OpenAlex URL/ID, arXiv URL/ID, or paper title.',
+      parameters: { type: 'object', properties: { work: { type: 'string', description: 'DOI, OpenAlex ID/URL, arXiv ID/URL, or title.' }, max_results: { type: 'number', description: 'Max references (default 10).' } }, required: ['work'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_citations',
+      description: 'Use OpenAlex to retrieve works citing a paper/work. Input can be a DOI, OpenAlex URL/ID, arXiv URL/ID, or paper title.',
+      parameters: { type: 'object', properties: { work: { type: 'string', description: 'DOI, OpenAlex ID/URL, arXiv ID/URL, or title.' }, max_results: { type: 'number', description: 'Max citing works (default 10).' } }, required: ['work'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_evidence',
+      description: 'Persist a claim-evidence row to .research/evidence.jsonl. Use this for every important research claim before final synthesis.',
+      parameters: {
+        type: 'object',
+        properties: {
+          claim: { type: 'string', description: 'Atomic claim or finding.' },
+          sources: { type: 'string', description: 'Citation/source ids, e.g. "1,2".' },
+          quote: { type: 'string', description: 'Optional exact supporting quote or passage.' },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low', 'speculative'], description: 'Confidence level.' },
+          support: { type: 'string', enum: ['supports', 'contradicts', 'background', 'weak'], description: 'Relationship between source(s) and claim.' },
+          topic: { type: 'string', description: 'Optional topic/plan item.' },
+          notes: { type: 'string', description: 'Optional caveats.' },
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+        },
+        required: ['claim'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_evidence',
+      description: 'List recorded claim-evidence rows from .research/evidence.jsonl.',
+      parameters: { type: 'object', properties: { status: { type: 'string', description: 'Optional status filter: supported, contested, unsupported, needs_review.' }, max_items: { type: 'number', description: 'Maximum rows (default 30).' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'evidence_matrix',
+      description: 'Render the current claim-evidence graph as a Markdown evidence matrix.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'verify_claims',
+      description: 'Check recorded evidence claims for missing citations, weak support, unsupported/contested status, and unresolved source ids.',
+      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_quality_gates',
+      description: 'Run quality gates before final synthesis/report: source coverage, evidence coverage, claim support, plan progress, and recency.',
+      parameters: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+          min_sources: { type: 'number', description: 'Minimum number of sources expected (default 5).' },
+          min_evidence: { type: 'number', description: 'Minimum evidence claims expected (default 3).' },
+          require_plan_completion: { type: 'boolean', description: 'If true, fail when plan progress is under 80%.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'gate_report',
+      description: 'Return the latest research quality gate report as Markdown.',
+      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_research_skills',
+      description: 'List built-in and workspace .research/skills/*.md research skills, with triggers and required tools.',
+      parameters: { type: 'object', properties: { query: { type: 'string', description: 'Optional query to recommend matching skills.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'load_research_skill',
+      description: 'Load full instructions for a research skill just-in-time instead of bloating the system prompt.',
+      parameters: { type: 'object', properties: { skill_id: { type: 'string', description: 'Skill id, e.g. literature-review or proof-map.' } }, required: ['skill_id'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_domain_connectors',
+      description: 'List domain-specific source connectors/tools for a research profile (biology, ML/AI, math, finance, etc.).',
+      parameters: { type: 'object', properties: { profile_id: { type: 'string', description: 'Optional profile id or current preset id.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scout_ideas',
+      description: 'Generate research idea cards from the current corpus/evidence and a topic. Saves them to .research/ideas.jsonl.',
+      parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Research area or problem.' }, max_ideas: { type: 'number', description: 'Maximum idea cards (default 5).' } }, required: ['topic'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'prioritize_ideas',
+      description: 'Rank saved idea cards by novelty + feasibility + impact.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_idea',
+      description: 'Save a manually synthesized idea card to .research/ideas.jsonl.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          hypothesis: { type: 'string' },
+          rationale: { type: 'string' },
+          sources: { type: 'string', description: 'Optional comma-separated corpus/source IDs.' },
+          novelty: { type: 'number' },
+          feasibility: { type: 'number' },
+          impact: { type: 'number' },
+          next_steps: { type: 'string', description: 'Optional semicolon-separated next steps.' },
+        },
+        required: ['title', 'hypothesis', 'rationale'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'search_knowledge',
       description:
         'Hybrid BM25 + vector search over the local research knowledge index (notes, saved findings, downloaded papers). Use this to quickly recall what you already researched before launching fresh web searches.',
@@ -608,6 +793,40 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return searchPubMed(args.query, args.max_results, args.year_from, args.year_to)
       case 'smart_search':
         return smartSearch(args.query, args.max_per_source, workspace)
+      case 'build_corpus':
+        return buildCorpusTool(args.session_id, args.tags, args.queue_full_text, workspace)
+      case 'list_corpus':
+        return listCorpus(workspace, args.max_items)
+      case 'queue_full_text':
+        return queueFullText(workspace, String(args.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+      case 'get_references':
+        return openAlexSnowballTool(args.work, args.max_results, 'references')
+      case 'get_citations':
+        return openAlexSnowballTool(args.work, args.max_results, 'citations')
+      case 'record_evidence':
+        return recordEvidence(workspace, args.claim, args.sources, { quote: args.quote, confidence: args.confidence, support: args.support, topic: args.topic, notes: args.notes, sessionId: args.session_id })
+      case 'list_evidence':
+        return listEvidence(workspace, args.status, args.max_items)
+      case 'evidence_matrix':
+        return evidenceMatrix(workspace)
+      case 'verify_claims':
+        return verifyClaims(workspace, args.session_id)
+      case 'run_quality_gates':
+        return runQualityGatesTool(workspace, args.session_id, args.min_sources, args.min_evidence, args.require_plan_completion)
+      case 'gate_report':
+        return formatGateReport(workspace, args.session_id)
+      case 'list_research_skills':
+        return listResearchSkillsTool(workspace, args.query)
+      case 'load_research_skill':
+        return loadResearchSkill(args.skill_id, workspace)
+      case 'list_domain_connectors':
+        return listDomainConnectorsTool(args.profile_id)
+      case 'scout_ideas':
+        return scoutIdeas(workspace, args.topic, args.max_ideas)
+      case 'prioritize_ideas':
+        return prioritizeIdeas(workspace)
+      case 'save_idea':
+        return saveIdeaTool(workspace, args)
       case 'download_arxiv_html':
         return downloadArxivHtml(args.arxiv_id, args.output_path, workspace)
       case 'download_arxiv_pdf':
@@ -726,6 +945,147 @@ async function recallFindingsAsync(workspace: string, query: string, maxResults?
 
 function recallFindingsHybrid(workspace: string, query: string, maxResults?: number): string {
   return recallFindings(workspace, query, maxResults)
+}
+
+function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefined, queue: boolean | undefined, workspace: string): string {
+  if (!sessionId) return 'Error: session id missing; build_corpus must be called from an agent session.'
+  const sources = getSourceTracker(sessionId).getAll()
+  if (sources.length === 0) return 'No collected sources in this session yet. Run search tools first.'
+  const tags = String(tagsRaw ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+  const merged = addSourcesToCorpus(workspace, sources, tags)
+  if (queue) queueFullText(workspace)
+  const stats = corpusStats(workspace)
+  return [
+    `Corpus updated: ${merged.added} added, ${merged.updated} merged.`,
+    `Stats: ${stats.total} total, ${stats.primary} primary, ${stats.withDoi} DOI, ${stats.withArxiv} arXiv, ${stats.queuedFullText} queued full text.`,
+    '',
+    rankCorpus(workspace),
+  ].join('\n')
+}
+
+function openAlexSnowballTool(work: string, maxResults: number | undefined, mode: 'references' | 'citations'): string {
+  const input = String(work ?? '').trim()
+  if (!input) return 'Error: work is required.'
+  const limit = Math.max(1, Math.min(25, Number(maxResults) || 10))
+  const script = `
+const input = process.argv[1]
+const mode = process.argv[2]
+const limit = Number(process.argv[3] || '10')
+function cleanDoi(s) {
+  const m = String(s).match(/10\\.\\d{4,9}\\/[-._;()/:A-Z0-9]+/i)
+  return m ? m[0].replace(/[.,;)\\]]+$/, '') : ''
+}
+async function j(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } })
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + url)
+  return await r.json()
+}
+async function resolveWork(s) {
+  const doi = cleanDoi(s)
+  if (doi) return await j('https://api.openalex.org/works/https://doi.org/' + encodeURIComponent(doi))
+  const open = String(s).match(/openalex\\.org\\/(W\\d+)/i)?.[1] || String(s).match(/\\bW\\d{6,}\\b/)?.[0]
+  if (open) return await j('https://api.openalex.org/works/' + open)
+  const search = await j('https://api.openalex.org/works?per-page=1&search=' + encodeURIComponent(s))
+  if (search.results && search.results[0]) return search.results[0]
+  return null
+}
+function line(w, i) {
+  const authors = (w.authorships || []).slice(0, 6).map(a => a.author?.display_name).filter(Boolean).join(', ')
+  const doi = w.doi || ''
+  const url = doi || w.primary_location?.landing_page_url || w.id || ''
+  const abstract = w.abstract_inverted_index ? Object.entries(w.abstract_inverted_index).sort((a,b)=>a[1][0]-b[1][0]).map(([k])=>k).join(' ').slice(0, 350) : ''
+  return [String(i+1)+'. '+(w.title || 'Untitled'), w.publication_year ? '   Year: '+w.publication_year : '', authors ? '   Authors: '+authors : '', w.cited_by_count != null ? '   Citations: '+w.cited_by_count : '', doi ? '   DOI: '+doi : '', url ? '   URL: '+url : '', abstract ? '   Abstract: '+abstract : ''].filter(Boolean).join('\\n')
+}
+(async () => {
+  const root = await resolveWork(input)
+  if (!root) { console.log('No OpenAlex work found for "' + input + '".'); return }
+  let works = []
+  if (mode === 'citations') {
+    const url = (root.cited_by_api_url || ('https://api.openalex.org/works?filter=cites:' + root.id.split('/').pop())) + '&per-page=' + limit
+    works = (await j(url)).results || []
+  } else {
+    const refs = (root.referenced_works || []).slice(0, limit)
+    for (const ref of refs) {
+      try { works.push(await j(ref)) } catch {}
+    }
+  }
+  console.log(JSON.stringify({ root, works }))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  try {
+    const payload = JSON.parse(runNodeScript(script, [input, mode, String(limit)]))
+    const root = payload.root
+    const works = Array.isArray(payload.works) ? payload.works : []
+    if (!root) return `No OpenAlex work found for "${input}".`
+    const title = root.title || input
+    if (works.length === 0) return `No ${mode} found for "${title}" via OpenAlex.`
+    const lines = works.map((w: any, i: number) => {
+      const authors = (w.authorships || []).slice(0, 6).map((a: any) => a.author?.display_name).filter(Boolean).join(', ')
+      const doi = w.doi || ''
+      const url = doi || w.primary_location?.landing_page_url || w.id || ''
+      const abstract = w.abstract_inverted_index
+        ? Object.entries(w.abstract_inverted_index).sort((a: any, b: any) => a[1][0] - b[1][0]).map(([k]) => k).join(' ').slice(0, 350)
+        : ''
+      return [
+        `${i + 1}. ${w.title || 'Untitled'}`,
+        w.publication_year ? `   Year: ${w.publication_year}` : null,
+        authors ? `   Authors: ${authors}` : null,
+        w.cited_by_count != null ? `   Citations: ${w.cited_by_count}` : null,
+        doi ? `   DOI: ${doi}` : null,
+        url ? `   URL: ${url}` : null,
+        abstract ? `   Abstract: ${abstract}` : null,
+      ].filter(Boolean).join('\n')
+    })
+    return `Found ${works.length} ${mode} for "${title}" via OpenAlex:\n\n${lines.join('\n\n')}`
+  } catch (e: any) {
+    return `Error: OpenAlex ${mode} lookup failed. ${String(e?.stderr || e?.message || e).trim()}`
+  }
+}
+
+function runQualityGatesTool(workspace: string, sessionId: string | undefined, minSources?: number, minEvidence?: number, requirePlanCompletion?: boolean): string {
+  const { summary } = runQualityGates(workspace, sessionId, { minSources, minEvidence, requirePlanCompletion })
+  return `${summary}\n\n${formatGateReport(workspace, sessionId)}`
+}
+
+function listResearchSkillsTool(workspace: string, query?: string): string {
+  const skills = query ? recommendSkills(query, cfg.get('selectedPreset'), workspace) : listResearchSkills(workspace)
+  if (skills.length === 0) return 'No research skills found.'
+  return skills.map((s) => [
+    `- ${s.id}: ${s.name}`,
+    `  Domain: ${s.domain}`,
+    `  Description: ${s.description}`,
+    `  Tools: ${s.requiredTools.join(', ') || 'none'}`,
+    `  Triggers: ${s.triggers.join(', ')}`,
+  ].join('\n')).join('\n')
+}
+
+function listDomainConnectorsTool(profileId?: string): string {
+  const profile = profileId
+    ? (RESEARCH_PROFILES.find((p) => p.id === profileId || p.presetIds.includes(profileId as any)) ?? getResearchProfileByPresetId(profileId))
+    : getResearchProfileByPresetId(cfg.get('selectedPreset'))
+  return [
+    `Profile: ${profile.label} (${profile.domain})`,
+    `Preferred tools: ${profile.preferredTools.join(', ')}`,
+    '',
+    ...profile.sourceConnectors.map((c) => `- ${c.label} [${c.status}]: ${c.description}. Tools: ${c.preferredTools.join(', ')}`),
+  ].join('\n')
+}
+
+function saveIdeaTool(workspace: string, args: Record<string, any>): string {
+  const title = String(args.title ?? '').trim()
+  const hypothesis = String(args.hypothesis ?? '').trim()
+  const rationale = String(args.rationale ?? '').trim()
+  if (!title || !hypothesis || !rationale) return 'Error: title, hypothesis and rationale are required.'
+  return saveIdea(workspace, {
+    title,
+    hypothesis,
+    rationale,
+    sources: String(args.sources ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+    novelty: Math.max(0, Math.min(100, Number(args.novelty) || 60)),
+    feasibility: Math.max(0, Math.min(100, Number(args.feasibility) || 60)),
+    impact: Math.max(0, Math.min(100, Number(args.impact) || 60)),
+    nextSteps: String(args.next_steps ?? '').split(';').map((s) => s.trim()).filter(Boolean),
+  })
 }
 
 function readFile(filePath: string, workspace: string, offset?: number, limit?: number): string {

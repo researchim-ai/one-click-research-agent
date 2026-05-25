@@ -87,6 +87,15 @@ interface ElectronAPI {
   // Research features
   getSessionSources(sessionId: string): Promise<any[]>
   getResearchPlan(workspace: string): Promise<{ items: { text: string; done: boolean; line: number }[]; progress: { total: number; done: number; pct: number } }>
+  getResearchProfiles(): Promise<import('../research-profiles').ResearchProfile[]>
+  getResearchDashboard(workspace: string): Promise<{
+    profile: import('../research-profiles').ResearchProfile
+    plan: { total: number; done: number; pct: number }
+    corpus: { total: number; primary: number; queuedFullText: number; read: number; withDoi: number; withArxiv: number }
+    evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number }
+    ideas: number
+    index: { chunks: number; docs: number; hasVectors: boolean }
+  }>
   listResearchArtifacts(workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>>
   embedStatus(): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }>
   embedDownloadModel(): Promise<{ ok: boolean; path?: string; error?: string }>

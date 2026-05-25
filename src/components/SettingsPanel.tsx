@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, type ReactNode } from 'react'
 import type { ModelVariantInfo, ModelFamily, ToolInfo, SystemResources, GpuMode, WebSearchStatus } from '../../electron/types'
 import type { AppConfig, AppLanguage, CustomTool, WebSearchProvider } from '../../electron/config'
 import { DEFAULT_PRESET_ID, RESEARCH_PRESETS, type ResearchPresetId } from '../../research-presets'
+import { getResearchProfileByPresetId } from '../../research-profiles'
 
 interface Props {
   open: boolean
@@ -894,6 +895,7 @@ function AgentTab({
   onChange: (field: string, value: number | boolean | ResearchPresetId | WebSearchProvider | AppLanguage | string) => void
 }) {
   const activePreset = RESEARCH_PRESETS.find((preset) => preset.id === selectedPreset) ?? RESEARCH_PRESETS[0]
+  const activeProfile = getResearchProfileByPresetId(selectedPreset)
   const t = appLanguage === 'ru' ? {
     agentMode: 'Режим агента',
     agentModeHint: 'По умолчанию работает универсальный research-agent. Пресеты усиливают его под конкретные сценарии.',
@@ -1041,6 +1043,18 @@ function AgentTab({
             {activePreset.examples.map((example) => (
               <span key={example} className="px-2 py-1 rounded-lg bg-zinc-800 text-[11px] text-zinc-400">
                 {example}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="mt-3 px-3 py-3 rounded-xl border border-zinc-800 bg-zinc-900/40">
+          <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2">Research Profile</div>
+          <div className="text-sm text-zinc-300">{activeProfile.label}</div>
+          <p className="text-xs text-zinc-500 mt-1">{activeProfile.description}</p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {activeProfile.sourceConnectors.slice(0, 8).map((connector) => (
+              <span key={connector.id} className="px-2 py-0.5 rounded-md bg-zinc-800 text-[10px] text-zinc-400">
+                {connector.label} · {connector.status}
               </span>
             ))}
           </div>

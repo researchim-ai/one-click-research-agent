@@ -34,6 +34,10 @@ import { getSourceTracker } from './sources'
 import * as embed from './embed'
 import * as planner from './planner'
 import * as knowledgeIndex from './knowledge-index'
+import { corpusStats } from './corpus'
+import { evidenceStats } from './evidence'
+import { loadIdeas } from './idea-scout'
+import { getResearchProfileByPresetId, RESEARCH_PROFILES } from '../research-profiles'
 import {
   runAgent, resetAgent, setWorkspace, cancelAgent,
   createSession, switchSession, listSessions, deleteSession,
@@ -586,6 +590,41 @@ function registerIpcHandlers() {
       const items = planner.parsePlan(workspace)
       return { items, progress: planner.planProgress(items) }
     } catch { return { items: [], progress: { total: 0, done: 0, pct: 0 } } }
+  })
+
+  ipcMain.handle('get-research-profiles', () => RESEARCH_PROFILES)
+
+  ipcMain.handle('get-research-dashboard', (_e, workspace: string) => {
+    if (!workspace) {
+      return {
+        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
+        plan: { total: 0, done: 0, pct: 0 },
+        corpus: { total: 0, primary: 0, queuedFullText: 0, read: 0, withDoi: 0, withArxiv: 0 },
+        evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
+        ideas: 0,
+        index: { chunks: 0, docs: 0, hasVectors: false },
+      }
+    }
+    try {
+      const items = planner.parsePlan(workspace)
+      return {
+        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
+        plan: planner.planProgress(items),
+        corpus: corpusStats(workspace),
+        evidence: evidenceStats(workspace),
+        ideas: loadIdeas(workspace).length,
+        index: knowledgeIndex.indexStats(workspace),
+      }
+    } catch {
+      return {
+        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
+        plan: { total: 0, done: 0, pct: 0 },
+        corpus: { total: 0, primary: 0, queuedFullText: 0, read: 0, withDoi: 0, withArxiv: 0 },
+        evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
+        ideas: 0,
+        index: { chunks: 0, docs: 0, hasVectors: false },
+      }
+    }
   })
 
   ipcMain.handle('list-research-artifacts', (_e, workspace: string) => {

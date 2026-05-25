@@ -240,6 +240,8 @@ const PARSERS: Record<string, (text: string) => Omit<Source, 'idx'>[]> = {
   search_crossref: parseCrossrefResults,
   search_semantic_scholar: parseSemanticScholarResults,
   search_pubmed: parsePubMedResults,
+  get_references: parseOpenAlexResults,
+  get_citations: parseOpenAlexResults,
   fetch_url: parseFetchUrlResult,
   smart_search: (text: string) => {
     // smart_search aggregates sub-sections; parse all known headers
