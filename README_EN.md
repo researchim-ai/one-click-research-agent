@@ -68,6 +68,12 @@ Recommended arXiv flow is now:
 2. prefer arXiv HTML when available
 3. use PDF as fallback
 
+## Project map
+
+Detailed architecture map with mermaid diagrams, modules, tools, IPC, `.research/` artifacts, and extension points:
+
+→ [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md)
+
 ## Development
 
 Install dependencies:
