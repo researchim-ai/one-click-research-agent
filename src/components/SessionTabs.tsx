@@ -6,6 +6,7 @@ interface Props {
   activeSessionId: string | null
   busy: boolean
   onNew: () => void
+  onNewResearch?: () => void
   onSwitch: (id: string) => void
   onDelete: (id: string) => void
   onCollapse: () => void
@@ -17,6 +18,7 @@ export function SessionTabs({
   activeSessionId,
   busy,
   onNew,
+  onNewResearch,
   onSwitch,
   onDelete,
   onCollapse,
@@ -102,6 +104,16 @@ export function SessionTabs({
 
       {/* Actions */}
       <div className="flex items-center gap-0.5 px-1.5 shrink-0">
+        {onNewResearch && (
+          <button
+            onClick={onNewResearch}
+            disabled={busy}
+            className="h-6 px-2 flex items-center justify-center rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer text-[10px] transition-colors"
+            title={L ? 'Новое исследование с планом и checkpoint’ами' : 'New research with plan and checkpoints'}
+          >
+            {L ? 'Research' : 'Research'}
+          </button>
+        )}
         <button
           onClick={onNew}
           disabled={busy}

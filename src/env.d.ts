@@ -91,11 +91,18 @@ interface ElectronAPI {
   getResearchDashboard(workspace: string): Promise<{
     profile: import('../research-profiles').ResearchProfile
     plan: { total: number; done: number; pct: number }
-    corpus: { total: number; primary: number; queuedFullText: number; read: number; withDoi: number; withArxiv: number }
-    evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number }
+    corpus: { total: number; primary: number; selected: number; rejected: number; needsReview: number; queuedFullText: number; read: number; failed: number; withDoi: number; withArxiv: number; selectedRead: number; highPriority: number; highPriorityRead: number }
+    evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number; withCorpus?: number; withQuotes?: number }
+    quality?: { blockers: string[] }
     ideas: number
     index: { chunks: number; docs: number; hasVectors: boolean }
   }>
+  inferResearchRequest(payload: {
+    message: string
+    draft: any
+    appLanguage: 'ru' | 'en'
+    profiles: Array<{ id: string; label: string; domain: string }>
+  }): Promise<{ patch?: any; error?: string }>
   listResearchArtifacts(workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>>
   embedStatus(): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }>
   embedDownloadModel(): Promise<{ ok: boolean; path?: string; error?: string }>

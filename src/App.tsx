@@ -14,16 +14,21 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { SourcesPanel } from './components/SourcesPanel'
 import { ResearchArtifacts } from './components/ResearchArtifacts'
 import { ResearchDashboard } from './components/ResearchDashboard'
+import { NewResearchDialog, type NewResearchRequest } from './components/NewResearchDialog'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { normalizeExternalHttpUrl } from './utils/external-links'
+import { RESEARCH_PROFILES } from '../research-profiles'
+import type { ResearchPresetId } from '../research-presets'
+import { makeResearchRunDirFromTopic } from '../research-slug'
 
 export function App() {
   const {
     messages, busy, status, downloadProgress, buildStatus,
-    workspace, setWorkspace, contextUsage, tokensPerSecond,
-    sendMessage, resetChat, pollStatus, respondApproval, cancel,
+    workspace, setWorkspace, contextUsage, tokensPerSecond, autoOpenFile,
+    agentActivity, busyElapsedSec, gpuResources,
+    sendMessage, startResearchRun, resetChat, pollStatus, respondApproval, cancel,
     sessions, activeSessionId,
     newSession, switchToSession, removeSession,
   } = useAgent()
@@ -38,6 +43,7 @@ export function App() {
   const [codeRefs, setCodeRefs] = useState<CodeReference[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined)
+  const [newResearchOpen, setNewResearchOpen] = useState(false)
   const [diffView, setDiffView] = useState<{ filePath: string; original: string; modified: string } | null>(null)
   const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
   const [appLanguage, setAppLanguage] = useState<'ru' | 'en'>('ru')
@@ -99,6 +105,86 @@ export function App() {
       setDiffView(null)
     }
   }, [workspace])
+
+  useEffect(() => {
+    if (autoOpenFile?.path) openFile(autoOpenFile.path)
+  }, [autoOpenFile?.token])
+
+  const makeResearchRunDir = useCallback((topic: string): string => {
+    return makeResearchRunDirFromTopic(topic)
+  }, [])
+
+  const buildResearchPrompt = useCallback((request: NewResearchRequest): string => {
+    const profile = RESEARCH_PROFILES.find((p) => p.id === request.profileId) ?? RESEARCH_PROFILES[0]
+    const runDir = makeResearchRunDir(request.topic)
+    const dateRange = request.dateRange === 'custom'
+      ? request.customDateRange || 'custom range not specified'
+      : request.dateRange
+    const reportLanguageLabel = request.reportLanguage === 'ru' ? 'Russian / русский' : 'English'
+    return [
+      '# Start managed research run',
+      '',
+      `Topic: ${request.topic}`,
+      `Research profile: ${profile.label} (${profile.domain})`,
+      `Mode: ${request.mode}`,
+      `Date range: ${dateRange}`,
+      `Max sources: ${request.maxSources}`,
+      `Need full text: ${request.needFullText ? 'yes' : 'no'}`,
+      `Minimum selected sources: ${request.minSelectedSources}`,
+      `Minimum full-text reads: ${request.minFullTextReads}`,
+      `Evidence per plan section: ${request.evidencePerSection}`,
+      `Strict date range: ${request.strictDateRange ? 'yes' : 'no'}`,
+      `Require quality pass before report: ${request.requireQualityPass ? 'yes' : 'no'}`,
+      `Report language: ${reportLanguageLabel}`,
+      `Research artifact directory: ${runDir}`,
+      `Requested outputs: ${request.outputs.join(', ') || 'brief'}`,
+      `User-review checkpoints: ${request.checkpoints.join(', ') || 'none'}`,
+      request.extraDirections ? `Extra directions: ${request.extraDirections}` : '',
+      '',
+      'Run this as a managed, editable research workflow, not as a one-shot answer.',
+      `All user-facing research outputs, checkpoints, briefings, report sections, limitations, and generated Markdown artifacts must be written in ${reportLanguageLabel}.`,
+      request.reportLanguage === 'ru'
+        ? 'Keep terminology consistent in Russian. English technical terms are allowed only as terms of art, preferably with Russian explanation on first use. Do not produce mixed-language prose.'
+        : 'Keep terminology consistent in English. Do not switch to Russian unless the user explicitly asks.',
+      '',
+      'The system "Managed research contract" and the live "Research state" block at the end of the',
+      'conversation are authoritative for the workflow and report rules. This kickoff only sets run',
+      'parameters and checkpoints. Follow the contract; do not re-derive or contradict it.',
+      '',
+      'Run parameters:',
+      `- Store all artifacts in \`${runDir}\` (not the shared \`.research/\` root). Treat the directory as an opaque id: copy it exactly into \`output_dir\` for every tool that supports it. Never translate or re-slugify it.`,
+      `- screen_corpus: \`max_selected: ${request.minSelectedSources}\`, \`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`.`,
+      `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`.`,
+      `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources you may claim as read. Report found/selected/read/evidence counts separately.`,
+      request.requireQualityPass
+        ? '- A quality pass is required before the report: data/evidence gates must pass before `generate_evidence_report`.'
+        : '- A non-passing report is allowed: still produce it only via `generate_evidence_report`, including blockers and limitations.',
+      '',
+      'User-review checkpoints (stop and ask me before continuing):',
+      request.checkpoints.includes('plan') ? '- plan: stop after drafting the plan; ask what to edit/approve before searching.' : '',
+      request.checkpoints.includes('corpus') ? '- corpus: stop after corpus building; ask which sources/directions to keep, remove, or prioritize.' : '',
+      request.checkpoints.includes('evidence') ? '- evidence: stop after evidence extraction; ask what claims/gaps to revise.' : '',
+      request.checkpoints.includes('report') ? '- report: show gaps and quality warnings before the final report; ask for approval or edits.' : '',
+      request.checkpoints.length === 0 ? '- none: work autonomously through the contract phases.' : '- Between checkpoints, work autonomously using the profile tools.',
+      '',
+      'Start now with `plan_research`.',
+    ].filter(Boolean).join('\n')
+  }, [makeResearchRunDir])
+
+  const presetForResearch = useCallback((request: NewResearchRequest): ResearchPresetId => {
+    if (request.mode === 'reproduction') return 'paper-reproduction'
+    if (request.profileId === 'universal' && (request.mode === 'deep' || request.mode === 'systematic' || request.mode === 'idea-scout')) return 'deep-research'
+    const profile = RESEARCH_PROFILES.find((p) => p.id === request.profileId) ?? RESEARCH_PROFILES[0]
+    return profile.presetIds[0]
+  }, [])
+
+  const handleStartResearch = useCallback(async (request: NewResearchRequest) => {
+    const preset = presetForResearch(request)
+    await window.api?.saveConfig?.({ selectedPreset: preset }).catch(() => {})
+    setNewResearchOpen(false)
+    const title = `Research: ${request.topic}`
+    await startResearchRun(buildResearchPrompt(request), title)
+  }, [buildResearchPrompt, presetForResearch, startResearchRun])
 
   const addCodeRef = useCallback((ref: CodeReference) => {
     setCodeRefs((prev) => {
@@ -241,6 +327,9 @@ export function App() {
         case 'new-chat':
           newSession()
           break
+        case 'new-research':
+          setNewResearchOpen(true)
+          break
         case 'reset-context':
           resetChat()
           break
@@ -330,6 +419,15 @@ export function App() {
             )}
           </div>
           <button
+            onClick={() => setNewResearchOpen(true)}
+            disabled={!workspace || busy}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+            style={{ WebkitAppRegion: 'no-drag' } as any}
+            title={appLanguage === 'ru' ? 'Начать управляемое исследование' : 'Start managed research'}
+          >
+            {appLanguage === 'ru' ? 'New Research' : 'New Research'}
+          </button>
+          <button
             onClick={() => { setSettingsTab('model'); setSettingsOpen(true) }}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/80 cursor-pointer transition-colors"
             style={{ WebkitAppRegion: 'no-drag' } as any}
@@ -345,6 +443,13 @@ export function App() {
       )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} initialTab={settingsTab} />
+      <NewResearchDialog
+        open={newResearchOpen}
+        busy={busy}
+        appLanguage={appLanguage}
+        onClose={() => setNewResearchOpen(false)}
+        onStart={handleStartResearch}
+      />
       {pendingExternalUrl && (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/70" onClick={() => setPendingExternalUrl(null)} />
@@ -456,6 +561,8 @@ export function App() {
                         onContentChange={(content) => updateFileContent(activeFile.path, content)}
                         onAfterSave={() => refreshFile(activeFile.path)}
                         onBreadcrumbClick={(dirPath) => setBreadcrumbExpandTo(dirPath)}
+                        externalLinksEnabled={externalLinksEnabled}
+                        onOpenExternalLink={requestOpenExternalLink}
                         appLanguage={appLanguage}
                       />
                     ) : activeFile ? (
@@ -473,6 +580,7 @@ export function App() {
                       <ResearchDashboard
                         workspace={workspace}
                         appLanguage={appLanguage}
+                        onNewResearch={() => setNewResearchOpen(true)}
                         onOpenSettings={() => {
                           setSettingsTab('agent')
                           setSettingsOpen(true)
@@ -531,6 +639,7 @@ export function App() {
                   activeSessionId={activeSessionId}
                   busy={busy}
                   onNew={newSession}
+                  onNewResearch={() => setNewResearchOpen(true)}
                   onSwitch={switchToSession}
                   onDelete={removeSession}
                   appLanguage={appLanguage}
@@ -546,6 +655,10 @@ export function App() {
                   codeRefs={codeRefs}
                   onRemoveCodeRef={removeCodeRef}
                   contextUsage={contextUsage}
+                  agentActivity={agentActivity}
+                  busyElapsedSec={busyElapsedSec}
+                  tokensPerSecond={tokensPerSecond}
+                  gpuResources={gpuResources}
                   externalLinksEnabled={externalLinksEnabled}
                   onOpenExternalLink={requestOpenExternalLink}
                   appLanguage={appLanguage}

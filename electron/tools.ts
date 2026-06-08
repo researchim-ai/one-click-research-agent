@@ -17,12 +17,18 @@ import { runSubResearcher, canSpawnMore } from './sub-researcher'
 import { searchHybrid, indexStats, rebuildIndex, indexText as indexTextHybrid } from './knowledge-index'
 import { exportPdf, exportDocx, exportBibTex } from './export-report'
 import { screenshotPage } from './screenshot'
-import { addSourcesToCorpus, listCorpus, queueFullText, rankCorpus, corpusStats } from './corpus'
-import { evidenceMatrix, evidenceStats, listEvidence, recordEvidence, verifyClaims } from './evidence'
-import { formatGateReport, runQualityGates } from './quality-gates'
+import {
+  addSourcesToCorpus, assignCorpusToPlan, fullTextStatus, listCorpus, listSelectedCorpus, loadCorpus, markCorpusItemRead,
+  queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats,
+} from './corpus'
+import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
+import { formatGateReport, formatGateResults, latestQualityGateFailure, readQualityGateSnapshot, runQualityGates, writeQualityGateSnapshot } from './quality-gates'
+import { applyGateEscapeValve, ensureResearchRunSpec } from './research-workflow'
+import { auditResearchRun, formatAuditResult } from './research-audit'
 import { listResearchSkills, loadResearchSkill, recommendSkills } from './research-skills'
 import { prioritizeIdeas, saveIdea, scoutIdeas } from './idea-scout'
 import { RESEARCH_PROFILES, getResearchProfileByPresetId } from '../research-profiles'
+import { canonicalResearchOutputDir } from '../research-paths'
 
 export const TOOL_DEFINITIONS = [
   {
@@ -199,7 +205,7 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'generate_report',
-      description: 'Generate a structured research report as a Markdown file. Automatically appends a References section from all sources collected during this session. Use this as the final step of a deep research workflow.',
+      description: 'Generate a general Markdown report outside the managed research pipeline. Do NOT use for managed research .research/YYYY.../report.md; use generate_evidence_report instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -216,7 +222,7 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'write_file',
-      description: 'Create a new file or completely overwrite an existing one. For partial edits, use edit_file instead.',
+      description: 'Create a new file or completely overwrite an existing one. For partial edits, use edit_file instead. Do NOT use this to create or overwrite managed research report.md; use generate_evidence_report.',
       parameters: {
         type: 'object',
         properties: {
@@ -461,6 +467,7 @@ export const TOOL_DEFINITIONS = [
         type: 'object',
         properties: {
           session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory, for example ".research/2026-05-25_20-38_topic".' },
           tags: { type: 'string', description: 'Optional comma-separated tags for the corpus entries.' },
           queue_full_text: { type: 'boolean', description: 'If true, mark added corpus items as queued for full-text reading.' },
         },
@@ -473,7 +480,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'list_corpus',
       description: 'List the ranked research corpus from .research/corpus.jsonl, including IDs, scores, identifiers, URLs, and full-text status.',
-      parameters: { type: 'object', properties: { max_items: { type: 'number', description: 'Maximum items to show (default: 20).' } }, required: [] },
+      parameters: { type: 'object', properties: { max_items: { type: 'number', description: 'Maximum items to show (default: 20).' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
     },
   },
   {
@@ -481,7 +488,79 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'queue_full_text',
       description: 'Mark corpus items as queued for full-text reading. Omit ids to queue all candidate items.',
-      parameters: { type: 'object', properties: { ids: { type: 'string', description: 'Optional comma-separated corpus IDs.' } }, required: [] },
+      parameters: { type: 'object', properties: { ids: { type: 'string', description: 'Optional comma-separated corpus IDs.' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'audit_research_run',
+      description: 'Audit a research run for corpus screening, full-text coverage, evidence linkage, report claims, and blockers. Writes audit.md and audit.json.',
+      parameters: { type: 'object', properties: { output_dir: { type: 'string', description: 'Optional research artifact directory.' }, year_from: { type: 'number' }, year_to: { type: 'number' }, min_selected: { type: 'number' }, min_read: { type: 'number' }, min_evidence: { type: 'number' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'screen_corpus',
+      description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage.',
+      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, output_dir: { type: 'string' } }, required: ['question'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_selected_corpus',
+      description: 'List selected/high-priority corpus items that should drive full-text reading and evidence extraction.',
+      parameters: { type: 'object', properties: { max_items: { type: 'number' }, output_dir: { type: 'string' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reject_corpus_items',
+      description: 'Reject irrelevant/noisy corpus items by stable corpus ID with a reason.',
+      parameters: { type: 'object', properties: { ids: { type: 'string' }, reason: { type: 'string' }, output_dir: { type: 'string' } }, required: ['ids'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'assign_corpus_to_plan',
+      description: 'Assign selected corpus IDs to a plan item such as Q1/Q2 for section-level coverage gates.',
+      parameters: { type: 'object', properties: { ids: { type: 'string' }, plan_item_id: { type: 'string' }, output_dir: { type: 'string' } }, required: ['ids', 'plan_item_id'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'select_full_text_batch',
+      description: 'Select top selected corpus items that still need full-text reading, prioritized by readPriority and score.',
+      parameters: { type: 'object', properties: { limit: { type: 'number' }, output_dir: { type: 'string' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_corpus_item',
+      description: 'Read/download one corpus item by stable corpus ID and update localPath/readStatus/readAt.',
+      parameters: { type: 'object', properties: { id: { type: 'string' }, output_dir: { type: 'string' } }, required: ['id'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_full_text_batch',
+      description: 'Batch wrapper that reads/downloads selected corpus items up to the requested limit and updates readStatus/localPath.',
+      parameters: { type: 'object', properties: { limit: { type: 'number' }, output_dir: { type: 'string' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'full_text_status',
+      description: 'Show selected/read/failed full-text coverage, including high-priority unread sources.',
+      parameters: { type: 'object', properties: { output_dir: { type: 'string' } }, required: [] },
     },
   },
   {
@@ -510,12 +589,19 @@ export const TOOL_DEFINITIONS = [
         properties: {
           claim: { type: 'string', description: 'Atomic claim or finding.' },
           sources: { type: 'string', description: 'Citation/source ids, e.g. "1,2".' },
+          corpus_ids: { type: 'string', description: 'Stable corpus IDs supporting the claim, comma-separated.' },
+          source_urls: { type: 'string', description: 'Source URLs supporting the claim, comma-separated.' },
+          local_path: { type: 'string', description: 'Local full-text file path used for the quote/passage.' },
+          passage_id: { type: 'string', description: 'Optional passage/chunk id.' },
+          plan_item_id: { type: 'string', description: 'Plan section id such as Q1/Q2.' },
+          evidence_type: { type: 'string', enum: ['primary_result', 'survey_statement', 'benchmark', 'safety_claim', 'background'], description: 'Type of evidence.' },
           quote: { type: 'string', description: 'Optional exact supporting quote or passage.' },
           confidence: { type: 'string', enum: ['high', 'medium', 'low', 'speculative'], description: 'Confidence level.' },
           support: { type: 'string', enum: ['supports', 'contradicts', 'background', 'weak'], description: 'Relationship between source(s) and claim.' },
           topic: { type: 'string', description: 'Optional topic/plan item.' },
           notes: { type: 'string', description: 'Optional caveats.' },
           session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory for evidence.jsonl.' },
         },
         required: ['claim'],
       },
@@ -526,7 +612,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'list_evidence',
       description: 'List recorded claim-evidence rows from .research/evidence.jsonl.',
-      parameters: { type: 'object', properties: { status: { type: 'string', description: 'Optional status filter: supported, contested, unsupported, needs_review.' }, max_items: { type: 'number', description: 'Maximum rows (default 30).' } }, required: [] },
+      parameters: { type: 'object', properties: { status: { type: 'string', description: 'Optional status filter: supported, contested, unsupported, needs_review.' }, max_items: { type: 'number', description: 'Maximum rows (default 30).' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
     },
   },
   {
@@ -534,7 +620,39 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'evidence_matrix',
       description: 'Render the current claim-evidence graph as a Markdown evidence matrix.',
-      parameters: { type: 'object', properties: {}, required: [] },
+      parameters: { type: 'object', properties: { output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract_evidence_from_corpus_item',
+      description: 'Create corpus-linked evidence rows from a read corpus item using a provided claim/quote. Use after reading full text.',
+      parameters: { type: 'object', properties: { corpus_id: { type: 'string' }, claim: { type: 'string' }, quote: { type: 'string' }, plan_item_id: { type: 'string' }, evidence_type: { type: 'string', enum: ['primary_result', 'survey_statement', 'benchmark', 'safety_claim', 'background'] }, confidence: { type: 'string', enum: ['high', 'medium', 'low', 'speculative'] }, output_dir: { type: 'string' }, session_id: { type: 'string' } }, required: ['corpus_id', 'claim'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'extract_evidence_batch',
+      description: 'Return a checklist of read selected corpus items that need evidence extraction. Use it to record evidence rows section by section.',
+      parameters: { type: 'object', properties: { output_dir: { type: 'string' }, max_items: { type: 'number' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'evidence_coverage_by_plan',
+      description: 'Summarize evidence coverage by plan item, including corpus-linked and quoted claim counts.',
+      parameters: { type: 'object', properties: { output_dir: { type: 'string' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'repair_evidence_quotes',
+      description: 'Batch repair for report_citation_coverage blockers. Fills missing evidence quotes/caveats from linked read corpus full-text or metadata/snippets. Use this instead of many repeated record_evidence calls when many claims lack quotes.',
+      parameters: { type: 'object', properties: { output_dir: { type: 'string' }, max_items: { type: 'number', description: 'Maximum missing-quote claims to repair in this batch (default 40).' } }, required: [] },
     },
   },
   {
@@ -542,7 +660,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'verify_claims',
       description: 'Check recorded evidence claims for missing citations, weak support, unsupported/contested status, and unresolved source ids.',
-      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' } }, required: [] },
+      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
     },
   },
   {
@@ -556,7 +674,11 @@ export const TOOL_DEFINITIONS = [
           session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
           min_sources: { type: 'number', description: 'Minimum number of sources expected (default 5).' },
           min_evidence: { type: 'number', description: 'Minimum evidence claims expected (default 3).' },
+          min_selected: { type: 'number', description: 'Minimum selected corpus items expected.' },
+          min_full_text_reads: { type: 'number', description: 'Minimum selected corpus items that must be read before final report.' },
+          evidence_per_section: { type: 'number', description: 'Minimum evidence rows per plan section.' },
           require_plan_completion: { type: 'boolean', description: 'If true, fail when plan progress is under 80%.' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory for quality-gates.json.' },
         },
         required: [],
       },
@@ -567,7 +689,15 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'gate_report',
       description: 'Return the latest research quality gate report as Markdown.',
-      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' } }, required: [] },
+      parameters: { type: 'object', properties: { session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'generate_evidence_report',
+      description: 'The ONLY valid final-report tool for managed research runs. Generates narrative report.md from selected corpus/evidence and a separate evidence-report.md appendix with matrix, coverage, and quality gates. Use this to create or repair .research/YYYY.../report.md after gates are ready; do not use write_file or generate_report for that.',
+      parameters: { type: 'object', properties: { title: { type: 'string' }, output_path: { type: 'string' }, output_dir: { type: 'string' }, session_id: { type: 'string' } }, required: ['title'] },
     },
   },
   {
@@ -599,7 +729,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'scout_ideas',
       description: 'Generate research idea cards from the current corpus/evidence and a topic. Saves them to .research/ideas.jsonl.',
-      parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Research area or problem.' }, max_ideas: { type: 'number', description: 'Maximum idea cards (default 5).' } }, required: ['topic'] },
+      parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Research area or problem.' }, max_ideas: { type: 'number', description: 'Maximum idea cards (default 5).' }, output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: ['topic'] },
     },
   },
   {
@@ -607,7 +737,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'prioritize_ideas',
       description: 'Rank saved idea cards by novelty + feasibility + impact.',
-      parameters: { type: 'object', properties: {}, required: [] },
+      parameters: { type: 'object', properties: { output_dir: { type: 'string', description: 'Optional research artifact directory.' } }, required: [] },
     },
   },
   {
@@ -626,6 +756,7 @@ export const TOOL_DEFINITIONS = [
           feasibility: { type: 'number' },
           impact: { type: 'number' },
           next_steps: { type: 'string', description: 'Optional semicolon-separated next steps.' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory.' },
         },
         required: ['title', 'hypothesis', 'rationale'],
       },
@@ -659,6 +790,7 @@ export const TOOL_DEFINITIONS = [
         properties: {
           question: { type: 'string', description: 'The top-level research question.' },
           sub_questions: { type: 'array', items: { type: 'string' }, description: 'Array of specific sub-questions (3–7 recommended).' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory, for example ".research/2026-05-25_20-38_topic".' },
           session_id: { type: 'string', description: 'Internal: session id. Passed automatically.' },
         },
         required: ['question', 'sub_questions'],
@@ -675,6 +807,7 @@ export const TOOL_DEFINITIONS = [
         properties: {
           item_id: { type: 'string', description: 'Plan item id, for example "Q2" or "Q1.3".' },
           done: { type: 'boolean', description: 'New checkbox state.' },
+          output_dir: { type: 'string', description: 'Optional research artifact directory containing plan.md.' },
         },
         required: ['item_id', 'done'],
       },
@@ -762,6 +895,26 @@ function resolvePath(raw: string | undefined, workspace: string): string {
   return path.resolve(p)
 }
 
+function resolveResearchOutputPath(raw: string | undefined, workspace: string, fallback: string): string {
+  const value = String(raw || fallback).replace(/\\/g, '/')
+  if (path.isAbsolute(value)) {
+    const absolute = resolvePath(value, workspace)
+    const rel = path.relative(workspace, absolute).replace(/\\/g, '/')
+    if (rel === '.research' || rel.startsWith('.research/')) {
+      const dir = path.dirname(rel)
+      const file = path.basename(rel)
+      return resolvePath(path.join(canonicalResearchOutputDir(dir), file), workspace)
+    }
+    return absolute
+  }
+  if (value === '.research' || value.startsWith('.research/')) {
+    const dir = path.dirname(value)
+    const file = path.basename(value)
+    return resolvePath(path.join(canonicalResearchOutputDir(dir), file), workspace)
+  }
+  return resolvePath(value, workspace)
+}
+
 function assertInWorkspace(resolved: string, workspace: string): void {
   const ws = path.resolve(workspace)
   if (!resolved.startsWith(ws) && !resolved.startsWith(ws + path.sep)) {
@@ -794,27 +947,55 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'smart_search':
         return smartSearch(args.query, args.max_per_source, workspace)
       case 'build_corpus':
-        return buildCorpusTool(args.session_id, args.tags, args.queue_full_text, workspace)
+        return buildCorpusTool(args.session_id, args.tags, args.queue_full_text, workspace, args.output_dir)
       case 'list_corpus':
-        return listCorpus(workspace, args.max_items)
+        return listCorpus(workspace, args.max_items, args.output_dir)
       case 'queue_full_text':
-        return queueFullText(workspace, String(args.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+        return queueFullText(workspace, String(args.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean), args.output_dir)
+      case 'audit_research_run':
+        return formatAuditResult(auditResearchRun(workspace, { outputDir: args.output_dir, yearFrom: args.year_from, yearTo: args.year_to, minSelected: args.min_selected, minRead: args.min_read, minEvidence: args.min_evidence }))
+      case 'screen_corpus':
+        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, strictDateRange: args.strict_date_range }, args.output_dir)
+      case 'list_selected_corpus':
+        return listSelectedCorpus(workspace, args.max_items, args.output_dir)
+      case 'reject_corpus_items':
+        return rejectCorpusItems(workspace, args.ids, args.reason, args.output_dir)
+      case 'assign_corpus_to_plan':
+        return assignCorpusToPlan(workspace, args.ids, args.plan_item_id, args.output_dir)
+      case 'select_full_text_batch':
+        return selectFullTextBatchTool(workspace, args.limit, args.output_dir)
+      case 'read_corpus_item':
+        return readCorpusItemTool(workspace, args.id, args.output_dir)
+      case 'read_full_text_batch':
+        return readFullTextBatchTool(workspace, args.limit, args.output_dir)
+      case 'full_text_status':
+        return fullTextStatus(workspace, args.output_dir)
       case 'get_references':
         return openAlexSnowballTool(args.work, args.max_results, 'references')
       case 'get_citations':
         return openAlexSnowballTool(args.work, args.max_results, 'citations')
       case 'record_evidence':
-        return recordEvidence(workspace, args.claim, args.sources, { quote: args.quote, confidence: args.confidence, support: args.support, topic: args.topic, notes: args.notes, sessionId: args.session_id })
+        return recordEvidence(workspace, args.claim, args.sources, { quote: args.quote, confidence: args.confidence, support: args.support, topic: args.topic, notes: args.notes, sessionId: args.session_id, outputDir: args.output_dir, corpusIds: args.corpus_ids, sourceUrls: args.source_urls, localPath: args.local_path, passageId: args.passage_id, planItemId: args.plan_item_id, evidenceType: args.evidence_type } as any)
       case 'list_evidence':
-        return listEvidence(workspace, args.status, args.max_items)
+        return listEvidence(workspace, args.status, args.max_items, args.output_dir)
       case 'evidence_matrix':
-        return evidenceMatrix(workspace)
+        return evidenceMatrix(workspace, args.output_dir)
+      case 'extract_evidence_from_corpus_item':
+        return extractEvidenceFromCorpusItemTool(workspace, args)
+      case 'extract_evidence_batch':
+        return extractEvidenceBatchTool(workspace, args.output_dir, args.max_items)
+      case 'evidence_coverage_by_plan':
+        return evidenceCoverageByPlan(workspace, args.output_dir)
+      case 'repair_evidence_quotes':
+        return repairEvidenceQuotes(workspace, args.output_dir, args.max_items)
       case 'verify_claims':
-        return verifyClaims(workspace, args.session_id)
+        return verifyClaims(workspace, args.session_id, args.output_dir)
       case 'run_quality_gates':
-        return runQualityGatesTool(workspace, args.session_id, args.min_sources, args.min_evidence, args.require_plan_completion)
+        return runQualityGatesTool(workspace, args.session_id, args.min_sources, args.min_evidence, args.require_plan_completion, args.output_dir, args.min_selected, args.min_full_text_reads, args.evidence_per_section)
       case 'gate_report':
-        return formatGateReport(workspace, args.session_id)
+        return formatGateReport(workspace, args.session_id, args.output_dir)
+      case 'generate_evidence_report':
+        return generateEvidenceReportTool(workspace, args.title, args.output_path, args.output_dir, args.session_id)
       case 'list_research_skills':
         return listResearchSkillsTool(workspace, args.query)
       case 'load_research_skill':
@@ -822,9 +1003,9 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'list_domain_connectors':
         return listDomainConnectorsTool(args.profile_id)
       case 'scout_ideas':
-        return scoutIdeas(workspace, args.topic, args.max_ideas)
+        return scoutIdeas(workspace, args.topic, args.max_ideas, args.output_dir)
       case 'prioritize_ideas':
-        return prioritizeIdeas(workspace)
+        return prioritizeIdeas(workspace, args.output_dir)
       case 'save_idea':
         return saveIdeaTool(workspace, args)
       case 'download_arxiv_html':
@@ -836,9 +1017,9 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'verify_sources':
         return verifySources(args.session_id, args.max_sources)
       case 'plan_research':
-        return planResearch(args.question, args.sub_questions, workspace, args.session_id)
+        return planResearch(args.question, args.sub_questions, workspace, args.session_id, args.output_dir)
       case 'update_plan_status':
-        return updatePlanStatus(args.item_id, args.done, workspace)
+        return updatePlanStatus(args.item_id, args.done, workspace, args.output_dir)
       case 'fetch_url':
         return fetchUrlTool(args.url, args.format, workspace)
       case 'edit_file':
@@ -947,19 +1128,19 @@ function recallFindingsHybrid(workspace: string, query: string, maxResults?: num
   return recallFindings(workspace, query, maxResults)
 }
 
-function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefined, queue: boolean | undefined, workspace: string): string {
+function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefined, queue: boolean | undefined, workspace: string, outputDir?: string): string {
   if (!sessionId) return 'Error: session id missing; build_corpus must be called from an agent session.'
   const sources = getSourceTracker(sessionId).getAll()
   if (sources.length === 0) return 'No collected sources in this session yet. Run search tools first.'
   const tags = String(tagsRaw ?? '').split(',').map((s) => s.trim()).filter(Boolean)
-  const merged = addSourcesToCorpus(workspace, sources, tags)
-  if (queue) queueFullText(workspace)
-  const stats = corpusStats(workspace)
+  const merged = addSourcesToCorpus(workspace, sources, tags, outputDir)
+  if (queue) queueFullText(workspace, undefined, outputDir)
+  const stats = corpusStats(workspace, outputDir)
   return [
     `Corpus updated: ${merged.added} added, ${merged.updated} merged.`,
     `Stats: ${stats.total} total, ${stats.primary} primary, ${stats.withDoi} DOI, ${stats.withArxiv} arXiv, ${stats.queuedFullText} queued full text.`,
     '',
-    rankCorpus(workspace),
+    rankCorpus(workspace, outputDir),
   ].join('\n')
 }
 
@@ -1042,9 +1223,350 @@ function line(w, i) {
   }
 }
 
-function runQualityGatesTool(workspace: string, sessionId: string | undefined, minSources?: number, minEvidence?: number, requirePlanCompletion?: boolean): string {
-  const { summary } = runQualityGates(workspace, sessionId, { minSources, minEvidence, requirePlanCompletion })
-  return `${summary}\n\n${formatGateReport(workspace, sessionId)}`
+function runQualityGatesTool(
+  workspace: string,
+  sessionId: string | undefined,
+  minSources?: number,
+  minEvidence?: number,
+  requirePlanCompletion?: boolean,
+  outputDir?: string,
+  minSelected?: number,
+  minFullTextReads?: number,
+  evidencePerSection?: number,
+): string {
+  const { results: rawResults } = runQualityGates(workspace, sessionId, { minSources, minEvidence, requirePlanCompletion, outputDir, minSelected, minFullTextReads, evidencePerSection } as any)
+
+  // No managed run directory → no escape valve / run.json bookkeeping.
+  if (!outputDir) {
+    const passed = rawResults.filter((r) => r.passed).length
+    return formatGateResults(workspace, sessionId, outputDir, rawResults, `Quality gates: ${passed}/${rawResults.length} passed.`)
+  }
+
+  // Persist the thresholds used so the run is reproducible / inspectable.
+  const thresholds: Record<string, number | boolean> = {}
+  if (minSources != null) thresholds.minSources = Number(minSources)
+  if (minEvidence != null) thresholds.minEvidence = Number(minEvidence)
+  if (minSelected != null) thresholds.minSelected = Number(minSelected)
+  if (minFullTextReads != null) thresholds.minFullTextReads = Number(minFullTextReads)
+  if (evidencePerSection != null) thresholds.evidencePerSection = Number(evidencePerSection)
+  if (requirePlanCompletion != null) thresholds.requirePlanCompletion = Boolean(requirePlanCompletion)
+  if (Object.keys(thresholds).length) ensureResearchRunSpec(workspace, outputDir, { thresholds })
+
+  // Escape valve: structural gates that have failed repeated honest repair
+  // attempts are downgraded to warnings so the run can finish with a documented
+  // limitation instead of looping. The downgraded snapshot is what downstream
+  // (report generation, FSM) reads.
+  const { results, downgraded } = applyGateEscapeValve(workspace, outputDir, rawResults)
+  if (downgraded.length) writeQualityGateSnapshot(workspace, outputDir, results)
+
+  const passed = results.filter((r) => r.passed).length
+  const summary = downgraded.length
+    ? `Quality gates: ${passed}/${results.length} passed. Downgraded to warnings (structural limitation after repeated repair attempts): ${downgraded.join(', ')}.`
+    : `Quality gates: ${passed}/${results.length} passed.`
+  return formatGateResults(workspace, sessionId, outputDir, results, summary)
+}
+
+function selectFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
+  const batch = selectFullTextBatch(workspace, limit, outputDir)
+  if (batch.length === 0) return 'No selected corpus items need full-text reading.'
+  return batch.map((e, i) => [
+    `${i + 1}. ${e.id}: ${e.title}`,
+    `   Priority: ${e.readPriority ?? 'low'} | score=${e.score} | year=${e.year ?? 'unknown'}`,
+    e.arxivId ? `   arXiv: ${e.arxivId}` : null,
+    `   URL: ${e.url}`,
+  ].filter(Boolean).join('\n')).join('\n\n')
+}
+
+function readCorpusItemTool(workspace: string, id: string | undefined, outputDir?: string): string {
+  const corpusId = String(id ?? '').trim()
+  if (!corpusId) return 'Error: id is required.'
+  const entry = loadCorpus(workspace, outputDir).find((e) => e.id === corpusId)
+  if (!entry) return `Error: corpus item not found: ${corpusId}`
+  const baseDir = canonicalResearchOutputDir(outputDir)
+  const safeId = corpusId.replace(/[^a-z0-9_-]+/gi, '_')
+  const fullTextDir = path.join(baseDir, 'fulltext')
+
+  if (entry.arxivId) {
+    const htmlPath = path.join(fullTextDir, `${safeId}.html`)
+    const html = downloadArxivHtml(entry.arxivId, htmlPath, workspace)
+    if (!html.startsWith('Error:')) {
+      markCorpusItemRead(workspace, corpusId, htmlPath, 'read', 'arXiv HTML downloaded', outputDir)
+      return `${html}\nUpdated corpus ${corpusId}: read.`
+    }
+    const pdfPath = path.join(fullTextDir, `${safeId}.pdf`)
+    const pdf = downloadArxivPdf(entry.arxivId, pdfPath, workspace)
+    if (!pdf.startsWith('Error:')) {
+      markCorpusItemRead(workspace, corpusId, pdfPath, 'read', 'arXiv PDF downloaded; parse_document recommended', outputDir)
+      return `${html}\n${pdf}\nUpdated corpus ${corpusId}: read via PDF fallback.`
+    }
+    markCorpusItemRead(workspace, corpusId, undefined, 'failed', `${html} ${pdf}`.slice(0, 500), outputDir)
+    return `${html}\n${pdf}\nUpdated corpus ${corpusId}: failed.`
+  }
+
+  const fetched = fetchUrlTool(entry.url, 'markdown', workspace)
+  if (fetched.startsWith('Error:')) {
+    markCorpusItemRead(workspace, corpusId, undefined, 'failed', fetched.slice(0, 500), outputDir)
+    return `${fetched}\nUpdated corpus ${corpusId}: failed.`
+  }
+  const target = resolvePath(path.join(fullTextDir, `${safeId}.md`), workspace)
+  assertInWorkspace(target, workspace)
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, fetched, 'utf-8')
+  const rel = path.relative(workspace, target)
+  markCorpusItemRead(workspace, corpusId, rel, 'read', 'URL fetched as markdown', outputDir)
+  return `Fetched ${entry.url} to ${rel} (${fetched.length} chars).\nUpdated corpus ${corpusId}: read.`
+}
+
+function readFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
+  const batch = selectFullTextBatch(workspace, limit, outputDir)
+  if (batch.length === 0) return 'No selected corpus items need full-text reading.'
+  const lines = [`Reading ${batch.length} selected corpus item(s):`, '']
+  for (const item of batch) {
+    const result = readCorpusItemTool(workspace, item.id, outputDir)
+    lines.push(`## ${item.id}: ${item.title}`, result, '')
+  }
+  lines.push(fullTextStatus(workspace, outputDir))
+  return lines.join('\n')
+}
+
+function extractEvidenceFromCorpusItemTool(workspace: string, args: Record<string, any>): string {
+  const corpusId = String(args.corpus_id ?? '').trim()
+  if (!corpusId) return 'Error: corpus_id is required.'
+  const item = loadCorpus(workspace, args.output_dir).find((e) => e.id === corpusId)
+  if (!item) return `Error: corpus item not found: ${corpusId}`
+  return recordEvidence(workspace, args.claim, args.sources, {
+    quote: args.quote,
+    confidence: args.confidence || 'medium',
+    support: args.support || 'supports',
+    topic: args.plan_item_id,
+    notes: item.readStatus === 'read' ? args.notes : `Metadata/abstract-only evidence; full text status=${item.readStatus ?? 'not_read'}. ${args.notes ?? ''}`.trim(),
+    sessionId: args.session_id,
+    outputDir: args.output_dir,
+    corpusIds: corpusId,
+    sourceUrls: item.url,
+    localPath: item.localPath,
+    planItemId: args.plan_item_id,
+    evidenceType: args.evidence_type,
+  } as any)
+}
+
+function extractEvidenceBatchTool(workspace: string, outputDir?: string, maxItems?: number): string {
+  const limit = Math.max(1, Math.min(50, Number(maxItems) || 20))
+  const items = loadCorpus(workspace, outputDir)
+    .filter((e) => e.screeningStatus === 'selected' && (e.readStatus === 'read' || e.status === 'read'))
+    .slice(0, limit)
+  if (items.length === 0) return 'No read selected corpus items. Run read_full_text_batch first.'
+  return [
+    'Use extract_evidence_from_corpus_item or record_evidence for each relevant claim below. Include corpus_ids, plan_item_id and quote whenever possible.',
+    '',
+    ...items.map((e, i) => `${i + 1}. ${e.id} [${e.subQuestions?.join(', ') || 'unassigned'}] ${e.title}\n   Local: ${e.localPath ?? 'none'}\n   URL: ${e.url}`),
+  ].join('\n\n')
+}
+
+function generateEvidenceReportTool(workspace: string, title: string, outputPath: string | undefined, outputDir: string | undefined, sessionId: string | undefined): string {
+  const snap = readQualityGateSnapshot(workspace, outputDir)
+  if (!snap) return 'Error: quality gates have not been run yet. Run run_quality_gates before generate_evidence_report.'
+  const blocker = latestQualityGateFailure(workspace, outputDir, { ignoreGates: ['final_report_structure'] })
+  if (blocker) return `Error: quality gates are failing. Do not generate final report yet.\n${blocker}\n\nRun read_full_text_batch / extract_evidence_batch and then run_quality_gates again.`
+  const ru = /[а-яё]/i.test(String(title))
+  const stats = corpusStats(workspace, outputDir)
+  const matrix = evidenceMatrix(workspace, outputDir)
+  const selected = listSelectedCorpus(workspace, 40, outputDir)
+  const status = fullTextStatus(workspace, outputDir)
+  const gates = formatGateReport(workspace, sessionId, outputDir)
+  const evidenceContent = [
+    ru ? '## Evidence-first резюме' : '## Evidence-First Summary',
+    '',
+    ru
+      ? `Отчёт основан на ${stats.selected} отобранных источниках, ${stats.selectedRead} прочитанных full-text источниках и ${evidenceStats(workspace, outputDir).total} evidence-claims.`
+      : `This report is based on ${stats.selected} selected corpus item(s), ${stats.selectedRead} selected full-text read(s), and ${evidenceStats(workspace, outputDir).total} evidence claim(s).`,
+    '',
+    ru ? '## Покрытие' : '## Coverage',
+    '',
+    status,
+    '',
+    ru ? '## Evidence matrix' : '## Evidence Matrix',
+    '',
+    matrix,
+    '',
+    ru ? '## Приложение: selected corpus' : '## Selected Corpus Appendix',
+    '',
+    selected,
+    '',
+    ru ? '## Quality gates' : '## Quality Gates',
+    '',
+    gates,
+    '',
+    ru ? '## Ограничения' : '## Limitations',
+    '',
+    ru
+      ? '- Разделы со слабым или отсутствующим evidence нужно расширить перед использованием отчёта как финального научного вывода.'
+      : '- Sections with weak or missing evidence should be expanded before using this as a final scientific conclusion.',
+    ru
+      ? '- Нельзя описывать raw corpus как evidence base, если источники не были отобраны и прочитаны.'
+      : '- Do not describe raw corpus size as the evidence base unless those items were selected and read.',
+  ].join('\n')
+  const evidencePath = resolveResearchOutputPath(undefined, workspace, path.join(canonicalResearchOutputDir(outputDir), 'evidence-report.md'))
+  fs.mkdirSync(path.dirname(evidencePath), { recursive: true })
+  fs.writeFileSync(evidencePath, `# ${ru ? 'Evidence report' : 'Evidence Report'}\n\n${evidenceContent}\n`, 'utf-8')
+
+  const synthesis = composeSynthesisReport(workspace, title, outputDir, ru)
+  const result = generateReport(
+    title,
+    synthesis,
+    outputPath || path.join(canonicalResearchOutputDir(outputDir), 'report.md'),
+    undefined,
+    workspace,
+    { ignoreFinalReportStructureGate: true, allowEvidenceReportGenerator: true },
+  )
+  const relEvidence = path.relative(workspace, evidencePath)
+  return `${result}\nEvidence appendix saved to ${relEvidence}.`
+}
+
+function composeSynthesisReport(workspace: string, title: string, outputDir: string | undefined, ru: boolean): string {
+  const corpus = loadCorpus(workspace, outputDir)
+  const selected = corpus.filter((e) => e.screeningStatus === 'selected')
+  const read = selected.filter((e) => e.readStatus === 'read' || e.status === 'read')
+  const reviews = selected.filter((e) => e.publicationType === 'survey' || e.publicationType === 'review')
+  const claims = loadEvidence(workspace, outputDir).filter((e) => e.status === 'supported')
+  const plan = parsePlan(workspace, outputDir)
+  const byPlan = new Map<string, typeof claims>()
+  for (const claim of claims) {
+    const key = claim.planItemId || claim.topic || 'other'
+    byPlan.set(key, [...(byPlan.get(key) || []), claim])
+  }
+  const sourceById = new Map(corpus.map((e) => [e.id, e]))
+  const sourceLabel = (id: string) => {
+    const src = sourceById.get(id)
+    return src ? `${src.title}${src.year ? ` (${src.year})` : ''}` : id
+  }
+  const cite = (claim: { corpusIds?: string[] }) => (claim.corpusIds || []).slice(0, 3).map((id) => `\`${id}\``).join(', ') || 'источник не привязан'
+  const topSources = read.slice(0, 16).map((e, i) => `${i + 1}. ${e.title}${e.year ? ` (${e.year})` : ''}${e.publicationType ? `, ${e.publicationType}` : ''}${e.citationCount !== undefined ? `, citations=${e.citationCount}` : ''}.`)
+  const reviewLines = reviews.length
+    ? reviews.map((e) => `- ${e.title}${e.year ? ` (${e.year})` : ''}: обзорная рамка для интерпретации первичных результатов.`)
+    : ['- Обзорных источников в selected corpus недостаточно; это должно считаться ограничением, а не нормой.']
+  const planSections = plan.length ? plan : [{ id: 'Q1', text: ru ? 'Основные результаты исследования' : 'Main research findings', done: true, level: 0, children: [] }]
+  const sectionText = planSections.map((item) => {
+    const rows = (byPlan.get(item.id) || []).slice(0, 5)
+    const bullets = rows.length
+      ? rows.map((claim) => {
+        const srcs = (claim.corpusIds || []).map(sourceLabel).slice(0, 2).join('; ')
+        return `- ${claim.claim} Поддержка: ${srcs || cite(claim)}.${claim.quote ? ` Ключевой фрагмент: "${claim.quote.slice(0, 220)}${claim.quote.length > 220 ? '...' : ''}"` : ''}`
+      })
+      : ['- По этому разделу нет достаточно сильных claim-level evidence; раздел требует дополнительного поиска и чтения.']
+    return [
+      `## ${item.id}. ${item.text.replace(/^Q\d+\.\s*/, '')}`,
+      '',
+      ...bullets,
+      '',
+      ru
+        ? 'Комментарий: эти выводы нужно читать как синтез отобранных и прочитанных источников, а не как исчерпывающую карту всей области.'
+        : 'Comment: treat these points as a synthesis of selected/read sources, not as an exhaustive map of the whole field.',
+    ].join('\n')
+  }).join('\n\n')
+
+  if (!ru) {
+    return [
+      '## Executive Summary',
+      '',
+      `This synthesis is based on ${selected.length} selected sources, ${read.length} read full-text sources, ${reviews.length} review/survey sources, and ${claims.length} supported evidence claims. It separates raw discovery from the evidence base: only selected and read material is used for conclusions.`,
+      '',
+      'The main picture is that reinforcement learning for LLMs has split into several practical streams: preference optimization for alignment, verifiable-reward training for reasoning, production post-training frameworks, and safety/robustness analysis. The strongest claims are those repeatedly supported by method papers and review-style sources; weaker areas are called out explicitly.',
+      '',
+      '## Method And Scope',
+      '',
+      `The workflow separated raw discovery (${corpus.length} corpus item(s)) from the evidence base (${selected.length} selected, ${read.length} read). Sources were screened for topical precision, recency, authority, review/survey coverage, full-text availability, and claim-level evidence links. Conclusions below use only selected sources and supported evidence claims, not raw search hits.`,
+      '',
+      '## Evaluation Criteria And Benchmarks',
+      '',
+      'The synthesis evaluates papers by reward formulation, optimization objective, evidence type, benchmark setting, recency, and whether claims are grounded in full-text passages or abstract-only evidence. Reasoning-oriented RL papers are interpreted separately from alignment/preference-optimization papers because their reward signals, evaluation metrics, and failure modes differ.',
+      '',
+      '## Evidence Base',
+      '',
+      ...topSources,
+      '',
+      '## Review And Survey Anchors',
+      '',
+      ...reviewLines.map((line) => line.replace('обзорная рамка для интерпретации первичных результатов', 'review context for interpreting primary results').replace('Обзорных источников в selected corpus недостаточно; это должно считаться ограничением, а не нормой.', 'Review/survey coverage is insufficient; this must be treated as a limitation, not as acceptable coverage.')),
+      '',
+      sectionText,
+      '',
+      '## Cross-Source Interpretation',
+      '',
+      'Across the evidence, the important distinction is not simply “RL works” versus “RL does not work”. The research separates by reward source, optimization objective, supervision cost, benchmark type, and deployment constraints. Preference optimization methods are attractive because they simplify training, while PPO/online RL variants remain competitive when the task needs stronger exploration or interaction. Verifiable reward methods are especially important for reasoning tasks because they reduce reliance on subjective preference labels.',
+      '',
+      '## Limitations',
+      '',
+      '- This report should not treat unread, failed, or merely queued corpus items as evidence.',
+      '- High-priority failed full-text reads require replacement sources or explicit caveats.',
+      '- Citation counts and venue quality should be used as ranking signals, but recent 2025-2026 papers may be important despite low citations.',
+      '',
+      '## Practical Takeaways',
+      '',
+      '- Build the literature base around both primary method papers and review/survey papers.',
+      '- Keep RL-for-reasoning, RLHF/alignment, and tooling/framework papers as separate tracks.',
+      '- Do not let generic LLM papers enter the core evidence base unless they directly address RL, rewards, post-training, alignment, or reasoning.',
+      '',
+      '## Future Directions And Trends',
+      '',
+      '- Expect more work on verifiable rewards, process supervision, and hybrid RL/preference optimization for reasoning.',
+      '- Safety research should track reward hacking, proxy misspecification, and evaluation leakage as models and benchmarks scale.',
+      '- Production systems will likely separate data curation, reward design, online evaluation, and post-training orchestration more explicitly.',
+    ].join('\n')
+  }
+
+  return [
+    '## Краткое резюме',
+    '',
+    `Этот обзор основан на ${selected.length} отобранных источниках, ${read.length} прочитанных full-text источниках, ${reviews.length} обзорных/survey источниках и ${claims.length} поддержанных evidence-claims. Важно: raw corpus не считается доказательной базой; выводы строятся только по selected/read источникам.`,
+    '',
+    'Главная картина такая: RL для LLM в 2024–2026 годах распадается на несколько практических линий — preference optimization для alignment, verifiable rewards для reasoning, production-фреймворки post-training и отдельный пласт safety/robustness. Сильными считаются только те выводы, которые привязаны к прочитанным источникам и claim-level evidence; слабые зоны явно вынесены в ограничения.',
+    '',
+    '## Метод и подход к отбору источников',
+    '',
+    `Пайплайн отделяет raw discovery (${corpus.length} элементов корпуса) от доказательной базы (${selected.length} selected, ${read.length} read). Источники отбирались по topical precision, свежести, авторитетности, наличию обзорных/survey работ, доступности full text и связи с claim-level evidence. Выводы ниже строятся только на selected/read источниках и поддержанных claims, а не на сырых поисковых совпадениях.`,
+    '',
+    '## Метрики и критерии оценки',
+    '',
+    'Работы сравниваются по типу reward signal, цели оптимизации, виду evidence, benchmark setting, свежести и тому, есть ли привязка к full-text passage или только abstract-only caveat. RL-for-reasoning анализируется отдельно от alignment/preference optimization, потому что у этих веток разные reward signals, метрики и failure modes.',
+    '',
+    '## Доказательная база',
+    '',
+    ...topSources,
+    '',
+    '## Обзорные и survey-источники',
+    '',
+    ...reviewLines,
+    '',
+    sectionText,
+    '',
+    '## Сквозная интерпретация',
+    '',
+    'Ключевой вывод не сводится к простой формуле “RL работает” или “RL не работает”. В литературе различаются источник награды, тип оптимизации, стоимость supervision, характер benchmark и ограничения production-развёртывания. Методы preference optimization привлекательны из-за простоты и стабильности, но PPO/online RL-варианты остаются важными там, где нужна интерактивность, exploration или более сильная оптимизация поведения. Verifiable-reward подходы особенно важны для reasoning-задач, потому что уменьшают зависимость от субъективных preference labels.',
+    '',
+    '## Ограничения и риски интерпретации',
+    '',
+    '- Нельзя считать evidence источники, которые остались queued, failed или были найдены только в raw corpus.',
+    '- High-priority источники с failed full-text должны быть заменены аналогами или явно отмечены как пробел.',
+    '- Citation count и venue важны для ранжирования, но свежие статьи 2025–2026 могут быть значимыми даже при низком числе цитирований.',
+    '- Generic LLM-статьи не должны попадать в ядро обзора, если в них нет прямой связи с RL, reward models, post-training, alignment или reasoning.',
+    '',
+    '## Практические выводы',
+    '',
+    '- Корпус нужно строить из двух слоёв: обзорные/survey статьи для карты области и первичные method/benchmark/tool papers для конкретных утверждений.',
+    '- RL-for-reasoning, RLHF/alignment и tooling/frameworks лучше анализировать как разные ветки, а не смешивать в одну кучу.',
+    '- Для каждого крупного вывода нужен corpus ID, quote/passage и понимание, является ли источник первичным результатом, обзором или background.',
+    '',
+    '## Тренды и дальнейшие направления',
+    '',
+    '- Вероятно усиление работ по verifiable rewards, process supervision и гибридным RL/preference-optimization схемам для reasoning.',
+    '- Safety-направление должно отдельно отслеживать reward hacking, proxy misspecification и benchmark leakage.',
+    '- Production-пайплайны будут всё явнее разделять data curation, reward design, online evaluation и orchestration post-training.',
+    '',
+    '## Приложение: evidence claims',
+    '',
+    ...claims.slice(0, 30).map((claim) => `- ${claim.claim} Источники: ${cite(claim)}.`),
+  ].join('\n')
 }
 
 function listResearchSkillsTool(workspace: string, query?: string): string {
@@ -1085,7 +1607,7 @@ function saveIdeaTool(workspace: string, args: Record<string, any>): string {
     feasibility: Math.max(0, Math.min(100, Number(args.feasibility) || 60)),
     impact: Math.max(0, Math.min(100, Number(args.impact) || 60)),
     nextSteps: String(args.next_steps ?? '').split(';').map((s) => s.trim()).filter(Boolean),
-  })
+  }, args.output_dir)
 }
 
 function readFile(filePath: string, workspace: string, offset?: number, limit?: number): string {
@@ -1119,8 +1641,18 @@ function readFile(filePath: string, workspace: string, offset?: number, limit?: 
 }
 
 function writeFile(filePath: string, content: string, workspace: string): string {
-  const p = resolvePath(filePath, workspace)
+  const p = String(filePath || '').replace(/\\/g, '/').startsWith('.research/')
+    ? resolveResearchOutputPath(filePath, workspace, filePath)
+    : resolvePath(filePath, workspace)
   assertInWorkspace(p, workspace)
+  const relPath = path.relative(workspace, p).replace(/\\/g, '/')
+  if (/^\.research\/.*\/?report\.md$/i.test(relPath) || relPath === '.research/report.md') {
+    return [
+      'Error: direct write_file to research report.md is blocked.',
+      'Use generate_evidence_report with the same output_dir instead. It writes report.md plus evidence-report.md and enforces/post-verifies quality gates.',
+      'Do not bypass quality gates by writing report.md manually.',
+    ].join('\n')
+  }
   fs.mkdirSync(path.dirname(p), { recursive: true })
   fs.writeFileSync(p, content)
   const lines = content.split('\n').length
@@ -1261,14 +1793,32 @@ function generateReport(
   outputPath: string | undefined,
   sessionId: string | undefined,
   workspace: string,
+  opts?: { ignoreFinalReportStructureGate?: boolean; allowEvidenceReportGenerator?: boolean },
 ): string {
   const trimmedTitle = String(title ?? '').trim()
   if (!trimmedTitle) return 'Error: title is required.'
   const trimmedContent = String(content ?? '').trim()
   if (!trimmedContent) return 'Error: content is required.'
 
-  const targetPath = resolvePath(outputPath || '.research/report.md', workspace)
+  const targetPath = resolveResearchOutputPath(outputPath, workspace, '.research/report.md')
   assertInWorkspace(targetPath, workspace)
+  const relDir = path.relative(workspace, path.dirname(targetPath)) || '.research'
+  const normalizedReportPath = path.relative(workspace, targetPath).replace(/\\/g, '/')
+  if (/^\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_.+\/report\.md$/i.test(normalizedReportPath) && !opts?.allowEvidenceReportGenerator) {
+    return [
+      'Error: generate_report is not allowed for managed research report.md.',
+      `Use generate_evidence_report with output_dir: "${relDir}" instead. It builds the narrative report from corpus/evidence and verifies quality gates.`,
+      'Do not try to create report.md manually or by wrapping an existing file.',
+    ].join('\n')
+  }
+  const gateFailure = latestQualityGateFailure(
+    workspace,
+    relDir,
+    opts?.ignoreFinalReportStructureGate ? { ignoreGates: ['final_report_structure'] } : undefined,
+  )
+  if (gateFailure) {
+    return `Error: quality gates are failing. Final report generation is blocked until blockers are resolved.\n${gateFailure}\n\nContinue screening/reading corpus, extracting evidence, and rerun run_quality_gates.`
+  }
   fs.mkdirSync(path.dirname(targetPath), { recursive: true })
 
   let references = ''
@@ -1281,11 +1831,16 @@ function generateReport(
   }
 
   const date = new Date().toISOString().slice(0, 10)
-  const report = `# ${trimmedTitle}\n\n*Generated: ${date}*\n\n${trimmedContent}${references}\n`
+  const contentWithoutDuplicateTitle = trimmedContent.replace(new RegExp(`^#\\s+${escapeRegExp(trimmedTitle)}\\s*\\n+`, 'i'), '')
+  const report = `# ${trimmedTitle}\n\n*Generated: ${date}*\n\n${contentWithoutDuplicateTitle}${references}\n`
 
   fs.writeFileSync(targetPath, report, 'utf-8')
   const relPath = path.relative(workspace, targetPath)
   return `Report saved to ${relPath} (${report.length} chars, ${references ? 'with' : 'without'} references section).`
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function reflectOnFindings(findings: string, criteria?: string, sessionId?: string): string {
@@ -1797,7 +2352,7 @@ function downloadArxivHtml(arxivId: string, outputPath: string | undefined, work
 
   const normalizedId = normalizeArxivId(trimmedId)
   const safeId = normalizedId.replace(/\//g, '_')
-  const targetPath = resolvePath(outputPath || path.join('.research', 'arxiv', `${safeId}.html`), workspace)
+  const targetPath = resolveResearchOutputPath(outputPath, workspace, path.join('.research', 'arxiv', `${safeId}.html`))
   assertInWorkspace(targetPath, workspace)
   fs.mkdirSync(path.dirname(targetPath), { recursive: true })
 
@@ -1839,7 +2394,7 @@ function downloadArxivPdf(arxivId: string, outputPath: string | undefined, works
 
   const normalizedId = normalizeArxivId(trimmedId)
   const safeId = normalizedId.replace(/\//g, '_')
-  const targetPath = resolvePath(outputPath || path.join('.research', 'arxiv', `${safeId}.pdf`), workspace)
+  const targetPath = resolveResearchOutputPath(outputPath, workspace, path.join('.research', 'arxiv', `${safeId}.pdf`))
   assertInWorkspace(targetPath, workspace)
   fs.mkdirSync(path.dirname(targetPath), { recursive: true })
 
@@ -2098,26 +2653,26 @@ function verifySources(sessionId: string | undefined, maxSources?: number): stri
   return lines.join('\n')
 }
 
-function planResearch(question: string, subQuestions: unknown, workspace: string, sessionId: string | undefined): string {
+function planResearch(question: string, subQuestions: unknown, workspace: string, sessionId: string | undefined, outputDir?: string): string {
   const q = String(question ?? '').trim()
   if (!q) return 'Error: question is required.'
   const list = Array.isArray(subQuestions) ? subQuestions.map((s) => String(s || '').trim()).filter(Boolean) : []
   if (list.length === 0) return 'Error: sub_questions must be a non-empty array.'
   if (list.length > 10) list.length = 10
   try {
-    writePlan(workspace, q, list)
+    writePlan(workspace, q, list, outputDir)
   } catch (e: any) {
     return `Error: failed to write plan. ${e?.message || e}`
   }
   const preview = list.map((s, i) => `  ${i + 1}. ${s}`).join('\n')
-  return `Plan saved to .research/plan.md\n${preview}\n\nNext steps: investigate each sub-question (optionally via spawn_sub_researcher), then use update_plan_status to mark items done.`
+  return `Plan saved to ${canonicalResearchOutputDir(outputDir)}/plan.md\n${preview}\n\nNext steps: investigate each sub-question (optionally via spawn_sub_researcher), then use update_plan_status to mark items done.`
 }
 
-function updatePlanStatus(itemId: string, done: boolean, workspace: string): string {
+function updatePlanStatus(itemId: string, done: boolean, workspace: string, outputDir?: string): string {
   if (!itemId) return 'Error: item_id is required.'
-  const ok = updatePlanItem(workspace, String(itemId), Boolean(done))
-  if (!ok) return `Could not find plan item "${itemId}" in .research/plan.md. Make sure plan_research was called first and the id exists (e.g. "Q2").`
-  const items = parsePlan(workspace)
+  const ok = updatePlanItem(workspace, String(itemId), Boolean(done), outputDir)
+  if (!ok) return `Could not find plan item "${itemId}" in ${canonicalResearchOutputDir(outputDir)}/plan.md. Make sure plan_research was called first and the id exists (e.g. "Q2").`
+  const items = parsePlan(workspace, outputDir)
   const progress = planProgress(items)
   return `Updated "${itemId}" → ${done ? 'done' : 'open'}. Progress: ${progress.done}/${progress.total} (${progress.pct}%).`
 }

@@ -119,6 +119,7 @@ contextBridge.exposeInMainWorld('api', {
   getResearchPlan: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-plan', workspace),
   getResearchProfiles: (): Promise<any[]> => ipcRenderer.invoke('get-research-profiles'),
   getResearchDashboard: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-dashboard', workspace),
+  inferResearchRequest: (payload: any): Promise<any> => ipcRenderer.invoke('infer-research-request', payload),
   listResearchArtifacts: (workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>> =>
     ipcRenderer.invoke('list-research-artifacts', workspace),
   embedStatus: (): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }> =>

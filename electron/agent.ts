@@ -1,5 +1,5 @@
 import { getBuiltinToolDefinitions, executeTool, executeToolAsync, executeCustomTool, isAsyncTool } from './tools'
-import type { AgentEvent } from './types'
+import type { AgentEvent, AgentActivity } from './types'
 import type { AppConfig } from './config'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
@@ -11,6 +11,29 @@ import { formatResearchProfileForPrompt, getResearchProfileByPresetId } from '..
 import { getSourceTracker, extractSourcesFromToolResult } from './sources'
 import { loadPriorKnowledge } from './memory'
 import { skillPackForPreset } from './research-skills'
+import {
+  decideResearchCommandIntent,
+  isResearchResumeMessage,
+  researchRunProgressSummary,
+} from './research-resume'
+import {
+  formatQualityGateUserStatus,
+  readQualityGateSnapshot,
+} from './quality-gates'
+import { parsePlan } from './planner'
+import {
+  type ResearchContextMode,
+  buildResearchTailMessage,
+  buildResumeMessageWindow,
+  compressResearchToolResult,
+  isResearchContextTool,
+  resolveResearchContextMode,
+  resolveResearchOutputDir,
+  updateResearchRunState,
+  wantsCompactContext,
+} from './research-context'
+import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool } from './research-workflow'
+import { extractTextToolCalls } from './tool-call-parser'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
 export interface AgentBridge {
@@ -45,13 +68,44 @@ function debugLog(category: string, ...args: any[]) {
 
 const FILE_OPS_TOOLS = new Set(['write_file', 'edit_file', 'append_file', 'delete_file', 'create_directory'])
 const COMMAND_TOOL = 'execute_command'
+const WORKSPACE_ARTIFACT_TOOLS = new Set([
+  'plan_research',
+  'update_plan_status',
+  'download_arxiv_html',
+  'download_arxiv_pdf',
+  'generate_report',
+  'export_report',
+  'screenshot_page',
+  'build_corpus',
+  'queue_full_text',
+  'audit_research_run',
+  'screen_corpus',
+  'reject_corpus_items',
+  'assign_corpus_to_plan',
+  'read_corpus_item',
+  'read_full_text_batch',
+  'record_evidence',
+  'extract_evidence_from_corpus_item',
+  'repair_evidence_quotes',
+  'run_quality_gates',
+  'generate_evidence_report',
+  'scout_ideas',
+  'save_idea',
+])
 
 const FALLBACK_CTX_TOKENS = 32768
-const SUMMARIZE_TIMEOUT_MS = 60000
+const SUMMARIZE_TIMEOUT_MS = 20000
+
+/** Research context policy for the current runAgent invocation. */
+let researchContextMode: ResearchContextMode = 'off'
+let activeResearchOutputDir: string | null = null
 
 let currentBridge: AgentBridge | null = null
 
 function doEmit(e: AgentEvent): void { currentBridge!.emit(e) }
+function emitActivity(phase: AgentActivity['phase'], label: string, detail?: string): void {
+  doEmit({ type: 'agent_activity', activity: { phase, label, detail } })
+}
 function doRequestApproval(name: string, args: Record<string, any>): Promise<boolean> { return currentBridge!.requestApproval(name, args) }
 function doGetConfig(): AppConfig { return currentBridge!.getConfig() }
 function doGetSession(): Session { return currentBridge!.getSession() }
@@ -79,7 +133,127 @@ function shouldNotifyWorkspaceChanged(toolName: string, isCustom: boolean, resul
   if (result.startsWith('[Denied')) return false
   if (isCustom || toolName === COMMAND_TOOL) return true
   if (FILE_OPS_TOOLS.has(toolName)) return !result.startsWith('Error')
+  if (WORKSPACE_ARTIFACT_TOOLS.has(toolName)) return !result.startsWith('Error')
   return false
+}
+
+function getGeneratedReportPath(result: string, workspace: string): string | null {
+  const rel = result.match(/^Report saved to (.+?) \(/m)?.[1]?.trim()
+  if (!rel) return null
+  const resolved = path.resolve(workspace, rel)
+  const root = path.resolve(workspace)
+  if (!resolved.startsWith(root + path.sep) && resolved !== root) return null
+  return resolved
+}
+
+function researchTitleFromOutputDir(outputDir: string): string {
+  const slug = outputDir.replace(/^\.research\//, '').replace(/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_/, '').replace(/-/g, ' ')
+  return slug.slice(0, 120) || 'Research Report'
+}
+
+function isPlanApprovalMessage(text: string): boolean {
+  const t = String(text || '').trim().toLowerCase()
+  return /^(дела[йе]?|сделай|давай|ок|окей|поехали|начинай|продолжай|утверждаю|утвердить|согласен|go|start|approved?|continue)\b/.test(t)
+}
+
+function hasRecentPlanApprovalPrompt(messages: Message[]): boolean {
+  return messages.slice(-8).some((m: any) => {
+    if (m.role !== 'assistant' || typeof m.content !== 'string') return false
+    const t = m.content.toLowerCase()
+    return /утверд|approve|approval|перейти к поиску|жду вашего решения|что вы хотите сделать|редактировать/.test(t)
+      && /план|plan|подзадач|research/.test(t)
+  })
+}
+
+function phaseForResearchTool(toolName: string): Parameters<typeof updateResearchRunState>[1]['phase'] | undefined {
+  if (toolName === 'plan_research' || toolName === 'update_plan_status') return 'planning'
+  if (['build_corpus', 'screen_corpus', 'assign_corpus_to_plan', 'queue_full_text', 'read_corpus_item', 'read_full_text_batch'].includes(toolName)) return 'corpus'
+  if (['record_evidence', 'extract_evidence_from_corpus_item', 'extract_evidence_batch', 'repair_evidence_quotes', 'verify_claims'].includes(toolName)) return 'evidence'
+  if (toolName === 'generate_evidence_report') return 'report_generated'
+  return undefined
+}
+
+/** After gate_report / run_quality_gates: explain status to user; auto-generate report when all gates pass. */
+function followUpQualityGates(
+  toolName: string,
+  toolArgs: Record<string, any>,
+  result: string,
+  session: Session,
+  workspace: string,
+): string {
+  if (toolName !== 'gate_report' && toolName !== 'run_quality_gates') return result
+  if (result.startsWith('Error')) return result
+
+  const outputDir = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/') : activeResearchOutputDir
+  if (!outputDir) return result
+
+  const userStatus = formatQualityGateUserStatus(workspace, outputDir)
+  if (userStatus) doEmit({ type: 'status', content: userStatus })
+
+  const snap = readQualityGateSnapshot(workspace, outputDir)
+  const onlyReportStructureFailed = Boolean(
+    snap && snap.failed.length > 0 && snap.failed.every((r) => r.gate === 'final_report_structure'),
+  )
+  if (!snap) return result
+  if (!snap.allPassed && !onlyReportStructureFailed) {
+    const spec = updateResearchWorkflowAfterTool(workspace, outputDir, toolName, { gateResults: snap.failed })
+    const failed = snap.failed.map((r) => `- ${r.gate}: ${r.blockers.join('; ') || 'failed'}`).join('\n')
+    return `${result}\n\n[Research supervisor — mandatory next action]\nQuality gates are NOT complete. Do not produce a final answer, do not discuss shortcuts, and do not attempt to write report.md manually.\n\nFix these blockers first:\n${failed}\n\n${formatWorkflowGuidance(spec)}\n\nCall one allowed repair tool now with the same output_dir. After repairs, run run_quality_gates exactly once. Only generate_evidence_report may create report.md.`
+  }
+
+  updateResearchWorkflowAfterTool(workspace, outputDir, toolName, { gateResults: snap.failed })
+
+  doEmit({
+    type: 'status',
+    content: onlyReportStructureFailed
+      ? '📝 Данные прошли gates; текущий report.md плохой — регенерирую narrative report.md…'
+      : '📝 Все gates пройдены — генерирую report.md…',
+  })
+  emitActivity('tool_exec', 'generate_evidence_report', outputDir)
+  try {
+    const genResult = executeTool('generate_evidence_report', {
+      output_dir: outputDir,
+      title: researchTitleFromOutputDir(outputDir),
+      output_path: `${outputDir}/report.md`,
+      session_id: session.id,
+    }, workspace)
+    doEmit({ type: 'tool_call', name: 'generate_evidence_report', args: { output_dir: outputDir } })
+    doEmit({ type: 'tool_result', name: 'generate_evidence_report', result: genResult.slice(0, 4000) })
+    const reportPath = getGeneratedReportPath(genResult, workspace)
+    if (reportPath) {
+      doEmit({ type: 'open_file', filePath: reportPath })
+      doEmit({ type: 'status', content: `✅ Отчёт готов: \`${path.relative(workspace, reportPath)}\` — открываю в редакторе.` })
+      updateResearchRunState(workspace, {
+        outputDir,
+        phase: 'report_generated',
+        lastTool: 'generate_evidence_report',
+      })
+      updateResearchWorkflowAfterTool(workspace, outputDir, 'generate_evidence_report')
+    } else if (genResult.startsWith('Error')) {
+      doEmit({ type: 'status', content: `⚠ ${genResult.slice(0, 600)}` })
+    }
+
+    const verifyArgs = {
+      output_dir: outputDir,
+      session_id: session.id,
+      min_sources: toolArgs.min_sources,
+      min_evidence: toolArgs.min_evidence,
+      min_selected: toolArgs.min_selected,
+      min_full_text_reads: toolArgs.min_full_text_reads,
+      evidence_per_section: toolArgs.evidence_per_section,
+      require_plan_completion: toolArgs.require_plan_completion,
+    }
+    const verifyResult = executeTool('run_quality_gates', verifyArgs, workspace)
+    doEmit({ type: 'tool_call', name: 'run_quality_gates', args: verifyArgs })
+    doEmit({ type: 'tool_result', name: 'run_quality_gates', result: verifyResult.slice(0, 4000) })
+    const finalStatus = formatQualityGateUserStatus(workspace, outputDir)
+    if (finalStatus) doEmit({ type: 'status', content: finalStatus })
+
+    return `${result}\n\n---\n[Auto] ${genResult}\n\n---\n[Post-report verification]\n${verifyResult}`
+  } catch (e: any) {
+    doEmit({ type: 'status', content: `⚠ Не удалось сгенерировать report.md: ${e.message ?? e}` })
+    return result
+  }
 }
 
 // Graduated compression thresholds (fraction of message budget)
@@ -160,6 +334,17 @@ export const DEFAULT_SYSTEM_PROMPT = `You are a local-first research agent runni
 - **execute_command**: Use for reproducibility, data extraction, builds, tests, scripts, or repo inspection. Always inspect the result.
 - **write_file / edit_file / append_file**: Use only when the user wants saved outputs such as notes, summaries, scripts, or fixes.
 - **create_directory / delete_file**: Use sparingly and only with a clear purpose.
+
+## Managed research contract
+
+When the task is a managed/deep research run with a \`.research/YYYY-MM-DD_HH-MM-SS_...\` artifact directory:
+
+1. Treat the artifact directory as the run's database. Always pass the exact \`output_dir\` to every research tool that supports it.
+2. **The live "Research state" block at the END of the conversation is your single source of truth for what to do next.** It lists the current workflow state and the exact allowed next tools. Pick one allowed tool and call it — do not deliberate about alternatives.
+3. Normal phase order: \`plan_research\` → discovery/search → \`build_corpus\` → \`screen_corpus\` → full-text reads → evidence extraction/recording → \`verify_claims\` / \`audit_research_run\` → \`run_quality_gates\` → \`generate_evidence_report\`.
+4. The only valid way to create or repair the final \`report.md\` is \`generate_evidence_report\`. \`write_file\`, \`edit_file\`, \`append_file\`, and \`generate_report\` are blocked for managed \`report.md\` — do not attempt or discuss them.
+5. If quality gates fail, follow the gate repair route shown in the live state, then run \`run_quality_gates\` once with the same \`output_dir\`. Do not discuss shortcuts.
+6. Do not repeat a tool with identical arguments — its result will not change. Use \`list_evidence\` / \`verify_claims\` to check existing claims before adding new ones.
 
 ## Time awareness
 
@@ -656,42 +841,8 @@ function extractThinking(content: string): [string, string] {
   return [thinking, visible]
 }
 
-// ---------------------------------------------------------------------------
-// Recover tool calls that the model wrote as text instead of using the API
-// Qwen sometimes generates <tool_call>...</tool_call> or ```tool_call\n...\n``` in content/thinking
-// ---------------------------------------------------------------------------
-
-function extractTextToolCalls(content: string): { name: string; args: Record<string, any> }[] {
-  const results: { name: string; args: Record<string, any> }[] = []
-
-  // Pattern 1: <tool_call> <function=NAME> <parameter=KEY>VALUE</parameter> ... </function> </tool_call>
-  const xmlPattern = /<tool_call>\s*<function=(\w+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g
-  let match
-  while ((match = xmlPattern.exec(content)) !== null) {
-    const name = match[1]
-    const body = match[2]
-    const args: Record<string, any> = {}
-    const paramRe = /<parameter=(\w+)>\s*([\s\S]*?)\s*<\/parameter>/g
-    let pm
-    while ((pm = paramRe.exec(body)) !== null) {
-      const val = pm[2].trim()
-      // Try parsing as number
-      args[pm[1]] = /^\d+$/.test(val) ? parseInt(val) : val
-    }
-    if (name) results.push({ name, args })
-  }
-
-  // Pattern 2: {"name": "tool_name", "arguments": {...}} or tool_call JSON
-  const jsonPattern = /\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g
-  while ((match = jsonPattern.exec(content)) !== null) {
-    try {
-      const name = match[1]
-      const args = JSON.parse(match[2])
-      if (name && typeof args === 'object') results.push({ name, args })
-    } catch {}
-  }
-
-  return results
+function cleanThinkingText(content: string): string {
+  return content.replace(/<\/?think>/gi, '').trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -814,6 +965,8 @@ async function streamLlmResponse(
   const msgRoles = cleanMsgs.map((m) => m.role + (m.tool_calls ? `(${m.tool_calls.length}tc)` : '')).join(', ')
   debugLog('STREAM', `Sending request: ${cleanMsgs.length} msgs [${msgRoles}], max_tokens=${maxTok}, temp=${temp}, ctx=${ctxTokens()}, budget=${getMessageBudget()}, used=${estimateContextTokens(cleanMsgs)}`)
 
+  emitActivity('llm_queue', 'Загружаю контекст на GPU (llama-server)…', `${cleanMsgs.length} сообщений · ~${Math.round(estimateContextTokens(cleanMsgs) / 1024)}K токенов`)
+
   const startMs = Date.now()
   const r = await fetch(apiUrl, {
     method: 'POST',
@@ -877,6 +1030,9 @@ async function streamLlmResponse(
     if (done) { if (idleTimer) clearTimeout(idleTimer); break }
     chunkCount++
     resetIdle()
+    if (chunkCount === 1) {
+      emitActivity('llm_generate', 'Модель генерирует на GPU…')
+    }
 
     sseBuffer += decoder.decode(value, { stream: true })
     const lines = sseBuffer.split('\n')
@@ -908,7 +1064,7 @@ async function streamLlmResponse(
         accContent += accContent.includes('<think>') ? rc : `<think>${rc}`
         const { thinking } = parseAccumulatedThinking(accContent)
         if (thinking.length > lastThinkLen) {
-          doEmit( { type: 'thinking', content: thinking.slice(lastThinkLen) })
+          doEmit( { type: 'thinking', content: cleanThinkingText(thinking.slice(lastThinkLen)) })
           lastThinkLen = thinking.length
         }
         wasThinkingDone = false
@@ -934,10 +1090,9 @@ async function streamLlmResponse(
 
         // Emit thinking delta
         if (thinking.length > lastThinkLen) {
-          doEmit( { type: 'thinking', content: thinking.slice(lastThinkLen) })
+          doEmit( { type: 'thinking', content: cleanThinkingText(thinking.slice(lastThinkLen)) })
           lastThinkLen = thinking.length
         }
-
         // Emit visible response (time-based throttle — max ~7 updates/sec)
         if (visible.length > lastVisibleLen) {
           const now = Date.now()
@@ -1088,6 +1243,10 @@ async function countContextTokensAccurate(msgs: Message[]): Promise<number> {
     if (m.tool_calls) s += '\n' + JSON.stringify(m.tool_calls)
     return s
   }).join('\n')
+  // Avoid blocking llama-server tokenize on megabyte-scale prompts (resume / deep research).
+  if (fullText.length > 48_000) {
+    return estimateContextTokens(msgs)
+  }
   const serverCount = await countTokensViaServer(fullText)
   if (serverCount !== null) {
     const overhead = msgs.length * 4 + 4
@@ -1146,6 +1305,9 @@ function dynamicToolResultLimit(): number {
 }
 
 function smartTruncateToolResult(toolName: string, result: string, maxChars: number): string {
+  if (isResearchContextTool(toolName)) {
+    return compressResearchToolResult(toolName, result, maxChars)
+  }
   if (result.length <= maxChars) return result
 
   // For file reads — context-aware auto-limiting
@@ -1804,7 +1966,7 @@ async function tier3Summarize(
       : summaryAbort.signal
 
     const summaryMaxTokens = Math.min(1024, Math.floor(getMessageBudget() * 0.3))
-    const r = await fetch(apiUrl, {
+    const fetchPromise = fetch(apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1815,7 +1977,15 @@ async function tier3Summarize(
       }),
       signal: combinedSignal,
     })
+    const r = await Promise.race([
+      fetchPromise,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), SUMMARIZE_TIMEOUT_MS + 2000)),
+    ])
     clearTimeout(summaryTimeout)
+    if (!r) {
+      debugLog('CTX', 'tier3Summarize: hard timeout — skipping LLM summary')
+      return msgs
+    }
     if (!r.ok) return msgs
     const json = await r.json() as any
     const summary = json.choices?.[0]?.message?.content
@@ -2035,14 +2205,22 @@ async function manageContext(
   apiUrl: string,
   signal?: AbortSignal,
   iteration?: number,
+  opts?: { skipTier3?: boolean },
 ): Promise<Message[]> {
   const budget = getMessageBudget()
   let tokens = estimateContextTokens(msgs)
+  const useDiskSnapshot = researchContextMode !== 'off' && Boolean(activeResearchOutputDir)
 
-  debugLog('CTX', `manageContext: ${msgs.length} msgs, ${tokens} tokens, budget=${budget}, ctx=${ctxTokens()}, ratio=${(tokens/budget*100).toFixed(0)}%`)
+  debugLog('CTX', `manageContext: ${msgs.length} msgs, ${tokens} tokens, budget=${budget}, ctx=${ctxTokens()}, ratio=${(tokens/budget*100).toFixed(0)}%, researchMode=${researchContextMode}`)
 
   // Under threshold — no compression needed
   if (tokens <= budget * COMPRESS_TOOL_RESULTS_AT) return msgs
+
+  emitActivity(
+    'context_compress',
+    'Сжимаю контекст для продолжения…',
+    `${msgs.length} сообщений · ~${Math.round(tokens / 1024)}K / ${Math.round(budget / 1024)}K токенов`,
+  )
 
   // Preserve original messages for working memory extraction before compression
   const originalMsgs = [...msgs]
@@ -2050,6 +2228,7 @@ async function manageContext(
 
   // Tier 1: Compress old tool results
   if (tokens > budget * COMPRESS_TOOL_RESULTS_AT) {
+    emitActivity('context_compress', 'Сжатие: компактные результаты инструментов…')
     const { msgs: compressed } = tier1CompressOldToolResults(current)
     current = compressed
     tokens = estimateContextTokens(current)
@@ -2060,6 +2239,7 @@ async function manageContext(
 
   // Tier 2: Collapse old tool-call chains
   if (tokens > budget * SUMMARIZE_AT) {
+    emitActivity('context_compress', 'Сжатие: сворачиваю старые tool-цепочки…')
     const nonSystem = current.filter((m) => m.role !== 'system')
     if (nonSystem.length >= 6) {
       const { msgs: collapsed } = tier2CollapseOldChains(current)
@@ -2076,9 +2256,16 @@ async function manageContext(
   const tier3Cooldown = budget < 8000 ? 5 : budget < 15000 ? 3 : 2
   const tier3Ready = (iter - lastTier3Iteration) >= tier3Cooldown
 
-  if (tokens > budget * SUMMARIZE_AT && tier3Ready) {
+  // NOTE: the research working set is NOT injected into the message history here.
+  // It is delivered as a transient tail message at call time (appendResearchTail)
+  // so the stored history + system prompt remain a stable prefix for the KV cache.
+
+  // Tier 3b (general chat): LLM summarization — never used during research runs
+  const noTier3 = opts?.skipTier3 ?? useDiskSnapshot
+  if (tokens > budget * SUMMARIZE_AT && tier3Ready && !noTier3) {
     const nonSystem = current.filter((m) => m.role !== 'system')
     if (nonSystem.length >= 4) {
+      emitActivity('context_compress', 'Сжатие: LLM-саммари истории (GPU)…')
       current = await tier3Summarize(current, apiUrl, signal)
       lastTier3Iteration = iter
       tokens = estimateContextTokens(current)
@@ -2087,14 +2274,40 @@ async function manageContext(
     }
   }
 
-  // Tier 4: Emergency prune
-  if (tokens > budget * EMERGENCY_AT) {
-    doEmit( { type: 'status', content: '⚠️ Экстренная обрезка контекста' })
+  // Tier 4: structural prune when still over budget
+  const tier4Threshold = useDiskSnapshot ? budget * SUMMARIZE_AT : budget * EMERGENCY_AT
+  if (tokens > tier4Threshold) {
+    emitActivity(
+      'context_compress',
+      useDiskSnapshot
+        ? 'Структурное сжатие chat-истории (research-данные в .research/)…'
+        : 'Экстренное сжатие контекста…',
+    )
+    doEmit({ type: 'status', content: useDiskSnapshot ? '🗜️ Сжатие chat-истории — полные данные в .research/' : '⚠️ Экстренная обрезка контекста' })
     current = tier4EmergencyPrune(current)
     current = injectRehydrationHint(current, originalMsgs)
   }
 
   return current
+}
+
+/**
+ * Append the disk-backed research working set as a transient TAIL user message.
+ *
+ * Prefix-cache discipline: the returned array is used only for the LLM call. The
+ * persistent `messages` stay append-only and the system prompt is never mutated,
+ * so llama-server keeps its KV-cache prefix (context checkpoints) valid between
+ * iterations. Returns the same array reference when not in a research run.
+ */
+function appendResearchTail(msgs: Message[]): Message[] {
+  if (researchContextMode === 'off' || !activeResearchOutputDir) return msgs
+  const tail = buildResearchTailMessage(
+    workspace,
+    activeResearchOutputDir,
+    Math.floor(getMessageBudget() * calibratedRatio * 0.15),
+  )
+  if (!tail) return msgs
+  return [...msgs, tail as Message]
 }
 
 // Cached project context — invalidated on workspace change
@@ -2211,9 +2424,39 @@ export function cancelAgent() {
   }
 }
 
+function finishAgentError(session: Session, messages: Message[], message: string): string {
+  emitActivity('done', 'Остановлено')
+  doEmit({ type: 'error', content: message })
+  doEmit({ type: 'response', content: '', done: true })
+  session.messages = messages
+  session.updatedAt = Date.now()
+  doSaveSession(session)
+  return message.startsWith('Error:') ? message : `Error: ${message}`
+}
+
+function toolLoopSignature(toolName: string, toolArgs: Record<string, any>): string {
+  if (toolName === 'record_evidence') {
+    const claim = String(toolArgs.claim ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160)
+    return `${toolName}:${claim}:${toolArgs.plan_item_id ?? ''}:${String(toolArgs.corpus_ids ?? toolArgs.corpusIds ?? '').slice(0, 48)}`
+  }
+  if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName)) {
+    return `${toolName}:${toolArgs.output_dir ?? ''}`
+  }
+  return `${toolName}:${JSON.stringify(toolArgs)}`
+}
+
+function isLoopSensitiveTool(toolName: string): boolean {
+  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName)
+}
+
+function duplicateToolThreshold(toolName: string): number {
+  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName) ? 1 : 2
+}
+
 export async function runAgent(userMessage: string, ws: string, bridge: AgentBridge): Promise<string> {
   currentBridge = bridge
   try {
+  emitActivity('starting', 'Запуск агента…')
   workspace = ws
   cancelRequested = false
   lastTier3Iteration = -10
@@ -2244,10 +2487,98 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     messages.unshift({ role: 'system', content: getSystemPrompt() })
   }
 
-  messages.push({ role: 'user', content: userMessage })
+  activeResearchOutputDir = resolveResearchOutputDir(ws, messages, userMessage)
+  researchContextMode = resolveResearchContextMode({
+    userMessage,
+    presetId: (doGetConfig() as any).selectedPreset,
+    outputDir: activeResearchOutputDir,
+  })
+  const resumeLike = isResearchResumeMessage(userMessage)
+  const approvalLike = isPlanApprovalMessage(userMessage)
+  const approvalPromptPending = hasRecentPlanApprovalPrompt(messages as Message[])
+  const hasSavedPlan = Boolean(activeResearchOutputDir && parsePlan(ws, activeResearchOutputDir).length > 0)
+  const { planApproved, planBootstrapApproved, researchResume } = decideResearchCommandIntent({
+    resumeLike,
+    approvalLike,
+    approvalPromptPending,
+    hasOutputDir: Boolean(activeResearchOutputDir),
+    hasSavedPlan,
+    contextModeOff: researchContextMode === 'off',
+  })
+  if (activeResearchOutputDir && researchContextMode !== 'off') {
+    updateResearchRunState(ws, {
+      outputDir: activeResearchOutputDir,
+      phase: researchResume ? 'started' : 'started',
+    })
+  }
+  if (planApproved && activeResearchOutputDir) {
+    const spec = ensureResearchRunSpec(ws, activeResearchOutputDir, { state: 'PLANNED' })
+    doEmit({
+      type: 'status',
+      content: `✅ План утверждён. Перехожу к поиску источников для \`${activeResearchOutputDir}\`.`,
+    })
+    messages.push({
+      role: 'user',
+      content: [
+        '[Research workflow checkpoint approved]',
+        `The user approved the saved plan for output_dir: "${activeResearchOutputDir}".`,
+        formatWorkflowGuidance(spec),
+        'Do not restate the plan and do not ask for approval again.',
+        'Next action: call one focused search tool now (`search_arxiv`, `search_openalex`, `search_huggingface_papers`, or `search_web`) with a query derived from the approved plan and 2024-2026 date range. After search results, build_corpus and screen_corpus for the same output_dir.',
+      ].join('\n'),
+    })
+  }
+
+  if (planBootstrapApproved && activeResearchOutputDir) {
+    doEmit({
+      type: 'status',
+      content: `✅ План утверждён. Сначала сохраняю его в \`${activeResearchOutputDir}/plan.md\`, затем перейду к поиску источников.`,
+    })
+    messages.push({
+      role: 'user',
+      content: [
+        '[Research workflow plan approved — plan.md is not saved yet]',
+        `The user approved the research plan you just proposed for output_dir: "${activeResearchOutputDir}".`,
+        'Mandatory next action: call `plan_research` now.',
+        'Use the exact top-level question and sub-questions from your previous assistant message; do not ask for approval again.',
+        `Pass output_dir exactly as "${activeResearchOutputDir}".`,
+        'After plan_research succeeds, continue immediately with the next valid pipeline action: search sources for the approved sub-questions.',
+      ].join('\n'),
+    })
+  }
+
+  if (researchResume) {
+    const summary = researchRunProgressSummary(ws, activeResearchOutputDir ?? undefined)
+    if (summary) {
+      activeResearchOutputDir = summary.dir
+      researchContextMode = 'resume'
+      emitActivity('resume_checkpoint', 'Продолжаю research run с диска', summary.detail)
+      doEmit({ type: 'status', content: summary.statusLine })
+      const wsBudget = wantsCompactContext(userMessage) ? 3500 : 5500
+      messages = buildResumeMessageWindow(
+        getSystemPrompt(),
+        ws,
+        summary.dir,
+        summary.brief,
+        userMessage,
+        wsBudget,
+      ) as Message[]
+    } else {
+      emitActivity('resume_checkpoint', 'Checkpoint .research/ не найден', 'Структурное сжатие текущей истории')
+      doEmit({ type: 'status', content: '⚠️ Каталог .research/ не найден — сжимаю историю; research-state недоступен.' })
+      messages = tier4EmergencyPrune(messages)
+      messages.push({ role: 'user', content: userMessage })
+    }
+  } else {
+    // Research working set is delivered as a transient tail message per call
+    // (appendResearchTail); the stored history stays append-only for prefix caching.
+    if (!planApproved && !planBootstrapApproved) messages.push({ role: 'user', content: userMessage })
+  }
   session.messages = messages
 
   const apiUrl = `${doGetApiUrl()}/v1/chat/completions`
+
+  emitActivity('context_compress', 'Подготавливаю контекст модели…')
 
   // Calibrate token ratio from server (non-blocking, happens once)
   calibrateTokenRatio().catch(() => {})
@@ -2266,11 +2597,10 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   const filesCreatedThisTurn = new Set<string>()
   let consecutiveReReads = 0
 
-  // General loop detection: same tool + same args repeated
+  // General loop detection: same tool + same args repeated (single loop-breaker)
   let lastToolSig = ''
   let sameToolRepeatCount = 0
 
-  let lastReflectInjectedAt = -1
   for (let i = 0; i < getMaxIterations(); i++) {
     if (doIsCancelRequested()) {
       doEmit( { type: 'status', content: '⏹ Запрос агента остановлен пользователем' })
@@ -2285,30 +2615,10 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       fullResponse = ''
     }
 
-    // Supervisor auto-reflect: every N iterations, nudge the agent to pause and self-check
-    const superCfg = doGetConfig() as any
-    const reflectEvery = Math.max(0, Number(superCfg.supervisorAutoReflectEvery) || 0)
-    const selectedPreset = superCfg.selectedPreset || ''
-    const autoReflectActive = reflectEvery > 0 || selectedPreset === 'deep-research'
-    const effectiveReflectEvery = reflectEvery > 0 ? reflectEvery : 10
-    if (autoReflectActive && i > 0 && i - lastReflectInjectedAt >= effectiveReflectEvery) {
-      const recentReflect = messages.slice(-20).some((m: any) =>
-        (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((tc: any) => tc.function?.name === 'reflect'))
-        || (m.role === 'tool' && typeof m.content === 'string' && m.content.includes('Self-Reflection'))
-      )
-      if (!recentReflect) {
-        messages.push({
-          role: 'user',
-          content: `[Supervisor pause @ iteration ${i}] Stop and self-check: (1) Which sub-questions from the plan are answered? (2) Which sources contradict each other? (3) What critical gaps remain? Call the \`reflect\` tool with your current findings before continuing new searches.`,
-        })
-        lastReflectInjectedAt = i
-        doEmit({ type: 'status', content: `🧭 Supervisor: автоматическая пауза на саморефлексию (итерация ${i})` })
-      }
-    }
-
-    // Pre-flight: sanitize structure + ensure messages fit in context budget
+    // Pre-flight: sanitize structure + ensure messages fit in context budget.
+    // Token accounting includes the transient research tail so the clamp is exact.
     messages = sanitizeMessages(messages)
-    const accurateTokens = await countContextTokensAccurate(messages)
+    const accurateTokens = await countContextTokensAccurate(appendResearchTail(messages))
     const preflightBudget = getMessageBudget()
     const serverCtx = ctxTokens()
     debugLog('PREFLIGHT', `iter=${i}, msgs=${messages.length}, tokens=${accurateTokens}, budget=${preflightBudget}, ctx=${serverCtx}, ratio=${(accurateTokens/preflightBudget*100).toFixed(0)}%, maxResp=${getMaxResponseTokens()}`)
@@ -2322,7 +2632,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
     // Hard clamp: max_tokens must NEVER exceed (server ctx - prompt tokens)
     // This prevents HTTP 400 "exceeds available context size" errors
-    const postPruneTokens = await countContextTokensAccurate(messages)
+    const postPruneTokens = await countContextTokensAccurate(appendResearchTail(messages))
     const desiredMaxTokens = getMaxResponseTokens()
     const hardLimit = Math.max(256, serverCtx - postPruneTokens - 50)
     const effectiveMaxTokens = Math.min(desiredMaxTokens, hardLimit)
@@ -2330,92 +2640,91 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       debugLog('PREFLIGHT', `Clamped max_tokens: ${desiredMaxTokens} → ${effectiveMaxTokens} (ctx=${serverCtx}, prompt=${postPruneTokens})`)
     }
 
-    let streamResult: StreamResult
-    try {
+    let streamResult: StreamResult | undefined
+    const retryTemp = emptyRetries > 0 ? getBaseTemperature() + emptyRetries * 0.2 : undefined
+    let netTransportAttempts = 0
+    const maxNetTransportAttempts = 2
+
+    while (!streamResult) {
       const controller = new AbortController()
       currentAbort = controller
       doEmit({ type: 'stream_stats', tokensPerSecond: 0 })
-      // No fixed total timeout — idle timeout inside streamLlmResponse handles stalls
-      // Only abort on user cancel or server idle (120s no data)
 
-      const retryTemp = emptyRetries > 0 ? getBaseTemperature() + emptyRetries * 0.2 : undefined
-      streamResult = await streamLlmResponse(apiUrl, messages, fullResponse, controller.signal, effectiveMaxTokens, retryTemp)
-    } catch (e: any) {
-      debugLog('ERROR', `Catch in runAgent: name=${e?.name}, message=${e?.message}, cancelRequested=${cancelRequested}, stack=${(e?.stack ?? '').slice(0, 500)}`)
-      if (doIsCancelRequested()) {
-        doEmit( { type: 'status', content: '⏹ Запрос агента остановлен пользователем' })
-        session.updatedAt = Date.now()
-        doSaveSession(session)
-        return 'Canceled'
-      }
+      // Transient tail: stored `messages` stay append-only; only this call carries
+      // the fresh disk-backed research state at the very end (stable-prefix discipline).
+      const sendMessages = appendResearchTail(messages)
 
-      const errMsg = e.message ?? String(e)
-      const isAbort = e?.name === 'AbortError' || errMsg.includes('aborted')
-      const isContextError = errMsg.includes('500') || errMsg.includes('400') || errMsg.includes('context')
-      const isNetErr = !isContextError && !isAbort && isNetworkStreamError(e)
-
-      if (isAbort && !isContextError) {
-        // Idle timeout or network abort — not user-initiated
-        doEmit( { type: 'error', content: 'Соединение с моделью прервано (сервер не отвечал 60 секунд). Попробуйте ещё раз.' })
-        session.updatedAt = Date.now()
-        doSaveSession(session)
-        return 'Error: connection lost'
-      }
-
-      if (isNetErr) {
-        // TCP-level failure (undici "fetch failed" / "terminated" / ECONNRESET).
-        debugLog('ERROR', `Network-level stream failure: name=${e?.name}, msg=${errMsg}, cause=${e?.cause?.code ?? '-'}`)
-        doEmit({ type: 'status', content: '🔌 Соединение с llama-server прервано — проверяю состояние сервера…' })
-        // Give the server a moment before checking health; this distinguishes
-        // a transient transport break from a process that is no longer responsive.
-        await new Promise((r) => setTimeout(r, 1500))
-        const alive = await pingLlamaServer(apiUrl)
-        debugLog('ERROR', `llama-server health after transport failure: ${alive ? 'ok' : 'unreachable'}`)
-        if (!alive) {
-          doEmit({
-            type: 'error',
-            content: '❌ llama-server не отвечает после разрыва соединения. Проверьте ~/.one-click-agent/server-debug.log: там записаны команда запуска, stderr/stdout и exit/signal сервера.',
-          })
+      try {
+        streamResult = await streamLlmResponse(apiUrl, sendMessages, fullResponse, controller.signal, effectiveMaxTokens, retryTemp)
+      } catch (e: any) {
+        debugLog('ERROR', `Catch in runAgent: name=${e?.name}, message=${e?.message}, cancelRequested=${cancelRequested}, stack=${(e?.stack ?? '').slice(0, 500)}`)
+        if (doIsCancelRequested()) {
+          doEmit({ type: 'status', content: '⏹ Запрос агента остановлен пользователем' })
           session.updatedAt = Date.now()
           doSaveSession(session)
-          return 'Error: llama-server is not responding'
+          return 'Canceled'
         }
-        doEmit({ type: 'error', content: `LLM transport error: ${errMsg}` })
-        session.updatedAt = Date.now()
-        doSaveSession(session)
-        return `Error: ${errMsg}`
-      } else if (isContextError) {
-        // Extract real n_ctx from server error and auto-correct our tracking
-        const ctxMatch = errMsg.match(/n_ctx[":=\s]*(\d+)/)
-        if (ctxMatch) {
-          const realCtx = parseInt(ctxMatch[1])
-          if (realCtx > 0 && realCtx !== ctxTokens()) {
-            debugLog('CTX_FIX', `Server reports n_ctx=${realCtx}, we tracked ${ctxTokens()} — correcting!`)
-            doSetCtxSize(realCtx)
-            emitContextUsage(messages)
+
+        const errMsg = e.message ?? String(e)
+        const isAbort = e?.name === 'AbortError' || errMsg.includes('aborted')
+        const isContextError = errMsg.includes('500') || errMsg.includes('400') || errMsg.includes('context')
+        const isNetErr = !isContextError && !isAbort && isNetworkStreamError(e)
+
+        if (isAbort && !isContextError) {
+          return finishAgentError(session, messages, 'Соединение с моделью прервано (сервер не отвечал 60 секунд). Попробуйте ещё раз.')
+        }
+
+        if (isNetErr) {
+          debugLog('ERROR', `Network-level stream failure: name=${e?.name}, msg=${errMsg}, cause=${e?.cause?.code ?? '-'}`)
+          doEmit({ type: 'status', content: '🔌 Соединение с llama-server прервано — проверяю состояние сервера…' })
+          await new Promise((r) => setTimeout(r, 1500))
+          const alive = await pingLlamaServer(apiUrl)
+          debugLog('ERROR', `llama-server health after transport failure: ${alive ? 'ok' : 'unreachable'}`)
+          if (!alive) {
+            return finishAgentError(
+              session,
+              messages,
+              '❌ llama-server не отвечает после разрыва соединения. Проверьте ~/.one-click-agent/server-debug.log: там записаны команда запуска, stderr/stdout и exit/signal сервера.',
+            )
           }
+          if (netTransportAttempts < maxNetTransportAttempts) {
+            netTransportAttempts++
+            doEmit({ type: 'status', content: `🔁 Повтор после сетевой ошибки (${netTransportAttempts}/${maxNetTransportAttempts}) — сжимаю контекст…` })
+            messages = tier4EmergencyPrune(messages)
+            messages = await manageContext(messages, apiUrl, undefined, i)
+            session.messages = messages
+            emitContextUsage(messages)
+            continue
+          }
+          return finishAgentError(session, messages, `LLM transport error: ${errMsg}`)
         }
 
-        doEmit( { type: 'status', content: `🔧 Ошибка контекста (реальный ctx=${ctxTokens()}) — очищаю и повторяю…` })
-        messages = sanitizeMessages(messages)
-        messages = tier4EmergencyPrune(messages)
-        session.messages = messages
-        doSaveSession(session)
-        try {
-          const retryController = new AbortController()
-          currentAbort = retryController
-          streamResult = await streamLlmResponse(apiUrl, messages, fullResponse, retryController.signal)
-        } catch (retryErr: any) {
-          doEmit( { type: 'error', content: `LLM request failed after recovery: ${retryErr.message}` })
-          session.updatedAt = Date.now()
+        if (isContextError) {
+          const ctxMatch = errMsg.match(/n_ctx[":=\s]*(\d+)/)
+          if (ctxMatch) {
+            const realCtx = parseInt(ctxMatch[1])
+            if (realCtx > 0 && realCtx !== ctxTokens()) {
+              debugLog('CTX_FIX', `Server reports n_ctx=${realCtx}, we tracked ${ctxTokens()} — correcting!`)
+              doSetCtxSize(realCtx)
+              emitContextUsage(messages)
+            }
+          }
+
+          doEmit({ type: 'status', content: `🔧 Ошибка контекста (реальный ctx=${ctxTokens()}) — очищаю и повторяю…` })
+          messages = sanitizeMessages(messages)
+          messages = tier4EmergencyPrune(messages)
+          session.messages = messages
           doSaveSession(session)
-          return `Error: ${retryErr.message}`
+          try {
+            const retryController = new AbortController()
+            currentAbort = retryController
+            streamResult = await streamLlmResponse(apiUrl, appendResearchTail(messages), fullResponse, retryController.signal, effectiveMaxTokens, retryTemp)
+          } catch (retryErr: any) {
+            return finishAgentError(session, messages, `LLM request failed after recovery: ${retryErr.message}`)
+          }
+        } else {
+          return finishAgentError(session, messages, `LLM request failed: ${errMsg}`)
         }
-      } else {
-        doEmit( { type: 'error', content: `LLM request failed: ${errMsg}` })
-        session.updatedAt = Date.now()
-        doSaveSession(session)
-        return `Error: ${errMsg}`
       }
     }
 
@@ -2497,24 +2806,53 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       continue
     }
 
-    // --- Recover text-based tool calls from content/thinking ---
-    // Model sometimes writes tool calls as text instead of using the API
+    // --- Recover text-based tool calls (native API is primary; this is the fallback) ---
+    // Only parse the VISIBLE content (after stripping <think>). Tool calls the model writes
+    // inside its reasoning scratchpad are deliberation, not commitments — executing them
+    // produces phantom/looping calls. We recover only what the model actually emitted as output.
     if (!toolCalls && content) {
-      const textCalls = extractTextToolCalls(content)
+      const [thinking, visibleForTools] = extractThinking(content)
+      const textCalls = extractTextToolCalls(visibleForTools)
       if (textCalls.length > 0) {
-        debugLog('TEXT_TOOL', `Recovered ${textCalls.length} text-based tool call(s): ${textCalls.map((t) => t.name).join(', ')}`)
-        const [thinking] = extractThinking(content)
+        debugLog('TEXT_TOOL', `Recovered ${textCalls.length} text-based tool call(s) from visible content: ${textCalls.map((t) => t.name).join(', ')}`)
         if (thinking) {
-          doEmit( { type: 'thinking', content: thinking })
+          doEmit( { type: 'thinking', content: cleanThinkingText(thinking) })
         }
 
         const recoveredCustomTools = doGetConfig().customTools
         for (const tc of textCalls) {
-          doEmit( { type: 'tool_call', name: tc.name, args: tc.args })
-
           const isCustom = recoveredCustomTools.some((ct: any) => ct.name === tc.name)
+          const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report', 'build_corpus', 'assign_corpus_to_plan', 'record_evidence', 'extract_evidence_from_corpus_item', 'repair_evidence_quotes', 'verify_claims', 'run_quality_gates', 'gate_report', 'generate_evidence_report'])
+          let toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
+          if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name) && !toolArgs.output_dir) {
+            toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+          }
+
+          // Single loop-breaker: identical tool+args repeated past threshold.
+          const textToolSig = toolLoopSignature(tc.name, toolArgs)
+          if (textToolSig === lastToolSig && isLoopSensitiveTool(tc.name)) {
+            sameToolRepeatCount++
+            if (sameToolRepeatCount >= duplicateToolThreshold(tc.name)) {
+              const skipMsg = `You already called ${tc.name} with the same arguments; the result has not changed. Continue with the next concrete step (see the research state at the end of the conversation).`
+              const callId = `text_tc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+              messages.push({
+                role: 'assistant',
+                content: stripThinking(content),
+                tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(toolArgs) } }],
+              })
+              messages.push({ role: 'tool', tool_call_id: callId, content: skipMsg })
+              doEmit({ type: 'tool_result', name: tc.name, result: skipMsg })
+              continue
+            }
+          } else {
+            sameToolRepeatCount = 0
+          }
+          lastToolSig = textToolSig
+
+          doEmit( { type: 'tool_call', name: tc.name, args: toolArgs })
+
           if (needsApprovalForTool(tc.name, isCustom)) {
-            const approved = await doRequestApproval( tc.name, tc.args)
+            const approved = await doRequestApproval( tc.name, toolArgs)
             if (!approved) {
               const deniedResult = `[Denied by user] Operation "${tc.name}" was not approved.`
               doEmit( { type: 'tool_result', name: tc.name, result: deniedResult })
@@ -2525,8 +2863,6 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           }
 
           let result: string
-          const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report', 'build_corpus', 'record_evidence', 'verify_claims', 'run_quality_gates', 'gate_report'])
-          const toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
           if (isCustom) {
             const ct = recoveredCustomTools.find((t: any) => t.name === tc.name)
             result = ct ? executeCustomTool(ct, toolArgs, workspace) : `Error: custom tool "${tc.name}" not found`
@@ -2535,6 +2871,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           } else {
             result = executeTool(tc.name, toolArgs, workspace)
           }
+          result = followUpQualityGates(tc.name, toolArgs, result, session, workspace)
 
           const uiResult = result.length > 5000 ? result.slice(0, 5000) + '\n… [truncated]' : result
           doEmit( { type: 'tool_result', name: tc.name, result: uiResult })
@@ -2548,13 +2885,30 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             invalidateProjectContextCache()
             try { currentBridge!.notifyWorkspaceChanged() } catch {}
           }
+          if (toolArgs.output_dir) {
+            activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
+            if (researchContextMode === 'off') researchContextMode = 'active'
+          }
+          if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name)) {
+            const snap = readQualityGateSnapshot(workspace, activeResearchOutputDir)
+            const gatePhase = tc.name === 'run_quality_gates' || tc.name === 'gate_report'
+              ? (snap?.allPassed ? 'gates_passed' : 'gates_failed')
+              : undefined
+            updateResearchRunState(workspace, {
+              outputDir: activeResearchOutputDir,
+              phase: gatePhase ?? phaseForResearchTool(tc.name),
+              lastTool: tc.name,
+              gatesPassed: snap?.passed,
+              gatesTotal: snap?.total,
+            })
+          }
 
           // Build proper tool_calls message format
           const callId = `text_tc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
           messages.push({
             role: 'assistant',
             content: stripThinking(content),
-            tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }],
+            tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(toolArgs) } }],
           })
           messages.push({ role: 'tool', tool_call_id: callId, content: smartTruncateToolResult(tc.name, result, dynamicToolResultLimit()) })
         }
@@ -2605,12 +2959,16 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
     const [, visible] = extractThinking(content)
 
-    // No tool calls → final response
+    // No tool calls → final response.
+    // Direct manipulation of managed report.md is blocked at the tool layer
+    // (write_file/edit_file/append_file/generate_report) and the report is
+    // auto-generated by followUpQualityGates once gates pass, so no text-level
+    // "bypass" interception is needed here.
     if (!toolCalls || toolCalls.length === 0) {
       const finalText = visible || content
       fullResponse += (fullResponse ? '\n\n' : '') + finalText
       doEmit( { type: 'response', content: fullResponse, done: true })
-      // Store without <think> blocks to save context
+      emitActivity('done', 'Готово')
       messages.push({ role: 'assistant', content: stripThinking(content) })
       session.messages = messages
       session.updatedAt = Date.now()
@@ -2657,7 +3015,13 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         toolArgs = {}
       }
 
+      if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(toolName) && !toolArgs.output_dir) {
+        toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+      }
+
       doEmit( { type: 'tool_call', name: toolName, args: toolArgs })
+      const toolDetail = toolArgs.path ?? toolArgs.output_dir ?? toolArgs.claim?.slice?.(0, 80) ?? toolArgs.query?.slice?.(0, 80)
+      emitActivity('tool_exec', `Инструмент: ${toolName}`, toolDetail ? String(toolDetail) : undefined)
 
       // Track files created this turn
       if ((toolName === 'write_file' || toolName === 'append_file' || toolName === 'create_directory') && toolArgs.path) {
@@ -2665,15 +3029,18 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       }
 
       // General loop detection: same tool + same args called repeatedly
-      const readOnlyTools = new Set(['read_file', 'list_directory', 'find_files'])
-      const toolSig = `${toolName}:${JSON.stringify(toolArgs)}`
-      if (toolSig === lastToolSig && readOnlyTools.has(toolName)) {
+      const toolSig = toolLoopSignature(toolName, toolArgs)
+      if (toolSig === lastToolSig && isLoopSensitiveTool(toolName)) {
         sameToolRepeatCount++
-        debugLog('LOOP', `Duplicate ${toolName} call #${sameToolRepeatCount + 1}: ${toolArgs.path ?? ''}`)
-        if (sameToolRepeatCount >= 2) {
-          const skipMsg = `You already called ${toolName} with these exact arguments ${sameToolRepeatCount + 1} times. The result hasn't changed. Stop re-reading and proceed with the actual task. If you need to modify a file, use edit_file. If you're stuck, explain what you're trying to do.`
+        debugLog('LOOP', `Duplicate ${toolName} call #${sameToolRepeatCount + 1}: ${toolArgs.path ?? toolArgs.claim?.slice?.(0, 60) ?? ''}`)
+        if (sameToolRepeatCount >= duplicateToolThreshold(toolName)) {
+          const skipMsg = toolName === 'record_evidence'
+            ? `You already recorded this evidence claim. Use list_evidence / verify_claims, fix quality gate blockers if any, then proceed to generate_evidence_report. Do not re-record duplicates.`
+            : (toolName === 'run_quality_gates' || toolName === 'gate_report')
+              ? `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
+              : `You already called ${toolName} with these exact arguments ${sameToolRepeatCount + 1} times. The result hasn't changed. Stop re-reading and proceed with the actual task. If you need to modify a file, use edit_file. If you're stuck, explain what you're trying to do.`
           messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: skipMsg })
-          doEmit( { type: 'tool_result', name: toolName, result: skipMsg })
+          doEmit({ type: 'tool_result', name: toolName, result: skipMsg })
           continue
         }
       } else {
@@ -2699,7 +3066,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       const SESSION_AWARE_TOOLS = new Set([
         'generate_report', 'verify_sources', 'reflect', 'plan_research',
         'save_finding', 'spawn_sub_researcher', 'export_report',
-        'build_corpus', 'record_evidence', 'verify_claims', 'run_quality_gates', 'gate_report',
+        'build_corpus', 'assign_corpus_to_plan', 'record_evidence', 'extract_evidence_from_corpus_item', 'repair_evidence_quotes', 'verify_claims', 'run_quality_gates', 'gate_report', 'generate_evidence_report',
       ])
       if (SESSION_AWARE_TOOLS.has(toolName)) toolArgs = { ...toolArgs, session_id: session.id }
 
@@ -2760,6 +3127,35 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         result = await runTool()
       }
 
+      result = followUpQualityGates(toolName, toolArgs, result, session, workspace)
+
+      if (toolArgs.output_dir) {
+        activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
+        if (researchContextMode === 'off') researchContextMode = 'active'
+      } else {
+        const dirInResult = result.match(/(\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[^\s"'`]+)/)?.[1]
+        if (dirInResult) {
+          activeResearchOutputDir = dirInResult
+          if (researchContextMode === 'off') researchContextMode = 'active'
+        }
+      }
+      if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(toolName)) {
+        const snap = readQualityGateSnapshot(workspace, activeResearchOutputDir)
+        const spec = updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, toolName, {
+          gateResults: (toolName === 'run_quality_gates' || toolName === 'gate_report') ? (snap?.failed ?? []) : undefined,
+        })
+        const gatePhase = toolName === 'run_quality_gates' || toolName === 'gate_report'
+          ? (snap?.allPassed ? 'gates_passed' : 'gates_failed')
+          : undefined
+        updateResearchRunState(workspace, {
+          outputDir: activeResearchOutputDir,
+          phase: gatePhase ?? (spec.state === 'REPORT_READY' ? 'report_generated' : phaseForResearchTool(toolName)),
+          lastTool: toolName,
+          gatesPassed: snap?.passed,
+          gatesTotal: snap?.total,
+        })
+      }
+
       // Collect sources from search tools
       try {
         const sources = extractSourcesFromToolResult(toolName, result)
@@ -2771,6 +3167,10 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         ? result.slice(0, 5000) + `\n… [${Math.round(result.length / 1024)}KB total]`
         : result
       doEmit( { type: 'tool_result', name: toolName, result: uiResult })
+      if (toolName === 'generate_report' || toolName === 'generate_evidence_report') {
+        const reportPath = getGeneratedReportPath(result, workspace)
+        if (reportPath) doEmit({ type: 'open_file', filePath: reportPath })
+      }
 
       // Notify renderer to refresh file tree when agent modifies filesystem
       if (shouldNotifyWorkspaceChanged(toolName, isCustom, result)) {
@@ -2787,7 +3187,8 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: llmResult })
     }
 
-    // Summarize/prune after each iteration to stay within budget
+    // Research state is injected fresh as a tail message on every LLM call
+    // (appendResearchTail), so no periodic system-prompt mutation is needed here.
     messages = await manageContext(messages, apiUrl, undefined, i)
     session.messages = messages
     emitContextUsage( messages)
@@ -2800,6 +3201,8 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   doSaveSession(session)
   return fullResponse
   } finally {
+    researchContextMode = 'off'
+    activeResearchOutputDir = null
     currentBridge = null
   }
 }

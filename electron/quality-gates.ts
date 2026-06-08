@@ -1,9 +1,10 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import { loadCorpus, corpusStats } from './corpus'
+import { isReviewLike, loadCorpus, corpusStats } from './corpus'
 import { evidenceStats, loadEvidence, verifyClaims } from './evidence'
 import { getSourceTracker } from './sources'
 import { parsePlan, planProgress } from './planner'
+import { resolveResearchDir } from '../research-paths'
 
 export interface GateResult {
   gate: string
@@ -13,8 +14,18 @@ export interface GateResult {
   warnings: string[]
 }
 
-function qualityPath(workspace: string): string {
-  return path.join(workspace, '.research', 'quality-gates.json')
+interface QualityGateFile {
+  summary?: string
+  results?: GateResult[]
+  at?: number
+}
+
+function researchDir(workspace: string, outputDir?: string): string {
+  return resolveResearchDir(workspace, outputDir)
+}
+
+function qualityPath(workspace: string, outputDir?: string): string {
+  return path.join(researchDir(workspace, outputDir), 'quality-gates.json')
 }
 
 function pass(gate: string, score: number, warnings: string[] = []): GateResult {
@@ -25,31 +36,65 @@ function fail(gate: string, blockers: string[], score = 0, warnings: string[] = 
   return { gate, passed: false, score, blockers, warnings }
 }
 
-export function runQualityGates(workspace: string, sessionId?: string, opts?: { minSources?: number; minEvidence?: number; requirePlanCompletion?: boolean }): { results: GateResult[]; summary: string } {
+function claimKey(claim: { claim: string; planItemId?: string; topic?: string }): string {
+  return `${claim.planItemId || claim.topic || ''}:${claim.claim.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, ' ').trim().replace(/\s+/g, ' ').slice(0, 240)}`
+}
+
+function uniqueClaims<T extends { claim: string; planItemId?: string; topic?: string; quote?: string; notes?: string; sourceIdxs: number[]; corpusIds?: string[]; sourceUrls?: string[]; status: string; support?: string; confidence?: string }>(rows: T[]): T[] {
+  const byKey = new Map<string, T>()
+  for (const row of rows) {
+    const key = claimKey(row)
+    const prev = byKey.get(key)
+    if (!prev) {
+      byKey.set(key, row)
+      continue
+    }
+    byKey.set(key, {
+      ...prev,
+      ...row,
+      quote: prev.quote || row.quote,
+      notes: [prev.notes, row.notes].filter(Boolean).join(' '),
+      sourceIdxs: [...new Set([...(prev.sourceIdxs ?? []), ...(row.sourceIdxs ?? [])])],
+      corpusIds: [...new Set([...(prev.corpusIds ?? []), ...(row.corpusIds ?? [])])],
+      sourceUrls: [...new Set([...(prev.sourceUrls ?? []), ...(row.sourceUrls ?? [])])],
+      status: prev.status === 'supported' || row.status === 'supported' ? 'supported' : row.status,
+    } as T)
+  }
+  return [...byKey.values()]
+}
+
+export function runQualityGates(workspace: string, sessionId?: string, opts?: { minSources?: number; minEvidence?: number; requirePlanCompletion?: boolean; outputDir?: string }): { results: GateResult[]; summary: string } {
   const minSources = Math.max(1, Number(opts?.minSources) || 5)
   const minEvidence = Math.max(0, Number(opts?.minEvidence) || 3)
+  const minSelected = Math.max(1, Number((opts as any)?.minSelected) || Math.min(12, minSources))
+  const minFullTextReads = Math.max(0, Number((opts as any)?.minFullTextReads) || Math.min(8, Math.ceil(minSelected * 0.6)))
+  const evidencePerSection = Math.max(1, Number((opts as any)?.evidencePerSection) || 2)
+  const minReviewLike = Math.max(1, Math.min(3, Number((opts as any)?.minReviewLike) || Math.ceil(minSelected * 0.12)))
   const results: GateResult[] = []
 
   const tracker = sessionId ? getSourceTracker(sessionId) : null
   const sourceCount = tracker?.count() ?? 0
-  const corpus = corpusStats(workspace)
+  const corpus = corpusStats(workspace, opts?.outputDir)
   const totalSources = Math.max(sourceCount, corpus.total)
   results.push(totalSources >= minSources
     ? pass('source_coverage', Math.min(100, Math.round(totalSources / minSources * 100)))
     : fail('source_coverage', [`Only ${totalSources} source(s); target is at least ${minSources}.`], Math.round(totalSources / minSources * 100)))
 
-  const eStats = evidenceStats(workspace)
+  const eStats = evidenceStats(workspace, opts?.outputDir)
   results.push(eStats.total >= minEvidence
     ? pass('evidence_coverage', Math.min(100, Math.round(eStats.supported / Math.max(1, eStats.total) * 100)), eStats.needsReview ? [`${eStats.needsReview} claim(s) still need review.`] : [])
     : fail('evidence_coverage', [`Only ${eStats.total} evidence claim(s); target is at least ${minEvidence}.`], Math.round(eStats.total / Math.max(1, minEvidence) * 100)))
 
-  const claims = loadEvidence(workspace)
-  const unresolved = claims.filter((claim) => claim.sourceIdxs.length === 0 || claim.status !== 'supported')
+  const claims = uniqueClaims(loadEvidence(workspace, opts?.outputDir))
+  const unresolved = claims.filter((claim) => {
+    const hasStableSource = claim.sourceIdxs.length > 0 || Boolean(claim.corpusIds?.length) || Boolean(claim.sourceUrls?.length)
+    return !hasStableSource || claim.status !== 'supported'
+  })
   results.push(unresolved.length === 0
     ? pass('claim_support', 100)
-    : fail('claim_support', unresolved.slice(0, 5).map((c) => `${c.id}: ${c.status}; sources=${c.sourceIdxs.length}`), Math.max(0, 100 - unresolved.length * 20)))
+    : fail('claim_support', unresolved.slice(0, 5).map((c: any) => `${c.id}: ${c.status}; sources=${c.sourceIdxs.length}; corpus=${c.corpusIds?.length ?? 0}`), Math.max(0, 100 - unresolved.length * 20)))
 
-  const plan = parsePlan(workspace)
+  const plan = parsePlan(workspace, opts?.outputDir)
   const progress = planProgress(plan)
   if (plan.length > 0 || opts?.requirePlanCompletion) {
     results.push(progress.pct >= 80
@@ -57,7 +102,7 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
       : fail('plan_progress', [`Plan is ${progress.pct}% complete (${progress.done}/${progress.total}).`], progress.pct))
   }
 
-  const entries = loadCorpus(workspace)
+  const entries = loadCorpus(workspace, opts?.outputDir)
   const currentYear = new Date().getFullYear()
   const fresh = entries.filter((e) => e.year && e.year >= currentYear - 1).length
   if (entries.length > 0) {
@@ -66,17 +111,173 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
       : fail('recency', ['No recent corpus item found from the last two years.'], 0))
   }
 
+  const selected = entries.filter((e) => e.screeningStatus === 'selected')
+  const selectedRead = selected.filter((e) => e.readStatus === 'read' || e.status === 'read')
+  const highPriority = selected.filter((e) => e.readPriority === 'high')
+  const highPriorityRead = highPriority.filter((e) => e.readStatus === 'read' || e.status === 'read')
+  const selectedReviewLike = selected.filter(isReviewLike)
+  const weakTopicSelected = selected.filter((e) => (e.topicalPrecisionScore ?? e.relevanceScore ?? 0) < 45)
+  const failedHighPriority = highPriority.filter((e) => e.readStatus === 'failed')
+  results.push(selected.length >= minSelected
+    ? pass('selected_corpus_minimum', Math.min(100, Math.round(selected.length / minSelected * 100)))
+    : fail('selected_corpus_minimum', [`Only ${selected.length} selected corpus item(s); target is at least ${minSelected}.`], Math.round(selected.length / minSelected * 100)))
+
+  results.push(selected.length === 0 || selectedReviewLike.length >= minReviewLike
+    ? pass('review_source_coverage', selected.length ? Math.min(100, Math.round(selectedReviewLike.length / minReviewLike * 100)) : 100)
+    : fail('review_source_coverage', [`Only ${selectedReviewLike.length} selected review/survey source(s); target is at least ${minReviewLike}. Add survey/review/systematic overview papers before synthesis.`], Math.round(selectedReviewLike.length / minReviewLike * 100)))
+
+  results.push(weakTopicSelected.length === 0
+    ? pass('topical_precision', 100)
+    : fail('topical_precision', weakTopicSelected.slice(0, 8).map((e) => `${e.id}: precision=${e.topicalPrecisionScore ?? e.relevanceScore ?? 0}; ${e.title}`), Math.max(0, 100 - weakTopicSelected.length * 10)))
+
+  const readTarget = Math.min(selected.length || minFullTextReads, minFullTextReads)
+  results.push(readTarget === 0 || selectedRead.length >= readTarget
+    ? pass('full_text_coverage', selected.length ? Math.round(selectedRead.length / selected.length * 100) : 100, highPriority.length ? [`High-priority read coverage: ${highPriorityRead.length}/${highPriority.length}.`] : [])
+    : fail('full_text_coverage', [`Only ${selectedRead.length}/${selected.length} selected item(s) read; target is at least ${readTarget}.`], selected.length ? Math.round(selectedRead.length / selected.length * 100) : 0))
+
+  results.push(failedHighPriority.length === 0
+    ? pass('high_priority_availability', 100)
+    : fail('high_priority_availability', failedHighPriority.slice(0, 8).map((e) => `${e.id}: ${e.title}; ${e.readReason ?? 'failed full-text read'}`), Math.max(0, 100 - failedHighPriority.length * 15)))
+
+  const unreadTop = selected
+    .filter((e) => e.readStatus !== 'read' && e.status !== 'read')
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+  results.push(unreadTop.length === 0 || selectedRead.length >= readTarget
+    ? pass('unread_top_sources', 100, unreadTop.length ? [`${unreadTop.length} top selected source(s) still unread but minimum read threshold is met.`] : [])
+    : fail('unread_top_sources', unreadTop.map((e) => `${e.id}: ${e.title}`), 0))
+
+  const corpusLinked = claims.filter((claim) => claim.corpusIds?.length).length
+  results.push(claims.length === 0 || corpusLinked >= Math.ceil(claims.length * 0.8)
+    ? pass('evidence_to_corpus_linkage', claims.length ? Math.round(corpusLinked / claims.length * 100) : 100)
+    : fail('evidence_to_corpus_linkage', [`Only ${corpusLinked}/${claims.length} evidence claim(s) link to stable corpus IDs.`], Math.round(corpusLinked / Math.max(1, claims.length) * 100)))
+
+  if (plan.length > 0) {
+    const missingPlan = plan.filter((item) => {
+      const assigned = selected.filter((e) => e.subQuestions?.includes(item.id))
+      const readForPlan = assigned.filter((e) => e.readStatus === 'read' || e.status === 'read')
+      const evidenceForPlan = claims.filter((c) => c.planItemId === item.id || c.topic === item.id)
+      return assigned.length === 0 || readForPlan.length === 0 || evidenceForPlan.length < evidencePerSection
+    })
+    results.push(missingPlan.length === 0
+      ? pass('plan_section_coverage', 100)
+      : fail('plan_section_coverage', missingPlan.slice(0, 8).map((i) => `${i.id}: needs selected+read sources and ${evidencePerSection} evidence row(s).`), Math.max(0, 100 - missingPlan.length * 15)))
+  }
+
+  const dateViolations = selected.filter((e) => e.screeningReason?.toLowerCase().includes('outside strict date range')).length
+  results.push(dateViolations === 0
+    ? pass('date_range_compliance', 100)
+    : fail('date_range_compliance', [`${dateViolations} selected corpus item(s) are outside the strict date range.`], 0))
+
+  const topRejected = entries.slice(0, Math.min(20, entries.length)).filter((e) => e.screeningStatus === 'rejected').length
+  results.push(topRejected <= 5
+    ? pass('noise_ratio', Math.max(0, 100 - topRejected * 10))
+    : fail('noise_ratio', [`${topRejected}/20 top-ranked corpus item(s) are rejected/noise. Re-screen corpus before reporting.`], Math.max(0, 100 - topRejected * 10)))
+
+  const quoteLinked = claims.filter((claim) => claim.quote || claim.notes?.toLowerCase().includes('abstract')).length
+  results.push(claims.length === 0 || quoteLinked >= Math.ceil(claims.length * 0.7)
+    ? pass('report_citation_coverage', claims.length ? Math.round(quoteLinked / claims.length * 100) : 100)
+    : fail('report_citation_coverage', [`Only ${quoteLinked}/${claims.length} evidence claim(s) have a quote/passage or explicit abstract-only caveat.`], Math.round(quoteLinked / Math.max(1, claims.length) * 100)))
+
+  const reportPath = path.join(researchDir(workspace, opts?.outputDir), 'report.md')
+  if (fs.existsSync(reportPath)) {
+    const report = fs.readFileSync(reportPath, 'utf-8')
+    const headings = (report.match(/^##\s+/gm) || []).length
+    const analyticalSections = [
+      /executive summary|резюме|кратк/i,
+      /method|метод|подход/i,
+      /benchmark|метрик|оценк/i,
+      /limitations|ограничен|риски/i,
+      /future|trend|направлен|тренд/i,
+    ].filter((rx) => rx.test(report)).length
+    const appendixMatch = report.search(/Evidence matrix|Selected Corpus Appendix|Приложение: selected corpus/i)
+    const appendixHeavy = appendixMatch >= 0 && appendixMatch < Math.max(800, report.length * 0.35)
+    results.push(report.length >= 6000 && headings >= 5 && analyticalSections >= 4 && !appendixHeavy
+      ? pass('final_report_structure', 100)
+      : fail('final_report_structure', [
+        `report.md must be a narrative synthesis, not a technical appendix: length=${report.length}, h2=${headings}, analytical_sections=${analyticalSections}${appendixHeavy ? ', appendix appears too early' : ''}.`,
+      ], Math.min(100, Math.round(report.length / 60))))
+  }
+
   const passed = results.filter((r) => r.passed).length
   const summary = `Quality gates: ${passed}/${results.length} passed.`
   try {
-    fs.mkdirSync(path.dirname(qualityPath(workspace)), { recursive: true })
-    fs.writeFileSync(qualityPath(workspace), JSON.stringify({ summary, results, at: Date.now() }, null, 2), 'utf-8')
+    fs.mkdirSync(path.dirname(qualityPath(workspace, opts?.outputDir)), { recursive: true })
+    fs.writeFileSync(qualityPath(workspace, opts?.outputDir), JSON.stringify({ summary, results, at: Date.now() }, null, 2), 'utf-8')
   } catch {}
   return { results, summary }
 }
 
-export function formatGateReport(workspace: string, sessionId?: string): string {
-  const { results, summary } = runQualityGates(workspace, sessionId)
+/** Persist a (possibly post-processed) set of gate results to quality-gates.json. */
+export function writeQualityGateSnapshot(workspace: string, outputDir: string | undefined, results: GateResult[]): void {
+  const passed = results.filter((r) => r.passed).length
+  const summary = `Quality gates: ${passed}/${results.length} passed.`
+  try {
+    fs.mkdirSync(path.dirname(qualityPath(workspace, outputDir)), { recursive: true })
+    fs.writeFileSync(qualityPath(workspace, outputDir), JSON.stringify({ summary, results, at: Date.now() }, null, 2), 'utf-8')
+  } catch {}
+}
+
+export function latestQualityGateFailure(workspace: string, outputDir?: string, opts?: { ignoreGates?: string[] }): string | null {
+  const snap = readQualityGateSnapshot(workspace, outputDir)
+  if (!snap || snap.allPassed) return null
+  const ignored = new Set(opts?.ignoreGates ?? [])
+  const failed = snap.failed.filter((r) => !ignored.has(r.gate))
+  if (failed.length === 0) return null
+  return failed.map((r) => `${r.gate}: ${r.blockers.join('; ') || 'failed'}`).join('\n')
+}
+
+function readQualityGateFile(workspace: string, outputDir?: string): QualityGateFile | null {
+  const p = qualityPath(workspace, outputDir)
+  if (!fs.existsSync(p)) return null
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8')) as QualityGateFile
+  } catch {
+    return null
+  }
+}
+
+export function readQualityGateSnapshot(workspace: string, outputDir?: string): {
+  passed: number
+  total: number
+  failed: GateResult[]
+  allPassed: boolean
+} | null {
+  const data = readQualityGateFile(workspace, outputDir)
+  if (!data) return null
+  const results = data.results || []
+  const failed = results.filter((r) => !r.passed)
+  const passed = results.filter((r) => r.passed).length
+  return { passed, total: results.length, failed, allPassed: failed.length === 0 && results.length > 0 }
+}
+
+/** Human-readable gate status for the chat UI (Russian). */
+export function formatQualityGateUserStatus(workspace: string, outputDir?: string): string | null {
+  const snap = readQualityGateSnapshot(workspace, outputDir)
+  if (!snap) return null
+  if (snap.allPassed) {
+    return `✅ Quality gates: ${snap.passed}/${snap.total} — все проверки пройдены. Можно (и нужно) создать report.md через generate_evidence_report.`
+  }
+  if (snap.failed.length > 0 && snap.failed.every((r) => r.gate === 'final_report_structure')) {
+    return [
+      `📝 Quality gates: **${snap.passed}/${snap.total}** — данные готовы, но текущий \`report.md\` не проходит проверку структуры.`,
+      '',
+      'Это не блокирует регенерацию отчёта: нужно вызвать `generate_evidence_report`, чтобы переписать `report.md` нормальным narrative synthesis.',
+    ].join('\n')
+  }
+  const lines = snap.failed.map((r) => {
+    const detail = r.blockers[0] || r.warnings[0] || 'не пройдено'
+    return `• **${r.gate}** — ${detail}`
+  })
+  return [
+    `⚠️ Quality gates: **${snap.passed}/${snap.total}** (не все). **report.md пока не создаётся** — generate_evidence_report заблокирован.`,
+    '',
+    'Что исправить:',
+    ...lines,
+  ].join('\n')
+}
+
+export function formatGateResults(workspace: string, sessionId: string | undefined, outputDir: string | undefined, results: GateResult[], summary: string): string {
   const lines = [`# Research Quality Gates`, '', summary, '']
   for (const r of results) {
     lines.push(`## ${r.passed ? 'PASS' : 'FAIL'} ${r.gate}${r.score !== undefined ? ` (${r.score}%)` : ''}`)
@@ -85,8 +286,19 @@ export function formatGateReport(workspace: string, sessionId?: string): string 
     if (r.blockers.length === 0 && r.warnings.length === 0) lines.push('- No issues.')
     lines.push('')
   }
-  if (loadEvidence(workspace).length > 0) {
-    lines.push('---', '', verifyClaims(workspace, sessionId))
+  if (loadEvidence(workspace, outputDir).length > 0) {
+    lines.push('---', '', verifyClaims(workspace, sessionId, outputDir))
   }
   return lines.join('\n')
+}
+
+export function formatGateReport(workspace: string, sessionId?: string, outputDir?: string): string {
+  const stored = readQualityGateFile(workspace, outputDir)
+  if (stored?.results?.length) {
+    const summary = stored.summary || `Quality gates: ${stored.results.filter((r) => r.passed).length}/${stored.results.length} passed.`
+    return formatGateResults(workspace, sessionId, outputDir, stored.results, summary)
+  }
+
+  const { results, summary } = runQualityGates(workspace, sessionId, { outputDir })
+  return formatGateResults(workspace, sessionId, outputDir, results, summary)
 }

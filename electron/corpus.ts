@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import type { Source } from './sources'
+import { resolveResearchDir } from '../research-paths'
 
 export interface CorpusEntry {
   id: string
@@ -15,7 +16,21 @@ export interface CorpusEntry {
   date?: string
   sourceTool?: string
   snippet?: string
+  venue?: string
+  citationCount?: number
+  publicationType?: 'survey' | 'review' | 'benchmark' | 'method' | 'tool' | 'safety' | 'background' | 'unknown'
   tier: 'primary' | 'secondary' | 'background'
+  screeningStatus?: 'raw' | 'selected' | 'rejected' | 'needs_review'
+  screeningReason?: string
+  relevanceScore?: number
+  recencyScore?: number
+  authorityScore?: number
+  topicalPrecisionScore?: number
+  readPriority?: 'high' | 'medium' | 'low'
+  subQuestions?: string[]
+  readStatus?: 'not_read' | 'queued' | 'read' | 'failed'
+  readAt?: number
+  readReason?: string
   status: 'candidate' | 'queued_full_text' | 'read' | 'rejected'
   score: number
   tags: string[]
@@ -27,18 +42,37 @@ export interface CorpusEntry {
 export interface CorpusStats {
   total: number
   primary: number
+  selected: number
+  rejected: number
+  needsReview: number
   queuedFullText: number
   read: number
+  failed: number
   withDoi: number
   withArxiv: number
+  selectedRead: number
+  highPriority: number
+  highPriorityRead: number
+  reviewLike: number
+  selectedReviewLike: number
+  highCitation: number
 }
 
-function researchDir(workspace: string): string {
-  return path.join(workspace, '.research')
+export interface CorpusScreenOptions {
+  question: string
+  subQuestions?: string[]
+  yearFrom?: number
+  yearTo?: number
+  maxSelected?: number
+  strictDateRange?: boolean
 }
 
-export function corpusPath(workspace: string): string {
-  return path.join(researchDir(workspace), 'corpus.jsonl')
+function researchDir(workspace: string, outputDir?: string): string {
+  return resolveResearchDir(workspace, outputDir)
+}
+
+export function corpusPath(workspace: string, outputDir?: string): string {
+  return path.join(researchDir(workspace, outputDir), 'corpus.jsonl')
 }
 
 function normalizeTitle(title: string): string {
@@ -55,10 +89,12 @@ export function extractDoi(text: string): string | undefined {
 }
 
 export function extractArxivId(text: string): string | undefined {
-  const arxiv = text.match(/\b(?:arXiv:)?(\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+\/\d{7}(?:v\d+)?)\b/i)?.[1]
-  if (arxiv) return arxiv
   const url = text.match(/arxiv\.org\/(?:abs|pdf|html)\/([^?\s#]+)/i)?.[1]
-  return url?.replace(/\.pdf$/i, '')
+  if (url) return url.replace(/\.pdf$/i, '')
+  const explicit = text.match(/\barxiv\s*:\s*([a-z-]+\/\d{7}(?:v\d+)?|\d{4}\.\d{4,5}(?:v\d+)?)\b/i)?.[1]
+  if (explicit) return explicit
+  const doiArxiv = text.match(/\b10\.48550\/arxiv\.([a-z-]+\/\d{7}(?:v\d+)?|\d{4}\.\d{4,5}(?:v\d+)?)\b/i)?.[1]
+  return doiArxiv
 }
 
 export function extractPmid(text: string): string | undefined {
@@ -73,19 +109,32 @@ function keyFor(entry: Pick<CorpusEntry, 'doi' | 'arxivId' | 'pmid' | 'url' | 't
   return `title:${normalizeTitle(entry.title)}`
 }
 
-export function loadCorpus(workspace: string): CorpusEntry[] {
-  const p = corpusPath(workspace)
+export function loadCorpus(workspace: string, outputDir?: string): CorpusEntry[] {
+  const p = corpusPath(workspace, outputDir)
   if (!fs.existsSync(p)) return []
   try {
     return fs.readFileSync(p, 'utf-8')
       .split('\n')
       .filter(Boolean)
-      .map((line) => JSON.parse(line) as CorpusEntry)
+      .map((line) => normalizeEntry(JSON.parse(line) as CorpusEntry))
   } catch { return [] }
 }
 
-export function saveCorpus(workspace: string, entries: CorpusEntry[]): void {
-  const p = corpusPath(workspace)
+function normalizeEntry(entry: CorpusEntry): CorpusEntry {
+  const readStatus = entry.readStatus
+    ?? (entry.status === 'read' ? 'read' : entry.status === 'queued_full_text' ? 'queued' : entry.status === 'rejected' ? 'failed' : 'not_read')
+  const screeningStatus = entry.screeningStatus ?? (entry.status === 'rejected' ? 'rejected' : 'raw')
+  return {
+    ...entry,
+    publicationType: entry.publicationType ?? classifyPublicationType(entry),
+    screeningStatus,
+    readStatus,
+    subQuestions: Array.isArray(entry.subQuestions) ? entry.subQuestions : [],
+  }
+}
+
+export function saveCorpus(workspace: string, entries: CorpusEntry[], outputDir?: string): void {
+  const p = corpusPath(workspace, outputDir)
   fs.mkdirSync(path.dirname(p), { recursive: true })
   const sorted = [...entries].sort((a, b) => b.score - a.score || b.updatedAt - a.updatedAt)
   fs.writeFileSync(p, sorted.map((e) => JSON.stringify(e)).join('\n') + (sorted.length ? '\n' : ''), 'utf-8')
@@ -97,9 +146,19 @@ function scoreEntry(entry: CorpusEntry): number {
   if (entry.arxivId) score += 12
   if (entry.pmid) score += 12
   if (entry.url.includes('arxiv.org') || entry.url.includes('doi.org') || entry.url.includes('pubmed')) score += 8
+  if ((entry.citationCount ?? 0) >= 50) score += 8
+  if ((entry.citationCount ?? 0) >= 200) score += 8
+  if (entry.publicationType === 'survey' || entry.publicationType === 'review') score += 12
+  if ((entry.topicalPrecisionScore ?? 0) < 35) score -= 20
   if (entry.snippet && entry.snippet.length > 80) score += 5
   if (entry.year && entry.year >= new Date().getFullYear() - 1) score += 6
   if (entry.tier === 'primary') score += 10
+  score += Math.round(entry.relevanceScore ?? 0)
+  score += Math.round((entry.authorityScore ?? 0) / 2)
+  score += Math.round((entry.recencyScore ?? 0) / 2)
+  if (entry.screeningStatus === 'selected') score += 20
+  if (entry.readPriority === 'high') score += 8
+  if (entry.screeningStatus === 'rejected') score -= 100
   return score
 }
 
@@ -109,6 +168,8 @@ export function sourceToCorpusEntry(source: Source | Omit<Source, 'idx'>, tags: 
   const doi = extractDoi(text)
   const arxivId = extractArxivId(text)
   const pmid = extractPmid(text)
+  const venue = extractLineValue(text, 'Venue')
+  const citationCount = extractNumberLineValue(text, 'Citations')
   const year = Number(String(source.date ?? '').match(/\b(19|20)\d{2}\b/)?.[0]) || undefined
   const tier: CorpusEntry['tier'] = source.sourceTool?.includes('web') ? 'secondary' : 'primary'
   const id = slugHash(keyFor({ title: source.title, url: source.url, doi, arxivId, pmid }))
@@ -120,17 +181,24 @@ export function sourceToCorpusEntry(source: Source | Omit<Source, 'idx'>, tags: 
     arxivId,
     pmid,
     authors: source.authors,
+    venue,
+    citationCount,
     year,
     date: source.date,
     sourceTool: source.sourceTool,
     snippet: source.snippet,
     tier,
+    publicationType: 'unknown',
+    screeningStatus: 'raw',
+    readStatus: 'not_read',
+    subQuestions: [],
     status: 'candidate',
     score: 0,
     tags,
     addedAt: now,
     updatedAt: now,
   }
+  entry.publicationType = classifyPublicationType(entry)
   entry.score = scoreEntry(entry)
   return entry
 }
@@ -163,38 +231,52 @@ export function mergeCorpusEntries(existing: CorpusEntry[], incoming: CorpusEntr
   return { entries: [...byKey.values()], added, updated }
 }
 
-export function addSourcesToCorpus(workspace: string, sources: Array<Source | Omit<Source, 'idx'>>, tags: string[] = []): { entries: CorpusEntry[]; added: number; updated: number } {
-  const existing = loadCorpus(workspace)
+export function addSourcesToCorpus(workspace: string, sources: Array<Source | Omit<Source, 'idx'>>, tags: string[] = [], outputDir?: string): { entries: CorpusEntry[]; added: number; updated: number } {
+  const existing = loadCorpus(workspace, outputDir)
   const incoming = sources.filter((s) => s.title && s.url).map((s) => sourceToCorpusEntry(s, tags))
   const merged = mergeCorpusEntries(existing, incoming)
-  saveCorpus(workspace, merged.entries)
+  saveCorpus(workspace, merged.entries, outputDir)
   return merged
 }
 
-export function corpusStats(workspace: string): CorpusStats {
-  const entries = loadCorpus(workspace)
+export function corpusStats(workspace: string, outputDir?: string): CorpusStats {
+  const entries = loadCorpus(workspace, outputDir)
+  const selected = entries.filter((e) => e.screeningStatus === 'selected')
+  const highPriority = entries.filter((e) => e.screeningStatus === 'selected' && e.readPriority === 'high')
   return {
     total: entries.length,
     primary: entries.filter((e) => e.tier === 'primary').length,
-    queuedFullText: entries.filter((e) => e.status === 'queued_full_text').length,
-    read: entries.filter((e) => e.status === 'read').length,
+    selected: selected.length,
+    rejected: entries.filter((e) => e.screeningStatus === 'rejected').length,
+    needsReview: entries.filter((e) => e.screeningStatus === 'needs_review').length,
+    queuedFullText: entries.filter((e) => e.readStatus === 'queued' || e.status === 'queued_full_text').length,
+    read: entries.filter((e) => e.readStatus === 'read' || e.status === 'read').length,
+    failed: entries.filter((e) => e.readStatus === 'failed').length,
     withDoi: entries.filter((e) => !!e.doi).length,
     withArxiv: entries.filter((e) => !!e.arxivId).length,
+    selectedRead: selected.filter((e) => e.readStatus === 'read' || e.status === 'read').length,
+    highPriority: highPriority.length,
+    highPriorityRead: highPriority.filter((e) => e.readStatus === 'read' || e.status === 'read').length,
+    reviewLike: entries.filter(isReviewLike).length,
+    selectedReviewLike: selected.filter(isReviewLike).length,
+    highCitation: entries.filter((e) => (e.citationCount ?? 0) >= 50).length,
   }
 }
 
-export function listCorpus(workspace: string, max = 20): string {
-  const entries = loadCorpus(workspace).slice(0, Math.max(1, Math.min(100, max)))
+export function listCorpus(workspace: string, max = 20, outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir).slice(0, Math.max(1, Math.min(100, max)))
   if (entries.length === 0) return 'Corpus is empty. Use build_corpus or add_to_corpus after search.'
-  const stats = corpusStats(workspace)
+  const stats = corpusStats(workspace, outputDir)
   const lines = [`Corpus: ${stats.total} items (${stats.primary} primary, ${stats.queuedFullText} queued full text, ${stats.read} read)\n`]
   entries.forEach((e, i) => {
     lines.push([
       `${i + 1}. ${e.title}`,
-      `   ID: ${e.id} | score=${e.score} | ${e.tier} | ${e.status}`,
+      `   ID: ${e.id} | score=${e.score} | ${e.tier} | screen=${e.screeningStatus ?? 'raw'} | read=${e.readStatus ?? e.status}`,
       e.year ? `   Year: ${e.year}` : null,
       e.doi ? `   DOI: ${e.doi}` : null,
       e.arxivId ? `   arXiv: ${e.arxivId}` : null,
+      e.citationCount !== undefined ? `   Citations: ${e.citationCount}` : null,
+      e.publicationType ? `   Type: ${e.publicationType}` : null,
       `   URL: ${e.url}`,
       e.snippet ? `   Snippet: ${e.snippet.slice(0, 220)}` : null,
     ].filter(Boolean).join('\n'))
@@ -202,25 +284,281 @@ export function listCorpus(workspace: string, max = 20): string {
   return lines.join('\n\n')
 }
 
-export function queueFullText(workspace: string, ids?: string[]): string {
-  const entries = loadCorpus(workspace)
+export function queueFullText(workspace: string, ids?: string[], outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir)
   const wanted = new Set((ids || []).map(String))
   let changed = 0
   for (const e of entries) {
     if (wanted.size === 0 || wanted.has(e.id)) {
       if (e.status === 'candidate') {
         e.status = 'queued_full_text'
+        e.readStatus = 'queued'
         e.updatedAt = Date.now()
         changed++
       }
     }
   }
-  saveCorpus(workspace, entries)
+  saveCorpus(workspace, entries, outputDir)
   return `Queued ${changed} corpus item(s) for full-text reading.`
 }
 
-export function rankCorpus(workspace: string): string {
-  const entries = loadCorpus(workspace).map((e) => ({ ...e, score: scoreEntry(e), updatedAt: Date.now() }))
-  saveCorpus(workspace, entries)
-  return listCorpus(workspace, 30)
+export function rankCorpus(workspace: string, outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir).map((e) => ({ ...e, score: scoreEntry(e), updatedAt: Date.now() }))
+  saveCorpus(workspace, entries, outputDir)
+  return listCorpus(workspace, 30, outputDir)
+}
+
+function tokenizeQuery(text: string): string[] {
+  const stop = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'about', 'какие', 'какой', 'как', 'что', 'для', 'или', 'это', 'over', 'last'])
+  return String(text || '').toLowerCase()
+    .replace(/[^a-z0-9а-яё+.-]+/gi, ' ')
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3 && !stop.has(t))
+}
+
+function extractLineValue(text: string, label: string): string | undefined {
+  return text.match(new RegExp(`^\\s*${label}:\\s*(.+)$`, 'im'))?.[1]?.trim()
+}
+
+function extractNumberLineValue(text: string, label: string): number | undefined {
+  const value = extractLineValue(text, label)
+  if (!value) return undefined
+  const n = Number(value.replace(/[^\d.-]+/g, ''))
+  return Number.isFinite(n) ? n : undefined
+}
+
+function classifyPublicationType(entry: Pick<CorpusEntry, 'title' | 'snippet' | 'venue' | 'url'>): CorpusEntry['publicationType'] {
+  const text = `${entry.title} ${entry.snippet ?? ''} ${entry.venue ?? ''} ${entry.url ?? ''}`.toLowerCase()
+  if (/\b(systematic\s+review|meta[- ]analysis|survey|review|overview|state[- ]of[- ]the[- ]art)\b/i.test(text)) return /survey/i.test(text) ? 'survey' : 'review'
+  if (/\bbenchmark|leaderboard|evaluation suite|dataset\b/i.test(text)) return 'benchmark'
+  if (/\bframework|library|toolkit|open-source|github|trl|openrlhf|verl|vllm\b/i.test(text)) return 'tool'
+  if (/\bsafety|alignment|poison|bias|jailbreak|harm|robustness\b/i.test(text)) return 'safety'
+  if (/\bmethod|approach|algorithm|training|optimization|fine[- ]tuning|post[- ]training\b/i.test(text)) return 'method'
+  return 'unknown'
+}
+
+export function isReviewLike(entry: Pick<CorpusEntry, 'publicationType' | 'title' | 'snippet'>): boolean {
+  return entry.publicationType === 'survey'
+    || entry.publicationType === 'review'
+    || /\b(survey|review|overview|systematic|meta[- ]analysis|state[- ]of[- ]the[- ]art)\b/i.test(`${entry.title} ${entry.snippet ?? ''}`)
+}
+
+function topicPrecisionFor(entry: CorpusEntry, queryText: string): { score: number; blockers: string[] } {
+  const text = `${entry.title} ${entry.snippet ?? ''} ${entry.tags?.join(' ') ?? ''}`.toLowerCase()
+  const query = queryText.toLowerCase()
+  const wantsLlm = /\b(llm|large language model|language models?|chatgpt|reasoning model|post-training|post training)\b/i.test(query)
+  const wantsRl = /\b(reinforcement learning|rlhf|rlvr|grpo|dpo|ppo|rloo|\brl\b|reward|policy optimization|preference optimization)\b/i.test(query)
+  const hasLlm = /\b(llm|large language model|language models?|chatgpt|reasoning model|post-training|post training)\b/i.test(text)
+  const hasRl = /\b(reinforcement learning|rlhf|rlvr|grpo|dpo|ppo|rloo|\brl\b|reward|policy optimization|preference optimization)\b/i.test(text)
+  const blockers: string[] = []
+  let score = 50
+  if (wantsLlm) score += hasLlm ? 25 : -30
+  if (wantsRl) score += hasRl ? 30 : -35
+  if (wantsLlm && wantsRl && !(hasLlm && hasRl)) blockers.push('Missing required RL+LLM topical intersection')
+  if (/\b(vulnerability|chemistry|speech synthesis|image restoration|constructional semantics|medical applications|gravitational waves)\b/i.test(text)) {
+    score -= 30
+    blockers.push('Likely off-topic for requested research scope')
+  }
+  return { score: Math.max(0, Math.min(100, score)), blockers }
+}
+
+function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
+  const text = `${entry.title} ${entry.snippet ?? ''} ${entry.authors ?? ''}`.toLowerCase()
+  const matched = [...new Set(terms.filter((t) => text.includes(t)))]
+  const rlBoost = ['reinforcement', 'learning', 'rl', 'rlhf', 'dpo', 'ppo', 'reward', 'policy', 'q-learning', 'offline', 'safe', 'robot', 'marl', 'agent', 'verifiable'].filter((t) => text.includes(t))
+  const subQs = subQuestions
+    .map((q, i) => ({ id: `Q${i + 1}`, hits: tokenizeQuery(q).filter((t) => text.includes(t)).length }))
+    .filter((x) => x.hits > 0)
+    .sort((a, b) => b.hits - a.hits)
+    .slice(0, 3)
+    .map((x) => x.id)
+  const precision = topicPrecisionFor(entry, queryText)
+  return {
+    score: Math.min(100, matched.length * 7 + rlBoost.length * 8 + subQs.length * 8 + Math.round(precision.score * 0.25)),
+    matched,
+    subQs,
+    topicalPrecision: precision.score,
+    blockers: precision.blockers,
+  }
+}
+
+function recencyFor(entry: CorpusEntry, yearFrom?: number, yearTo?: number): number {
+  if (!entry.year) return 20
+  if (yearFrom && entry.year < yearFrom) return 0
+  if (yearTo && entry.year > yearTo) return 20
+  const current = new Date().getFullYear()
+  return Math.max(15, Math.min(100, 100 - Math.max(0, current - entry.year) * 12))
+}
+
+function authorityFor(entry: CorpusEntry): number {
+  let score = 20
+  if (entry.doi) score += 20
+  if (entry.arxivId) score += 20
+  if ((entry.citationCount ?? 0) >= 25) score += 10
+  if ((entry.citationCount ?? 0) >= 100) score += 10
+  if (isReviewLike(entry)) score += 20
+  if (/benchmark|nature|neurips|iclr|icml|acl|emnlp|naacl|science/i.test(`${entry.title} ${entry.snippet ?? ''} ${entry.venue ?? ''}`)) score += 20
+  if (/openalex|semantic|crossref|pubmed|arxiv/i.test(entry.sourceTool ?? '')) score += 10
+  return Math.min(100, score)
+}
+
+export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir)
+  if (entries.length === 0) return 'Corpus is empty. Build corpus before screening.'
+  const queryText = [opts.question, ...(opts.subQuestions || [])].join(' ')
+  const terms = tokenizeQuery(queryText)
+  const maxSelected = Math.max(1, Math.min(100, Number(opts.maxSelected) || 30))
+  const screened = entries.map((entry) => {
+    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText)
+    const recency = recencyFor(entry, opts.yearFrom, opts.yearTo)
+    const publicationType = classifyPublicationType(entry)
+    const withType = { ...entry, publicationType }
+    const authority = authorityFor(withType)
+    const outsideDate = Boolean(opts.strictDateRange && entry.year && ((opts.yearFrom && entry.year < opts.yearFrom) || (opts.yearTo && entry.year > opts.yearTo)))
+    const lowPrecision = rel.topicalPrecision < 45 || rel.blockers.length > 0
+    const selectedScore = rel.score * 0.55 + recency * 0.2 + authority * 0.25
+    const updated: CorpusEntry = {
+      ...entry,
+      publicationType,
+      relevanceScore: Math.round(rel.score),
+      recencyScore: Math.round(recency),
+      authorityScore: Math.round(authority),
+      topicalPrecisionScore: Math.round(rel.topicalPrecision),
+      subQuestions: rel.subQs.length ? rel.subQs : entry.subQuestions ?? [],
+      screeningStatus: outsideDate || rel.score < 18 || rel.topicalPrecision < 25 ? 'rejected' : lowPrecision ? 'needs_review' : selectedScore >= 42 ? 'selected' : 'needs_review',
+      screeningReason: outsideDate
+        ? `Outside strict date range ${opts.yearFrom ?? '*'}-${opts.yearTo ?? '*'}`
+        : rel.blockers.length
+          ? `${rel.blockers.join('; ')}; matched: ${rel.matched.join(', ') || 'none'}`
+        : rel.score < 18
+          ? `Low topic relevance; matched: ${rel.matched.join(', ') || 'none'}`
+          : `Selected score ${Math.round(selectedScore)}; precision ${Math.round(rel.topicalPrecision)}; type=${publicationType}; citations=${entry.citationCount ?? 'unknown'}; matched: ${rel.matched.slice(0, 8).join(', ') || 'semantic/context'}`,
+      readPriority: selectedScore >= 62 && rel.topicalPrecision >= 60 ? 'high' : selectedScore >= 44 ? 'medium' : 'low',
+      readStatus: entry.readStatus ?? (entry.status === 'read' ? 'read' : 'not_read'),
+      updatedAt: Date.now(),
+    }
+    updated.score = scoreEntry(updated)
+    return updated
+  }).sort((a, b) => b.score - a.score)
+
+  let selectedCount = 0
+  for (const entry of screened) {
+    if (entry.screeningStatus === 'selected') {
+      selectedCount++
+      if (selectedCount > maxSelected) {
+        entry.screeningStatus = 'needs_review'
+        entry.screeningReason = `Below top ${maxSelected} selected cutoff. ${entry.screeningReason ?? ''}`.trim()
+        entry.readPriority = 'low'
+        entry.score = scoreEntry(entry)
+      }
+    }
+  }
+  saveCorpus(workspace, screened, outputDir)
+  const stats = corpusStats(workspace, outputDir)
+  return [
+    `Screened ${screened.length} corpus item(s).`,
+    `Selected: ${stats.selected}; needs review: ${stats.needsReview}; rejected: ${stats.rejected}.`,
+    `Review/survey coverage: ${stats.selectedReviewLike}/${stats.selected} selected.`,
+    '',
+    listSelectedCorpus(workspace, 30, outputDir),
+  ].join('\n')
+}
+
+export function listSelectedCorpus(workspace: string, max = 30, outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir)
+    .filter((e) => e.screeningStatus === 'selected')
+    .sort((a, b) => (b.score - a.score) || ((b.relevanceScore ?? 0) - (a.relevanceScore ?? 0)))
+    .slice(0, Math.max(1, Math.min(100, max)))
+  if (entries.length === 0) return 'No selected corpus items. Run screen_corpus first.'
+  return entries.map((e, i) => [
+    `${i + 1}. ${e.title}`,
+    `   ID: ${e.id} | score=${e.score} | relevance=${e.relevanceScore ?? '-'} | priority=${e.readPriority ?? 'low'} | read=${e.readStatus ?? 'not_read'}`,
+    `   Type: ${e.publicationType ?? 'unknown'} | precision=${e.topicalPrecisionScore ?? '-'} | citations=${e.citationCount ?? 'unknown'}`,
+    e.subQuestions?.length ? `   Plan: ${e.subQuestions.join(', ')}` : null,
+    e.year ? `   Year: ${e.year}` : null,
+    `   URL: ${e.url}`,
+    e.screeningReason ? `   Reason: ${e.screeningReason}` : null,
+  ].filter(Boolean).join('\n')).join('\n\n')
+}
+
+export function rejectCorpusItems(workspace: string, idsRaw: string, reason = 'Rejected by user/tool', outputDir?: string): string {
+  const ids = new Set(String(idsRaw || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean))
+  if (ids.size === 0) return 'Error: provide one or more corpus IDs.'
+  const entries = loadCorpus(workspace, outputDir)
+  let changed = 0
+  for (const e of entries) {
+    if (ids.has(e.id)) {
+      e.screeningStatus = 'rejected'
+      e.status = 'rejected'
+      e.readStatus = 'failed'
+      e.screeningReason = reason
+      e.updatedAt = Date.now()
+      e.score = scoreEntry(e)
+      changed++
+    }
+  }
+  saveCorpus(workspace, entries, outputDir)
+  return `Rejected ${changed} corpus item(s).`
+}
+
+export function assignCorpusToPlan(workspace: string, idsRaw: string, planItemId: string, outputDir?: string): string {
+  const ids = new Set(String(idsRaw || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean))
+  const planId = String(planItemId || '').trim()
+  if (ids.size === 0 || !planId) return 'Error: ids and plan_item_id are required.'
+  const entries = loadCorpus(workspace, outputDir)
+  let changed = 0
+  for (const e of entries) {
+    if (ids.has(e.id)) {
+      e.subQuestions = [...new Set([...(e.subQuestions || []), planId])]
+      e.screeningStatus = e.screeningStatus === 'rejected' ? 'needs_review' : 'selected'
+      e.updatedAt = Date.now()
+      e.score = scoreEntry(e)
+      changed++
+    }
+  }
+  saveCorpus(workspace, entries, outputDir)
+  return `Assigned ${changed} corpus item(s) to ${planId}.`
+}
+
+export function selectFullTextBatch(workspace: string, limit = 12, outputDir?: string): CorpusEntry[] {
+  return loadCorpus(workspace, outputDir)
+    .filter((e) => e.screeningStatus === 'selected' && e.readStatus !== 'read' && e.readStatus !== 'failed')
+    .sort((a, b) => {
+      const prio = (x: CorpusEntry) => x.readPriority === 'high' ? 3 : x.readPriority === 'medium' ? 2 : 1
+      return prio(b) - prio(a) || b.score - a.score
+    })
+    .slice(0, Math.max(1, Math.min(50, Number(limit) || 12)))
+}
+
+export function markCorpusItemRead(workspace: string, id: string, localPath: string | undefined, readStatus: 'read' | 'failed', reason?: string, outputDir?: string): CorpusEntry | null {
+  const entries = loadCorpus(workspace, outputDir)
+  const entry = entries.find((e) => e.id === id)
+  if (!entry) return null
+  entry.readStatus = readStatus
+  entry.status = readStatus === 'read' ? 'read' : entry.status
+  entry.localPath = localPath ?? entry.localPath
+  entry.readReason = reason
+  entry.readAt = Date.now()
+  entry.updatedAt = Date.now()
+  entry.score = scoreEntry(entry)
+  saveCorpus(workspace, entries, outputDir)
+  return entry
+}
+
+export function fullTextStatus(workspace: string, outputDir?: string): string {
+  const entries = loadCorpus(workspace, outputDir).filter((e) => e.screeningStatus === 'selected')
+  if (entries.length === 0) return 'No selected corpus items. Run screen_corpus first.'
+  const read = entries.filter((e) => e.readStatus === 'read').length
+  const failed = entries.filter((e) => e.readStatus === 'failed').length
+  const high = entries.filter((e) => e.readPriority === 'high')
+  const highRead = high.filter((e) => e.readStatus === 'read').length
+  const lines = [
+    `Full-text status: ${read}/${entries.length} selected read; ${failed} failed; high-priority ${highRead}/${high.length} read.`,
+    '',
+  ]
+  for (const e of entries.slice(0, 40)) {
+    lines.push(`- ${e.id} [${e.readPriority ?? 'low'} / ${e.readStatus ?? 'not_read'}] ${e.title}${e.localPath ? ` -> ${e.localPath}` : ''}${e.readReason ? ` (${e.readReason})` : ''}`)
+  }
+  return lines.join('\n')
 }

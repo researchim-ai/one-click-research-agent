@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import { resolveResearchDir } from '../research-paths'
 
 export interface PlanItem {
   id: string
@@ -9,15 +10,19 @@ export interface PlanItem {
   children: PlanItem[]
 }
 
-export function planPath(workspacePath: string): string {
-  return path.join(workspacePath, '.research', 'plan.md')
+function safeResearchDir(workspacePath: string, outputDir?: string): string {
+  return resolveResearchDir(workspacePath, outputDir)
+}
+
+export function planPath(workspacePath: string, outputDir?: string): string {
+  return path.join(safeResearchDir(workspacePath, outputDir), 'plan.md')
 }
 
 /**
  * Create or overwrite plan.md with a structured, checkable plan.
  */
-export function writePlan(workspacePath: string, question: string, subQuestions: string[]): string {
-  const p = planPath(workspacePath)
+export function writePlan(workspacePath: string, question: string, subQuestions: string[], outputDir?: string): string {
+  const p = planPath(workspacePath, outputDir)
   fs.mkdirSync(path.dirname(p), { recursive: true })
   const lines: string[] = []
   lines.push(`# Research Plan: ${question}`)
@@ -38,8 +43,8 @@ export function writePlan(workspacePath: string, question: string, subQuestions:
 /**
  * Parse plan.md checkboxes into a hierarchical structure.
  */
-export function parsePlan(workspacePath: string): PlanItem[] {
-  const p = planPath(workspacePath)
+export function parsePlan(workspacePath: string, outputDir?: string): PlanItem[] {
+  const p = planPath(workspacePath, outputDir)
   if (!fs.existsSync(p)) return []
   const text = fs.readFileSync(p, 'utf-8')
   const lines = text.split('\n')
@@ -64,8 +69,8 @@ export function parsePlan(workspacePath: string): PlanItem[] {
 /**
  * Toggle a checkbox by item id in-place.
  */
-export function updatePlanItem(workspacePath: string, itemId: string, done: boolean): boolean {
-  const p = planPath(workspacePath)
+export function updatePlanItem(workspacePath: string, itemId: string, done: boolean, outputDir?: string): boolean {
+  const p = planPath(workspacePath, outputDir)
   if (!fs.existsSync(p)) return false
   const text = fs.readFileSync(p, 'utf-8')
   const lines = text.split('\n')

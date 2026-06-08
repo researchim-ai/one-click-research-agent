@@ -47,7 +47,7 @@ export interface DownloadProgress {
 }
 
 export interface AgentEvent {
-  type: 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'command_approval' | 'context_usage' | 'new_turn' | 'tool_streaming' | 'stream_stats'
+  type: 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'command_approval' | 'context_usage' | 'new_turn' | 'tool_streaming' | 'stream_stats' | 'open_file' | 'agent_activity'
   content?: string
   name?: string
   args?: Record<string, unknown>
@@ -56,6 +56,7 @@ export interface AgentEvent {
   approvalId?: string
   toolStreamPath?: string
   toolStreamContent?: string
+  filePath?: string
   contextUsage?: {
     usedTokens: number
     budgetTokens: number
@@ -64,6 +65,25 @@ export interface AgentEvent {
   }
   /** Tokens per second from last completed stream (emitted after each LLM response). */
   tokensPerSecond?: number
+  /** Live agent phase for the activity bar (session load, GPU inference, tools, etc.). */
+  activity?: AgentActivity
+}
+
+export type AgentActivityPhase =
+  | 'starting'
+  | 'session_save'
+  | 'session_load'
+  | 'resume_checkpoint'
+  | 'context_compress'
+  | 'llm_queue'
+  | 'llm_generate'
+  | 'tool_exec'
+  | 'done'
+
+export interface AgentActivity {
+  phase: AgentActivityPhase
+  label: string
+  detail?: string
 }
 
 export interface AppStatus {

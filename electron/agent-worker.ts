@@ -101,8 +101,23 @@ parentPort.on('message', async (msg: any) => {
     const { message, workspace, config, session: payloadSession, apiUrl, ctxSize, sessionPath } = msg.payload
     let session: Session
     if (sessionPath) {
+      parentPort!.postMessage({
+        type: 'emit',
+        event: { type: 'agent_activity', activity: { phase: 'session_load', label: 'Читаю сессию агента…' } },
+      })
       const raw = await fs.promises.readFile(sessionPath, 'utf-8')
       session = JSON.parse(raw) as Session
+      parentPort!.postMessage({
+        type: 'emit',
+        event: {
+          type: 'agent_activity',
+          activity: {
+            phase: 'session_load',
+            label: 'Сессия загружена',
+            detail: `${session.messages.length} сообщений в памяти агента`,
+          },
+        },
+      })
     } else {
       session = payloadSession
     }

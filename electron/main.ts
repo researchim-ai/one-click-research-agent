@@ -53,7 +53,14 @@ import * as tsService from './ts-service'
 import * as pyResolve from './py-resolve'
 import * as git from './git'
 import * as recentWorkspaces from './recent-workspaces'
-import type { ToolInfo } from './types'
+import type { ToolInfo, AgentActivity } from './types'
+import { isResearchResumeMessage, compactSessionForWorkerResume } from './research-resume'
+
+const SEND_MESSAGE_TIMEOUT_MS = 20 * 60 * 1000
+
+function emitAgentActivity(activity: AgentActivity): void {
+  try { mainWindow?.webContents.send('agent-event', { type: 'agent_activity', activity }) } catch {}
+}
 
 let mainWindow: BrowserWindow | null = null
 let agentWorker: Worker | null = null
@@ -61,6 +68,86 @@ let pendingSendResolve: ((result: string) => void) | null = null
 
 const WORKSPACE_CHANGED_DEBOUNCE_MS = 1200
 let workspaceChangedTimer: ReturnType<typeof setTimeout> | null = null
+
+function extractJsonObject(text: string): any | null {
+  const raw = String(text || '').trim()
+  try { return JSON.parse(raw) } catch {}
+  const match = raw.match(/\{[\s\S]*\}/)
+  if (!match) return null
+  try { return JSON.parse(match[0]) } catch { return null }
+}
+
+async function inferResearchRequest(payload: any): Promise<{ patch?: Record<string, any>; error?: string }> {
+  const message = String(payload?.message ?? '').trim()
+  if (!message) return { patch: {} }
+  if (!serverManager.isRunning()) return { error: 'llama-server is not running' }
+  const profiles = Array.isArray(payload?.profiles) ? payload.profiles : []
+  const draft = payload?.draft ?? {}
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), 12000)
+  try {
+    const res = await fetch(`${serverManager.llamaApiUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        model: 'local',
+        temperature: 0.1,
+        max_tokens: 500,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              'You extract parameters for a research-run UI. Return ONLY compact JSON with a top-level "patch" object.',
+              'Allowed patch keys: topic, profileId, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
+              'Allowed modes: quick, deep, systematic, reproduction, idea-scout.',
+              'Allowed dateRange: any, last-year, last-2-years, since-2024, custom.',
+              'Allowed reportLanguage: ru, en.',
+              'Do not invent a topic if the user did not provide one. Preserve user language intent.',
+            ].join('\n'),
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({
+              message,
+              currentDraft: draft,
+              appLanguage: payload?.appLanguage ?? config.get('appLanguage'),
+              profiles,
+            }),
+          },
+        ],
+      }),
+    })
+    if (!res.ok) return { error: `HTTP ${res.status}` }
+    const data = await res.json()
+    const content = String(data?.choices?.[0]?.message?.content ?? '')
+    const parsed = extractJsonObject(content)
+    const patch = parsed?.patch && typeof parsed.patch === 'object' ? parsed.patch : parsed && typeof parsed === 'object' ? parsed : {}
+    return { patch: sanitizeResearchPatch(patch) }
+  } catch (e: any) {
+    return { error: String(e?.message || e) }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function sanitizeResearchPatch(raw: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {}
+  const strings = ['topic', 'profileId', 'mode', 'dateRange', 'customDateRange', 'reportLanguage', 'extraDirections']
+  for (const key of strings) {
+    if (typeof raw[key] === 'string' && raw[key].trim()) out[key] = raw[key].trim()
+  }
+  for (const key of ['maxSources', 'minSelectedSources', 'minFullTextReads', 'evidencePerSection']) {
+    const n = Number(raw[key])
+    if (Number.isFinite(n)) out[key] = Math.trunc(n)
+  }
+  for (const key of ['needFullText', 'strictDateRange', 'requireQualityPass']) {
+    if (typeof raw[key] === 'boolean') out[key] = raw[key]
+  }
+  if (Array.isArray(raw.outputs)) out.outputs = raw.outputs.map(String).filter(Boolean)
+  if (Array.isArray(raw.checkpoints)) out.checkpoints = raw.checkpoints.map(String).filter(Boolean)
+  return out
+}
 
 function scheduleWorkspaceChangedNotify(): void {
   if (workspaceChangedTimer) clearTimeout(workspaceChangedTimer)
@@ -532,9 +619,34 @@ function registerIpcHandlers() {
   ipcMain.handle('send-message', async (_e, msg: string, workspace: string) => {
     if (!mainWindow) throw new Error('No window')
     return new Promise<string>((resolve) => {
-      pendingSendResolve = resolve
+      const timer = setTimeout(() => {
+        if (!pendingSendResolve) return
+        agentWorker?.postMessage({ type: 'cancel' })
+        pendingSendResolve('Error: Агент не ответил за 20 минут. Нажмите «Стоп» и отправьте «продолжай» снова.')
+        pendingSendResolve = null
+      }, SEND_MESSAGE_TIMEOUT_MS)
+
+      pendingSendResolve = (result: string) => {
+        clearTimeout(timer)
+        resolve(result)
+        pendingSendResolve = null
+      }
+
+      const resume = isResearchResumeMessage(msg)
+      emitAgentActivity({
+        phase: resume ? 'resume_checkpoint' : 'starting',
+        label: resume ? 'Продолжаю research run…' : 'Запускаю агента…',
+      })
+
       setImmediate(async () => {
-        const session = getActiveSession(workspace)
+        const sessionRaw = getActiveSession(workspace)
+        const session = resume ? compactSessionForWorkerResume(sessionRaw) : sessionRaw
+        const msgCount = session.messages.length
+        emitAgentActivity({
+          phase: 'session_save',
+          label: resume ? 'Подготавливаю продолжение (артефакты на диске)' : 'Сохраняю сессию для worker…',
+          detail: resume ? undefined : `${msgCount} сообщений`,
+        })
         const configVal = config.load()
         const apiUrl = serverManager.llamaApiUrl()
         const ctxSize = serverManager.getCtxSize() || 32768
@@ -549,7 +661,16 @@ function registerIpcHandlers() {
         write(',"messages":[')
         for (let i = 0; i < session.messages.length; i++) {
           write((i ? ',' : '') + JSON.stringify(session.messages[i]))
-          if (i > 0 && i % SESSION_WRITE_YIELD_EVERY === 0) await new Promise<void>(r => setImmediate(r))
+          if (i > 0 && i % SESSION_WRITE_YIELD_EVERY === 0) {
+            await new Promise<void>(r => setImmediate(r))
+            if (!resume && msgCount > SESSION_WRITE_YIELD_EVERY) {
+              emitAgentActivity({
+                phase: 'session_save',
+                label: 'Сохраняю сессию для worker…',
+                detail: `${Math.min(i, msgCount)}/${msgCount} сообщений`,
+              })
+            }
+          }
         }
         write('],"uiMessages":')
         write(JSON.stringify(session.uiMessages || []))
@@ -563,6 +684,7 @@ function registerIpcHandlers() {
         write(JSON.stringify(session.workspaceKey ?? ''))
         write('}')
         await new Promise<void>((res, rej) => { stream.once('finish', res); stream.once('error', rej); stream.end() })
+        emitAgentActivity({ phase: 'starting', label: 'Worker запущен — передаю управление агенту…' })
         getAgentWorker().postMessage({
           type: 'run',
           payload: { message: msg, workspace, config: configVal, apiUrl, ctxSize, sessionPath },
@@ -594,13 +716,26 @@ function registerIpcHandlers() {
 
   ipcMain.handle('get-research-profiles', () => RESEARCH_PROFILES)
 
+  ipcMain.handle('infer-research-request', async (_e, payload: any) => inferResearchRequest(payload))
+
   ipcMain.handle('get-research-dashboard', (_e, workspace: string) => {
+    const emptyCorpus = { total: 0, primary: 0, selected: 0, rejected: 0, needsReview: 0, queuedFullText: 0, read: 0, failed: 0, withDoi: 0, withArxiv: 0, selectedRead: 0, highPriority: 0, highPriorityRead: 0 }
+    const quality = (ws: string) => {
+      try {
+        const p = path.join(ws, '.research', 'quality-gates.json')
+        if (!fs.existsSync(p)) return { blockers: [] as string[] }
+        const data = JSON.parse(fs.readFileSync(p, 'utf-8'))
+        const blockers = (data.results || []).filter((r: any) => !r.passed).flatMap((r: any) => (r.blockers || []).map((b: string) => `${r.gate}: ${b}`))
+        return { blockers: blockers.slice(0, 8) }
+      } catch { return { blockers: [] as string[] } }
+    }
     if (!workspace) {
       return {
         profile: getResearchProfileByPresetId(config.get('selectedPreset')),
         plan: { total: 0, done: 0, pct: 0 },
-        corpus: { total: 0, primary: 0, queuedFullText: 0, read: 0, withDoi: 0, withArxiv: 0 },
+        corpus: emptyCorpus,
         evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
+        quality: { blockers: [] },
         ideas: 0,
         index: { chunks: 0, docs: 0, hasVectors: false },
       }
@@ -612,6 +747,7 @@ function registerIpcHandlers() {
         plan: planner.planProgress(items),
         corpus: corpusStats(workspace),
         evidence: evidenceStats(workspace),
+        quality: quality(workspace),
         ideas: loadIdeas(workspace).length,
         index: knowledgeIndex.indexStats(workspace),
       }
@@ -619,8 +755,9 @@ function registerIpcHandlers() {
       return {
         profile: getResearchProfileByPresetId(config.get('selectedPreset')),
         plan: { total: 0, done: 0, pct: 0 },
-        corpus: { total: 0, primary: 0, queuedFullText: 0, read: 0, withDoi: 0, withArxiv: 0 },
+        corpus: emptyCorpus,
         evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
+        quality: { blockers: [] },
         ideas: 0,
         index: { chunks: 0, docs: 0, hasVectors: false },
       }
@@ -747,7 +884,7 @@ function registerIpcHandlers() {
       return []
     }
     const filtered = entries
-      .filter((e) => !IGNORED.has(e.name) && !e.name.startsWith('.'))
+      .filter((e) => !IGNORED.has(e.name) && (!e.name.startsWith('.') || e.name === '.research'))
       .sort((a, b) => {
         if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
         return a.name.localeCompare(b.name)

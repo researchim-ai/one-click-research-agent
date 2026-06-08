@@ -23,6 +23,8 @@ interface ContextUsage {
   percent: number
 }
 
+import type { AgentActivity, SystemResources } from '../../electron/types'
+
 interface Props {
   messages: ChatMessage[]
   busy: boolean
@@ -33,6 +35,10 @@ interface Props {
   codeRefs?: CodeReference[]
   onRemoveCodeRef?: (index: number) => void
   contextUsage?: ContextUsage | null
+  agentActivity?: AgentActivity | null
+  busyElapsedSec?: number
+  tokensPerSecond?: number | null
+  gpuResources?: SystemResources | null
   externalLinksEnabled?: boolean
   onOpenExternalLink?: (url: string) => void
   appLanguage?: 'ru' | 'en'
@@ -49,6 +55,10 @@ export function Chat({
   codeRefs = [],
   onRemoveCodeRef,
   contextUsage,
+  agentActivity,
+  busyElapsedSec = 0,
+  tokensPerSecond,
+  gpuResources,
   externalLinksEnabled = true,
   onOpenExternalLink,
   appLanguage = 'ru',
@@ -317,20 +327,45 @@ export function Chat({
 
       {/* Agent working indicator */}
       {busy && (
-        <div className="flex items-center gap-2 px-4 py-1.5 border-t border-zinc-800/40 bg-[#0d1117]">
-          <span className="flex gap-1">
-            <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0s_infinite]" />
-            <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.2s_infinite]" />
-            <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.4s_infinite]" />
-          </span>
-          <span className="text-[11px] text-zinc-500">{L ? 'Агент работает…' : 'Agent working…'}</span>
-          {onCancel && (
-            <button
-              onClick={onCancel}
-              className="ml-auto px-2.5 py-0.5 rounded-full border border-zinc-700 text-[11px] text-zinc-400 hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 cursor-pointer transition-colors"
-            >
-              {L ? '⏹ Остановить' : '⏹ Stop'}
-            </button>
+        <div className="flex flex-col gap-1 px-4 py-2 border-t border-zinc-800/40 bg-[#0d1117]">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="flex gap-1 shrink-0">
+              <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0s_infinite]" />
+              <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.2s_infinite]" />
+              <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-[pulse-dot_1.4s_0.4s_infinite]" />
+            </span>
+            <span className="text-[11px] text-zinc-300 truncate">
+              {agentActivity?.label ?? (L ? 'Агент работает…' : 'Agent working…')}
+            </span>
+            {busyElapsedSec > 0 && (
+              <span className="text-[10px] text-zinc-600 tabular-nums shrink-0">{busyElapsedSec}с</span>
+            )}
+            {tokensPerSecond != null && tokensPerSecond > 0 && (
+              <span className="text-[10px] text-emerald-400 tabular-nums shrink-0">
+                {tokensPerSecond} tok/s
+              </span>
+            )}
+            {onCancel && (
+              <button
+                onClick={onCancel}
+                className="ml-auto px-2.5 py-0.5 rounded-full border border-zinc-700 text-[11px] text-zinc-400 hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 cursor-pointer transition-colors shrink-0"
+              >
+                {L ? '⏹ Остановить' : '⏹ Stop'}
+              </button>
+            )}
+          </div>
+          {(agentActivity?.detail || gpuResources?.gpus?.length) && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-5 text-[10px] text-zinc-500 min-w-0">
+              {agentActivity?.detail && (
+                <span className="truncate">{agentActivity.detail}</span>
+              )}
+              {gpuResources?.gpus?.[0] && (
+                <span className="text-zinc-600 shrink-0">
+                  GPU: {gpuResources.gpus[0].name.split(' ').slice(-2).join(' ')} ·{' '}
+                  {Math.round(gpuResources.gpus[0].vramFreeMb / 1024)}/{Math.round(gpuResources.gpus[0].vramTotalMb / 1024)} GB VRAM
+                </span>
+              )}
+            </div>
           )}
         </div>
       )}

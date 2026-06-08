@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import { loadCorpus } from './corpus'
 import { loadEvidence } from './evidence'
+import { resolveResearchDir } from '../research-paths'
 
 export interface IdeaCard {
   id: string
@@ -17,38 +18,42 @@ export interface IdeaCard {
   createdAt: number
 }
 
-function ideasPath(workspace: string): string {
-  return path.join(workspace, '.research', 'ideas.jsonl')
+function researchDir(workspace: string, outputDir?: string): string {
+  return resolveResearchDir(workspace, outputDir)
+}
+
+function ideasPath(workspace: string, outputDir?: string): string {
+  return path.join(researchDir(workspace, outputDir), 'ideas.jsonl')
 }
 
 function makeId(): string {
   return `I-${crypto.randomUUID().slice(0, 8)}`
 }
 
-export function loadIdeas(workspace: string): IdeaCard[] {
-  const p = ideasPath(workspace)
+export function loadIdeas(workspace: string, outputDir?: string): IdeaCard[] {
+  const p = ideasPath(workspace, outputDir)
   if (!fs.existsSync(p)) return []
   try {
     return fs.readFileSync(p, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as IdeaCard)
   } catch { return [] }
 }
 
-export function saveIdea(workspace: string, idea: Omit<IdeaCard, 'id' | 'createdAt'>): string {
+export function saveIdea(workspace: string, idea: Omit<IdeaCard, 'id' | 'createdAt'>, outputDir?: string): string {
   const card: IdeaCard = { ...idea, id: makeId(), createdAt: Date.now() }
-  const rows = loadIdeas(workspace)
+  const rows = loadIdeas(workspace, outputDir)
   rows.push(card)
-  const p = ideasPath(workspace)
+  const p = ideasPath(workspace, outputDir)
   fs.mkdirSync(path.dirname(p), { recursive: true })
   fs.writeFileSync(p, rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf-8')
   return `Saved idea ${card.id}: ${card.title}`
 }
 
-export function scoutIdeas(workspace: string, topic: string, maxIdeas?: number): string {
+export function scoutIdeas(workspace: string, topic: string, maxIdeas?: number, outputDir?: string): string {
   const q = String(topic ?? '').trim()
   if (!q) return 'Error: topic is required.'
   const limit = Math.max(1, Math.min(10, Number(maxIdeas) || 5))
-  const corpus = loadCorpus(workspace).slice(0, 30)
-  const evidence = loadEvidence(workspace).slice(0, 30)
+  const corpus = loadCorpus(workspace, outputDir).slice(0, 30)
+  const evidence = loadEvidence(workspace, outputDir).slice(0, 30)
   const themes = new Map<string, number>()
   for (const item of corpus) {
     for (const token of item.title.toLowerCase().split(/[^a-zа-я0-9]+/i).filter((t) => t.length > 5)) {
@@ -78,14 +83,14 @@ export function scoutIdeas(workspace: string, topic: string, maxIdeas?: number):
       createdAt: Date.now(),
     })
   }
-  const p = ideasPath(workspace)
+  const p = ideasPath(workspace, outputDir)
   fs.mkdirSync(path.dirname(p), { recursive: true })
   fs.writeFileSync(p, ideas.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf-8')
   return formatIdeas(ideas)
 }
 
-export function prioritizeIdeas(workspace: string): string {
-  const ideas = loadIdeas(workspace)
+export function prioritizeIdeas(workspace: string, outputDir?: string): string {
+  const ideas = loadIdeas(workspace, outputDir)
   if (ideas.length === 0) return 'No ideas saved yet. Use scout_ideas first.'
   const ranked = [...ideas].sort((a, b) => (b.novelty + b.feasibility + b.impact) - (a.novelty + a.feasibility + a.impact))
   return formatIdeas(ranked)

@@ -1,10 +1,13 @@
 import { memo, useMemo, useState } from 'react'
 import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { OpenFile } from '../hooks/useEditor'
 import { CodeEditor, type CodeSelectionInfo } from './CodeEditor'
+import { normalizeExternalHttpUrl } from '../utils/external-links'
 
 const rehypePlugins = [rehypeHighlight] as any[]
+const remarkPlugins = [remarkGfm] as any[]
 
 interface Props {
   file: OpenFile
@@ -14,6 +17,8 @@ interface Props {
   onContentChange?: (content: string) => void
   onAfterSave?: () => void
   onBreadcrumbClick?: (dirPath: string) => void
+  externalLinksEnabled?: boolean
+  onOpenExternalLink?: (url: string) => void
   appLanguage?: 'ru' | 'en'
 }
 
@@ -32,11 +37,33 @@ export const MarkdownViewer = memo(function MarkdownViewer({
   onContentChange,
   onAfterSave,
   onBreadcrumbClick,
+  externalLinksEnabled = true,
+  onOpenExternalLink,
   appLanguage = 'ru',
 }: Props) {
   const L = appLanguage === 'ru'
   const [mode, setMode] = useState<'preview' | 'edit'>('preview')
   const title = useMemo(() => relPath(workspace, file.path), [workspace, file.path])
+
+  const openMarkdownLink = (href: string | undefined) => {
+    const safeUrl = normalizeExternalHttpUrl(href)
+    if (safeUrl) {
+      if (externalLinksEnabled) onOpenExternalLink?.(safeUrl)
+      return
+    }
+    if (!href || !onOpenFile) return
+    if (href.startsWith('#') || href.startsWith('mailto:')) return
+    const cleanHref = href.split('#')[0].split('?')[0]
+    if (!cleanHref) return
+    const baseDir = file.path.includes('\\')
+      ? file.path.slice(0, file.path.lastIndexOf('\\'))
+      : file.path.slice(0, file.path.lastIndexOf('/'))
+    const sep = file.path.includes('\\') ? '\\' : '/'
+    const rawPath = cleanHref.startsWith('/') && workspace
+      ? workspace.replace(/[\\/]+$/, '') + cleanHref.replace(/\//g, sep)
+      : `${baseDir}${sep}${cleanHref.replace(/\//g, sep)}`
+    onOpenFile(rawPath)
+  }
 
   if (mode === 'edit') {
     return (
@@ -88,7 +115,29 @@ export const MarkdownViewer = memo(function MarkdownViewer({
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
         <article className="markdown-preview mx-auto max-w-[920px] rounded-2xl border border-zinc-800/70 bg-zinc-950/45 px-8 py-7 shadow-2xl shadow-black/20">
-          <Markdown rehypePlugins={rehypePlugins}>{file.content}</Markdown>
+          <Markdown
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={rehypePlugins}
+            components={{
+              a: ({ href, children }) => {
+                const safeUrl = normalizeExternalHttpUrl(href)
+                const clickable = !!safeUrl ? externalLinksEnabled : !!href && !href.startsWith('#') && !href.startsWith('mailto:')
+                return (
+                  <button
+                    type="button"
+                    onClick={() => openMarkdownLink(href)}
+                    disabled={!clickable}
+                    className="text-blue-300 underline decoration-blue-400/50 underline-offset-2 hover:text-blue-200 disabled:hover:text-blue-300 disabled:cursor-default cursor-pointer break-all text-left"
+                    title={href}
+                  >
+                    {children}
+                  </button>
+                )
+              },
+            }}
+          >
+            {file.content}
+          </Markdown>
         </article>
       </div>
     </div>

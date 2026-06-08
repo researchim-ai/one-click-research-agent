@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
-import type { AgentEvent, DownloadProgress, AppStatus } from '../../electron/types'
+import type { AgentEvent, AgentActivity, DownloadProgress, AppStatus, SystemResources } from '../../electron/types'
 import type { SessionInfo } from '../../electron/agent'
 
 export interface ToolCall {
@@ -27,6 +27,10 @@ export interface ChatMessage {
   done?: boolean
 }
 
+function isInternalStatus(content: string): boolean {
+  return /Supervisor: автоматическая пауза|^\[Supervisor pause @ iteration/i.test(content)
+}
+
 interface SessionState {
   messages: ChatMessage[]
   idCounter: number
@@ -46,6 +50,10 @@ export function useAgent() {
   const [workspace, setWorkspaceState] = useState(() => localStorage.getItem('workspace') || '')
   const [contextUsage, setContextUsage] = useState<{ usedTokens: number; budgetTokens: number; maxContextTokens: number; percent: number } | null>(null)
   const [tokensPerSecond, setTokensPerSecond] = useState<number | null>(null)
+  const [agentActivity, setAgentActivity] = useState<AgentActivity | null>(null)
+  const [busyElapsedSec, setBusyElapsedSec] = useState(0)
+  const [gpuResources, setGpuResources] = useState<SystemResources | null>(null)
+  const [autoOpenFile, setAutoOpenFile] = useState<{ path: string; token: number } | null>(null)
   const assistantRef = useRef<ChatMessage | null>(null)
   const idCounter = useRef(0)
 
@@ -146,9 +154,34 @@ export function useAgent() {
   useEffect(() => {
     if (!window.api) return
     pollStatus()
-    const interval = setInterval(pollStatus, 5000)
+    const interval = setInterval(pollStatus, busy ? 2000 : 5000)
     return () => clearInterval(interval)
-  }, [])
+  }, [busy])
+
+  useEffect(() => {
+    if (!busy) {
+      setBusyElapsedSec(0)
+      return
+    }
+    const started = Date.now()
+    const tick = setInterval(() => {
+      setBusyElapsedSec(Math.floor((Date.now() - started) / 1000))
+    }, 1000)
+    return () => clearInterval(tick)
+  }, [busy])
+
+  useEffect(() => {
+    if (!busy || !window.api) {
+      if (!busy) setGpuResources(null)
+      return
+    }
+    const pollGpu = () => {
+      window.api.detectResources().then(setGpuResources).catch(() => {})
+    }
+    pollGpu()
+    const interval = setInterval(pollGpu, 3000)
+    return () => clearInterval(interval)
+  }, [busy])
 
   const pollStatus = async () => {
     try {
@@ -248,6 +281,14 @@ export function useAgent() {
       if (ev.tokensPerSecond != null) setTokensPerSecond(ev.tokensPerSecond)
       return
     }
+    if (ev.type === 'agent_activity') {
+      if (ev.activity) setAgentActivity(ev.activity)
+      return
+    }
+    if (ev.type === 'open_file') {
+      if (ev.filePath) setAutoOpenFile({ path: ev.filePath, token: Date.now() })
+      return
+    }
 
     // All other events: immediate state update
     setMessages((prev) => {
@@ -273,7 +314,9 @@ export function useAgent() {
 
       switch (ev.type) {
         case 'status':
-          msgs.push({ id: nextId(), role: 'status', content: ev.content ?? '' })
+          if (!isInternalStatus(ev.content ?? '')) {
+            msgs.push({ id: nextId(), role: 'status', content: ev.content ?? '' })
+          }
           break
         case 'tool_call':
           assistant.toolCalls = [
@@ -304,12 +347,14 @@ export function useAgent() {
             assistant.done = true
             assistantRef.current = null
             setBusy(false)
+            setAgentActivity(null)
           }
           break
         case 'error':
           msgs.push({ id: nextId(), role: 'status', content: `⚠ ${ev.content}` })
           assistantRef.current = null
           setBusy(false)
+          setAgentActivity(null)
           break
       }
 
@@ -335,7 +380,14 @@ export function useAgent() {
   }, [])
 
   const sendMessage = useCallback(async (text: string) => {
-    if (!text.trim() || busy) return
+    if (!text.trim()) return
+    if (busy) {
+      setMessages((prev) => [
+        ...prev,
+        { id: nextId(), role: 'status', content: '⚠ Агент ещё выполняет предыдущий запрос. Дождитесь завершения или нажмите «Стоп».' },
+      ])
+      return
+    }
     setMessages((prev) => {
       const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text }
       const assistantMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '', toolCalls: [] }
@@ -343,20 +395,57 @@ export function useAgent() {
       return [...prev, userMsg, assistantMsg]
     })
     setBusy(true)
+    setAgentActivity({ phase: 'starting', label: 'Отправляю запрос…' })
     try {
       await window.api.sendMessage(text, workspace)
     } catch (e: any) {
       setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${e.message ?? e}` }])
+    } finally {
       setBusy(false)
+      setAgentActivity(null)
+      assistantRef.current = null
     }
     refreshSessions()
   }, [busy, workspace, refreshSessions])
+
+  const startResearchRun = useCallback(async (text: string, title?: string) => {
+    if (!text.trim() || busy || !workspace) return false
+    saveCurrentToMap()
+    const id = await window.api.createSession(workspace)
+    await window.api.switchSession(workspace, id).catch(() => {})
+    if (title?.trim()) {
+      await window.api.renameSession(workspace, id, title.trim().slice(0, 80)).catch(() => {})
+    }
+    setActiveSessionId(id)
+    idCounter.current = 0
+    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text }
+    const assistantMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '', toolCalls: [] }
+    assistantRef.current = assistantMsg
+    const initialMessages = [userMsg, assistantMsg]
+    setMessages(initialMessages)
+    sessionStates.current.set(id, { messages: initialMessages, idCounter: idCounter.current })
+    await window.api.saveUiMessages(workspace, id, initialMessages).catch(() => {})
+    setBusy(true)
+    setAgentActivity({ phase: 'starting', label: 'Запуск research run…' })
+    try {
+      await window.api.sendMessage(text, workspace)
+    } catch (e: any) {
+      setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${e.message ?? e}` }])
+    } finally {
+      setBusy(false)
+      setAgentActivity(null)
+      assistantRef.current = null
+    }
+    await refreshSessions()
+    return true
+  }, [busy, workspace, activeSessionId, messages, refreshSessions])
 
   const cancel = useCallback(async () => {
     try {
       await window.api.cancelAgent()
     } catch {}
     setBusy(false)
+    setAgentActivity(null)
   }, [])
 
   const setWorkspace = useCallback((ws: string) => {
@@ -456,8 +545,9 @@ export function useAgent() {
 
   return {
     messages, busy, status, downloadProgress, buildStatus,
-    workspace, setWorkspace, contextUsage, tokensPerSecond,
-    sendMessage, resetChat, pollStatus, respondApproval, cancel,
+    workspace, setWorkspace, contextUsage, tokensPerSecond, autoOpenFile,
+    agentActivity, busyElapsedSec, gpuResources,
+    sendMessage, startResearchRun, resetChat, pollStatus, respondApproval, cancel,
     sessions, activeSessionId,
     newSession, switchToSession, removeSession, renameActiveSession,
   }
