@@ -157,12 +157,14 @@ function recommendNextSteps(
   reportExists: boolean,
 ): string[] {
   const steps: string[] = []
-  const unreadSelected = stats.selected - stats.selectedRead
-  if (stats.failed > 0) {
-    steps.push(`Fix ${stats.failed} failed full-text read(s) — use full_text_status then read_corpus_item / read_full_text_batch.`)
+  const selected = loadCorpus(workspace, outputDir).filter((e) => e.screeningStatus === 'selected')
+  const failedSelected = selected.filter((e) => e.readStatus === 'failed')
+  const unreadSelected = selected.filter((e) => e.readStatus !== 'read' && e.status !== 'read' && e.readStatus !== 'failed')
+  if (failedSelected.length > 0) {
+    steps.push(`Treat ${failedSelected.length} failed full-text read(s) as unavailable after one concrete retry/status check; do not keep retrying non-retriable HTTP failures.`)
   }
-  if (unreadSelected > 0) {
-    steps.push(`Read ${unreadSelected} selected corpus item(s) not yet marked read — read_full_text_batch or read_corpus_item.`)
+  if (unreadSelected.length > 0) {
+    steps.push(`Read ${unreadSelected.length} selected corpus item(s) still pending — read_full_text_batch or read_corpus_item.`)
   }
   if (stats.selectedReviewLike < 2 && stats.selected > 5) {
     steps.push('Ensure at least 2 review/survey papers in selected corpus (screen_corpus / build_corpus).')
@@ -213,6 +215,9 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     .slice(0, 5)
     .map((e) => `${e.id}: ${e.title.slice(0, 60)}${e.readReason ? ` (${e.readReason.slice(0, 40)})` : ''}`)
 
+  const selectedCorpus = corpus.filter((e) => e.screeningStatus === 'selected')
+  const failedSelectedCount = selectedCorpus.filter((e) => e.readStatus === 'failed').length
+  const unreadSelectedCount = selectedCorpus.filter((e) => e.readStatus !== 'read' && e.status !== 'read' && e.readStatus !== 'failed').length
   const unreadHigh = corpus
     .filter((e) => e.screeningStatus === 'selected' && e.readStatus !== 'read' && e.readStatus !== 'failed')
     .sort((a, b) => (b.readPriority === 'high' ? 1 : 0) - (a.readPriority === 'high' ? 1 : 0))
@@ -240,7 +245,7 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
 
   lines.push(
     '',
-    `**Corpus:** ${stats.selected} selected · ${stats.selectedRead} read · ${stats.failed} failed · ${stats.selected - stats.selectedRead} unread`,
+    `**Corpus:** ${stats.selected} selected · ${stats.selectedRead} read · ${failedSelectedCount} failed/unavailable · ${unreadSelectedCount} pending unread`,
     `**Evidence:** ${evidence.total} total · ${evidence.supported} supported · ${evidence.needsReview} needs_review · ${evidence.contested} contested`,
     reportExists ? '**report.md:** exists' : '**report.md:** not yet generated',
   )
@@ -260,7 +265,7 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     lines.push('', '**Quality gates:** last run passed.')
   }
 
-  lines.push('', '**Recommended next steps:**')
+  lines.push('', '**Diagnostic hints (secondary; obey Allowed next tools first):**')
   for (let i = 0; i < nextSteps.length; i++) lines.push(`${i + 1}. ${nextSteps[i]}`)
   lines.push('', '**Workflow guidance:**', ...formatWorkflowGuidance(spec).split('\n').map((l) => `- ${l}`))
 

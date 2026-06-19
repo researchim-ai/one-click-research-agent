@@ -697,7 +697,17 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'generate_evidence_report',
       description: 'The ONLY valid final-report tool for managed research runs. Generates narrative report.md from selected corpus/evidence and a separate evidence-report.md appendix with matrix, coverage, and quality gates. Use this to create or repair .research/YYYY.../report.md after gates are ready; do not use write_file or generate_report for that.',
-      parameters: { type: 'object', properties: { title: { type: 'string' }, output_path: { type: 'string' }, output_dir: { type: 'string' }, session_id: { type: 'string' } }, required: ['title'] },
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          output_path: { type: 'string' },
+          output_dir: { type: 'string' },
+          session_id: { type: 'string' },
+          report_language: { type: 'string', enum: ['ru', 'en'], description: 'Language for all user-facing report sections and generated Markdown artifacts.' },
+        },
+        required: ['title'],
+      },
     },
   },
   {
@@ -995,7 +1005,7 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'gate_report':
         return formatGateReport(workspace, args.session_id, args.output_dir)
       case 'generate_evidence_report':
-        return generateEvidenceReportTool(workspace, args.title, args.output_path, args.output_dir, args.session_id)
+        return generateEvidenceReportTool(workspace, args.title, args.output_path, args.output_dir, args.session_id, args.report_language)
       case 'list_research_skills':
         return listResearchSkillsTool(workspace, args.query)
       case 'load_research_skill':
@@ -1268,7 +1278,9 @@ function runQualityGatesTool(
 
 function selectFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
   const batch = selectFullTextBatch(workspace, limit, outputDir)
-  if (batch.length === 0) return 'No selected corpus items need full-text reading.'
+  if (batch.length === 0) {
+    return 'No-op: no selected corpus items are queued for full-text batch reading. Call full_text_status to inspect failed/unread items; if a high-priority item failed, call read_corpus_item with that specific id once, then run_quality_gates.'
+  }
   return batch.map((e, i) => [
     `${i + 1}. ${e.id}: ${e.title}`,
     `   Priority: ${e.readPriority ?? 'low'} | score=${e.score} | year=${e.year ?? 'unknown'}`,
@@ -1282,6 +1294,12 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   if (!corpusId) return 'Error: id is required.'
   const entry = loadCorpus(workspace, outputDir).find((e) => e.id === corpusId)
   if (!entry) return `Error: corpus item not found: ${corpusId}`
+  if (entry.readStatus === 'read' || entry.status === 'read') {
+    return `No-op: corpus item ${corpusId} is already marked read${entry.localPath ? ` at ${entry.localPath}` : ''}. Do not call read_corpus_item for this id again; continue with full_text_status or run_quality_gates.`
+  }
+  if (entry.readStatus === 'failed' && /\bHTTP\s*(?:403|404|410|451)\b/i.test(entry.readReason ?? '')) {
+    return `Error: corpus item ${corpusId} already failed with a non-retriable fetch error (${entry.readReason}). Do not retry this id again; treat it as unavailable, run full_text_status, then run_quality_gates so the limitation is recorded.`
+  }
   const baseDir = canonicalResearchOutputDir(outputDir)
   const safeId = corpusId.replace(/[^a-z0-9_-]+/gi, '_')
   const fullTextDir = path.join(baseDir, 'fulltext')
@@ -1319,7 +1337,9 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
 
 function readFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
   const batch = selectFullTextBatch(workspace, limit, outputDir)
-  if (batch.length === 0) return 'No selected corpus items need full-text reading.'
+  if (batch.length === 0) {
+    return 'Error: no selected corpus items are queued for full-text batch reading. Do not call read_full_text_batch again with the same arguments. Call full_text_status to inspect failed/unread items; if a high-priority item failed, call read_corpus_item with that specific id once, then run_quality_gates.'
+  }
   const lines = [`Reading ${batch.length} selected corpus item(s):`, '']
   for (const item of batch) {
     const result = readCorpusItemTool(workspace, item.id, outputDir)
@@ -1363,52 +1383,55 @@ function extractEvidenceBatchTool(workspace: string, outputDir?: string, maxItem
   ].join('\n\n')
 }
 
-function generateEvidenceReportTool(workspace: string, title: string, outputPath: string | undefined, outputDir: string | undefined, sessionId: string | undefined): string {
+function generateEvidenceReportTool(workspace: string, title: string, outputPath: string | undefined, outputDir: string | undefined, sessionId: string | undefined, reportLanguage?: string): string {
   const snap = readQualityGateSnapshot(workspace, outputDir)
   if (!snap) return 'Error: quality gates have not been run yet. Run run_quality_gates before generate_evidence_report.'
   const blocker = latestQualityGateFailure(workspace, outputDir, { ignoreGates: ['final_report_structure'] })
   if (blocker) return `Error: quality gates are failing. Do not generate final report yet.\n${blocker}\n\nRun read_full_text_batch / extract_evidence_batch and then run_quality_gates again.`
-  const ru = /[а-яё]/i.test(String(title))
+  const language = reportLanguage === 'en' || reportLanguage === 'ru'
+    ? reportLanguage
+    : (cfg.get('appLanguage') ?? 'ru')
+  const ru = language === 'ru'
   const stats = corpusStats(workspace, outputDir)
   const matrix = evidenceMatrix(workspace, outputDir)
   const selected = listSelectedCorpus(workspace, 40, outputDir)
   const status = fullTextStatus(workspace, outputDir)
   const gates = formatGateReport(workspace, sessionId, outputDir)
   const evidenceContent = [
-    ru ? '## Evidence-first резюме' : '## Evidence-First Summary',
+    ru ? '## Резюме по доказательной базе' : '## Evidence-First Summary',
     '',
     ru
-      ? `Отчёт основан на ${stats.selected} отобранных источниках, ${stats.selectedRead} прочитанных full-text источниках и ${evidenceStats(workspace, outputDir).total} evidence-claims.`
+      ? `Отчёт основан на ${stats.selected} отобранных источниках, ${stats.selectedRead} прочитанных полнотекстовых источниках и ${evidenceStats(workspace, outputDir).total} доказательных утверждениях.`
       : `This report is based on ${stats.selected} selected corpus item(s), ${stats.selectedRead} selected full-text read(s), and ${evidenceStats(workspace, outputDir).total} evidence claim(s).`,
     '',
     ru ? '## Покрытие' : '## Coverage',
     '',
     status,
     '',
-    ru ? '## Evidence matrix' : '## Evidence Matrix',
+    ru ? '## Матрица доказательств' : '## Evidence Matrix',
     '',
     matrix,
     '',
-    ru ? '## Приложение: selected corpus' : '## Selected Corpus Appendix',
+    ru ? '## Приложение: отобранный корпус' : '## Selected Corpus Appendix',
     '',
     selected,
     '',
-    ru ? '## Quality gates' : '## Quality Gates',
+    ru ? '## Проверки качества' : '## Quality Gates',
     '',
     gates,
     '',
     ru ? '## Ограничения' : '## Limitations',
     '',
     ru
-      ? '- Разделы со слабым или отсутствующим evidence нужно расширить перед использованием отчёта как финального научного вывода.'
+      ? '- Разделы со слабой или отсутствующей доказательной базой нужно расширить перед использованием отчёта как финального научного вывода.'
       : '- Sections with weak or missing evidence should be expanded before using this as a final scientific conclusion.',
     ru
-      ? '- Нельзя описывать raw corpus как evidence base, если источники не были отобраны и прочитаны.'
+      ? '- Нельзя описывать сырой корпус как доказательную базу, если источники не были отобраны и прочитаны.'
       : '- Do not describe raw corpus size as the evidence base unless those items were selected and read.',
   ].join('\n')
   const evidencePath = resolveResearchOutputPath(undefined, workspace, path.join(canonicalResearchOutputDir(outputDir), 'evidence-report.md'))
   fs.mkdirSync(path.dirname(evidencePath), { recursive: true })
-  fs.writeFileSync(evidencePath, `# ${ru ? 'Evidence report' : 'Evidence Report'}\n\n${evidenceContent}\n`, 'utf-8')
+  fs.writeFileSync(evidencePath, `# ${ru ? 'Доказательный отчёт' : 'Evidence Report'}\n\n${evidenceContent}\n`, 'utf-8')
 
   const synthesis = composeSynthesisReport(workspace, title, outputDir, ru)
   const result = generateReport(
@@ -1427,7 +1450,8 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
   const corpus = loadCorpus(workspace, outputDir)
   const selected = corpus.filter((e) => e.screeningStatus === 'selected')
   const read = selected.filter((e) => e.readStatus === 'read' || e.status === 'read')
-  const reviews = selected.filter((e) => e.publicationType === 'survey' || e.publicationType === 'review')
+  const unavailable = selected.filter((e) => e.readStatus === 'failed')
+  const reviews = read.filter((e) => e.publicationType === 'survey' || e.publicationType === 'review')
   const claims = loadEvidence(workspace, outputDir).filter((e) => e.status === 'supported')
   const plan = parsePlan(workspace, outputDir)
   const byPlan = new Map<string, typeof claims>()
@@ -1436,26 +1460,139 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     byPlan.set(key, [...(byPlan.get(key) || []), claim])
   }
   const sourceById = new Map(corpus.map((e) => [e.id, e]))
+  const runDir = canonicalResearchOutputDir(outputDir).replace(/\\/g, '/').replace(/\/+$/, '')
+  const link = (text: string, href?: string) => {
+    const label = text.replace(/\|/g, '\\|')
+    const target = String(href ?? '').trim()
+    return target ? `[${label}](${target.replace(/\)/g, '%29')})` : label
+  }
+  const localHref = (localPath?: string) => {
+    if (!localPath) return ''
+    const normalized = localPath.replace(/\\/g, '/')
+    return normalized.startsWith(`${runDir}/`) ? normalized.slice(runDir.length + 1) : normalized
+  }
+  const sourceTag = (id: string) => {
+    const src = sourceById.get(id)
+    return src ? link(id, src.url) : `\`${id}\``
+  }
   const sourceLabel = (id: string) => {
     const src = sourceById.get(id)
-    return src ? `${src.title}${src.year ? ` (${src.year})` : ''}` : id
+    if (!src) return id
+    return `${src.title}${src.year ? ` (${src.year})` : ''}`
   }
-  const cite = (claim: { corpusIds?: string[] }) => (claim.corpusIds || []).slice(0, 3).map((id) => `\`${id}\``).join(', ') || 'источник не привязан'
-  const topSources = read.slice(0, 16).map((e, i) => `${i + 1}. ${e.title}${e.year ? ` (${e.year})` : ''}${e.publicationType ? `, ${e.publicationType}` : ''}${e.citationCount !== undefined ? `, citations=${e.citationCount}` : ''}.`)
+  const cite = (claim: { corpusIds?: string[] }) => (claim.corpusIds || []).slice(0, 3).map(sourceTag).join(', ') || (ru ? 'источник не привязан' : 'no linked source')
+  const evidenceStrength = (claim: { quote?: string; notes?: string; evidenceType?: string; confidence?: string }) => {
+    if (claim.notes?.toLowerCase().includes('abstract-only')) return ru ? 'только метаданные/аннотация' : 'metadata-only'
+    if (claim.quote && claim.evidenceType === 'primary_result') return ru ? 'сильная' : 'strong'
+    if (claim.quote) return ru ? 'средняя' : 'medium'
+    return ru ? 'слабая' : 'weak'
+  }
+  const confidenceLabel = (value?: string) => {
+    if (!ru) return value ?? 'unknown'
+    if (value === 'high') return 'высокая'
+    if (value === 'medium') return 'средняя'
+    if (value === 'low') return 'низкая'
+    if (value === 'speculative') return 'предварительная'
+    return 'неизвестная'
+  }
+  const evidenceTypeLabel = (value?: string) => {
+    if (!ru) return value ?? 'unknown'
+    if (value === 'primary_result') return 'первичный результат'
+    if (value === 'survey_statement') return 'утверждение из обзора'
+    if (value === 'benchmark') return 'бенчмарк'
+    if (value === 'safety_claim') return 'утверждение о безопасности'
+    if (value === 'background') return 'контекст'
+    return 'не классифицировано'
+  }
+  const priorityLabel = (value?: string) => {
+    if (!ru) return value ?? 'low'
+    if (value === 'high') return 'высокий'
+    if (value === 'medium') return 'средний'
+    return 'низкий'
+  }
+  const selectedLabel = ru ? 'отобранные' : 'selected'
+  const readLabel = ru ? 'прочитанные' : 'read'
+  const fullTextLabel = ru ? 'полный текст' : 'full text'
+  const localArtifactHeader = ru ? 'Локальный артефакт' : 'Local artifact'
+  const corpusIdHeader = ru ? 'ID корпуса' : 'Corpus ID'
+  const sourceHeader = ru ? 'Источник' : 'Source'
+  const typeHeader = ru ? 'Тип' : 'Type'
+  const priorityHeader = ru ? 'Приоритет' : 'Priority'
+  const planHeader = ru ? 'План' : 'Plan links'
+  const compactQuote = (quote?: string) => quote
+    ? quote.replace(/\s+/g, ' ').trim().slice(0, 260) + (quote.replace(/\s+/g, ' ').trim().length > 260 ? '...' : '')
+    : ''
+  const sourceType = (e: { publicationType?: string }) => {
+    if (!ru) return e.publicationType || 'unclassified'
+    if (e.publicationType === 'survey') return 'обзор'
+    if (e.publicationType === 'review') return 'обзор'
+    if (e.publicationType === 'benchmark') return 'бенчмарк'
+    if (e.publicationType === 'method') return 'метод'
+    if (e.publicationType === 'tool') return 'инструмент'
+    if (e.publicationType === 'safety') return 'безопасность'
+    if (e.publicationType === 'background') return 'контекст'
+    return 'не классифицирован'
+  }
+  const topSources = read.slice(0, 24).map((e, i) => {
+    const local = localHref(e.localPath)
+    return [
+      `| S${i + 1}`,
+      `${link(e.title, e.url)}${e.year ? ` (${e.year})` : ''}`,
+      sourceType(e),
+      priorityLabel(e.readPriority),
+      e.subQuestions?.join(', ') || '-',
+      local ? link(fullTextLabel, local) : '-',
+      `\`${e.id}\` |`,
+    ].join(' | ')
+  })
   const reviewLines = reviews.length
-    ? reviews.map((e) => `- ${e.title}${e.year ? ` (${e.year})` : ''}: обзорная рамка для интерпретации первичных результатов.`)
-    : ['- Обзорных источников в selected corpus недостаточно; это должно считаться ограничением, а не нормой.']
+    ? reviews.map((e) => `- ${link(e.title, e.url)}${e.year ? ` (${e.year})` : ''} (${sourceTag(e.id)}): ${ru ? 'обзорная рамка для интерпретации первичных результатов' : 'review context for interpreting primary results'}.`)
+    : [ru ? '- Обзорных источников среди прочитанных отобранных источников недостаточно; это ограничение.' : '- Review/survey coverage among read selected sources is insufficient; this is a limitation.']
+  const unavailableLines = unavailable.length
+    ? unavailable.map((e) => `- ${sourceTag(e.id)} ${link(e.title, e.url)}: ${e.readReason ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`)
+    : [ru ? '- Нет отобранных источников с недоступным полным текстом.' : '- No selected sources have failed full-text reads.']
   const planSections = plan.length ? plan : [{ id: 'Q1', text: ru ? 'Основные результаты исследования' : 'Main research findings', done: true, level: 0, children: [] }]
+  const directionRows = planSections.slice(0, 8).map((item) => {
+    const rows = (byPlan.get(item.id) || []).slice(0, 4)
+    const sourceCount = new Set(rows.flatMap((claim) => claim.corpusIds ?? [])).size
+    const strongCount = rows.filter((claim) => evidenceStrength(claim) === (ru ? 'сильная' : 'strong')).length
+    const weakCount = rows.length - strongCount
+    const titleText = item.text.replace(/^Q\d+\.\s*/, '').replace(/\|/g, '\\|')
+    return [
+      `| ${item.id}: ${titleText}`,
+      ru ? `${rows.length} утвержд.; ${sourceCount} источн.` : `${rows.length} claims; ${sourceCount} source(s)`,
+      ru ? `${strongCount} сильных; ${weakCount} ограниченных` : `${strongCount} strong; ${weakCount} limited`,
+      rows.map(cite).join('; ') || '-',
+      '|',
+    ].join(' | ')
+  })
   const sectionText = planSections.map((item) => {
     const rows = (byPlan.get(item.id) || []).slice(0, 5)
+    const primary = rows.filter((c) => c.evidenceType === 'primary_result' || c.evidenceType === 'benchmark' || c.evidenceType === 'safety_claim')
+    const surveys = rows.filter((c) => c.evidenceType === 'survey_statement')
+    const metadataOnly = rows.filter((c) => c.notes?.toLowerCase().includes('abstract-only'))
     const bullets = rows.length
       ? rows.map((claim) => {
-        const srcs = (claim.corpusIds || []).map(sourceLabel).slice(0, 2).join('; ')
-        return `- ${claim.claim} Поддержка: ${srcs || cite(claim)}.${claim.quote ? ` Ключевой фрагмент: "${claim.quote.slice(0, 220)}${claim.quote.length > 220 ? '...' : ''}"` : ''}`
+        const srcs = (claim.corpusIds || []).map((id) => {
+          const src = sourceById.get(id)
+          const local = localHref(src?.localPath)
+          return `${sourceTag(id)}${src ? ` ${sourceLabel(id)}` : ''}${local ? ` (${link(fullTextLabel, local)})` : ''}`
+        }).slice(0, 2).join('; ')
+        const quote = compactQuote(claim.quote)
+        return [
+          `- **${claim.claim}**`,
+          `  ${ru ? 'Опора' : 'Evidence'}: ${srcs || cite(claim)}.`,
+          `  ${ru ? 'Сила доказательства' : 'Strength'}: ${evidenceStrength(claim)}; ${ru ? 'тип' : 'type'}: ${evidenceTypeLabel(claim.evidenceType)}; ${ru ? 'уверенность' : 'confidence'}=${confidenceLabel(claim.confidence)}.`,
+          quote ? `  ${ru ? 'Фрагмент' : 'Quote'}: "${quote}"` : '',
+        ].filter(Boolean).join('\n')
       })
-      : ['- По этому разделу нет достаточно сильных claim-level evidence; раздел требует дополнительного поиска и чтения.']
+      : [ru ? '- По этому разделу нет достаточно сильных доказательных утверждений; раздел требует дополнительного поиска и чтения.' : '- This section lacks strong claim-level evidence and needs more search/reading.']
     return [
       `## ${item.id}. ${item.text.replace(/^Q\d+\.\s*/, '')}`,
+      '',
+      ru
+        ? `**Покрытие:** ${rows.length} доказательных утверждений; первичные/бенчмарк/безопасность=${primary.length}; обзорные=${surveys.length}; только метаданные=${metadataOnly.length}.`
+        : `**Coverage:** ${rows.length} claims; primary/benchmark/safety=${primary.length}; survey=${surveys.length}; metadata-only=${metadataOnly.length}.`,
       '',
       ...bullets,
       '',
@@ -1471,7 +1608,19 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
       '',
       `This synthesis is based on ${selected.length} selected sources, ${read.length} read full-text sources, ${reviews.length} review/survey sources, and ${claims.length} supported evidence claims. It separates raw discovery from the evidence base: only selected and read material is used for conclusions.`,
       '',
-      'The main picture is that reinforcement learning for LLMs has split into several practical streams: preference optimization for alignment, verifiable-reward training for reasoning, production post-training frameworks, and safety/robustness analysis. The strongest claims are those repeatedly supported by method papers and review-style sources; weaker areas are called out explicitly.',
+      `The strongest parts of the report are the sections with multiple linked claims, read sources, and direct quotes. Sections with metadata-only evidence, failed full-text access, or few independent sources are treated as limitations rather than settled conclusions.`,
+      '',
+      '## How To Use This Report',
+      '',
+      '- Source IDs are clickable when an external URL is available, for example `[S1](...)` links to the paper page or DOI.',
+      '- `full text` links open the local artifact saved under this research run.',
+      '- Metadata-only evidence is marked explicitly and should be treated as weaker than full-text evidence.',
+      '',
+      '## Direction Matrix',
+      '',
+      '| Research question | Evidence coverage | Evidence strength | Evidence links |',
+      '|---|---|---|---|',
+      ...directionRows,
       '',
       '## Method And Scope',
       '',
@@ -1479,21 +1628,27 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
       '',
       '## Evaluation Criteria And Benchmarks',
       '',
-      'The synthesis evaluates papers by reward formulation, optimization objective, evidence type, benchmark setting, recency, and whether claims are grounded in full-text passages or abstract-only evidence. Reasoning-oriented RL papers are interpreted separately from alignment/preference-optimization papers because their reward signals, evaluation metrics, and failure modes differ.',
+      'The synthesis evaluates sources by relevance to each research question, evidence type, recency, authority, independence, and whether claims are grounded in full-text passages or only in metadata/abstracts. Stronger conclusions require multiple read sources or direct primary evidence; weaker conclusions are explicitly marked.',
       '',
       '## Evidence Base',
       '',
+      `| # | ${sourceHeader} | ${typeHeader} | ${priorityHeader} | ${planHeader} | ${localArtifactHeader} | ${corpusIdHeader} |`,
+      '|---|---|---|---|---|---|---|',
       ...topSources,
       '',
       '## Review And Survey Anchors',
       '',
-      ...reviewLines.map((line) => line.replace('обзорная рамка для интерпретации первичных результатов', 'review context for interpreting primary results').replace('Обзорных источников в selected corpus недостаточно; это должно считаться ограничением, а не нормой.', 'Review/survey coverage is insufficient; this must be treated as a limitation, not as acceptable coverage.')),
+      ...reviewLines,
+      '',
+      '## Unavailable High-Priority Sources',
+      '',
+      ...unavailableLines,
       '',
       sectionText,
       '',
       '## Cross-Source Interpretation',
       '',
-      'Across the evidence, the important distinction is not simply “RL works” versus “RL does not work”. The research separates by reward source, optimization objective, supervision cost, benchmark type, and deployment constraints. Preference optimization methods are attractive because they simplify training, while PPO/online RL variants remain competitive when the task needs stronger exploration or interaction. Verifiable reward methods are especially important for reasoning tasks because they reduce reliance on subjective preference labels.',
+      'Across the evidence, the important distinction is between well-supported findings, plausible but thin findings, and unresolved gaps. The synthesis prioritizes claims that connect to stable corpus IDs, direct quotes, and read local artifacts. Claims supported only by metadata, snippets, or unavailable high-priority sources are kept visible but not over-weighted.',
       '',
       '## Limitations',
       '',
@@ -1503,67 +1658,85 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
       '',
       '## Practical Takeaways',
       '',
-      '- Build the literature base around both primary method papers and review/survey papers.',
-      '- Keep RL-for-reasoning, RLHF/alignment, and tooling/framework papers as separate tracks.',
-      '- Do not let generic LLM papers enter the core evidence base unless they directly address RL, rewards, post-training, alignment, or reasoning.',
+      '- Use the source table and per-question sections to see which conclusions are strongly supported and which need more reading.',
+      '- Treat one-source findings as provisional until confirmed by another independent source or by a stronger full-text passage.',
+      '- Keep raw discovery separate from the evidence base; do not cite items that were not selected/read or explicitly marked as metadata-only.',
       '',
       '## Future Directions And Trends',
       '',
-      '- Expect more work on verifiable rewards, process supervision, and hybrid RL/preference optimization for reasoning.',
-      '- Safety research should track reward hacking, proxy misspecification, and evaluation leakage as models and benchmarks scale.',
-      '- Production systems will likely separate data curation, reward design, online evaluation, and post-training orchestration more explicitly.',
+      '- Follow-up work should target the weakest plan sections first: low source diversity, metadata-only support, or failed full-text access.',
+      '- The next search pass should prioritize replacement sources for unavailable high-priority items and direct primary evidence for thin claims.',
+      '- If this report is used for decision-making, rerun quality gates after adding or replacing evidence so limitations stay visible.',
     ].join('\n')
   }
 
   return [
     '## Краткое резюме',
     '',
-    `Этот обзор основан на ${selected.length} отобранных источниках, ${read.length} прочитанных full-text источниках, ${reviews.length} обзорных/survey источниках и ${claims.length} поддержанных evidence-claims. Важно: raw corpus не считается доказательной базой; выводы строятся только по selected/read источникам.`,
+    `Этот обзор основан на ${selected.length} отобранных источниках, ${read.length} прочитанных полнотекстовых источниках, ${reviews.length} обзорных источниках и ${claims.length} поддержанных доказательных утверждениях. Важно: сырой корпус не считается доказательной базой; выводы строятся только по отобранным и прочитанным источникам.`,
     '',
-    'Главная картина такая: RL для LLM в 2024–2026 годах распадается на несколько практических линий — preference optimization для alignment, verifiable rewards для reasoning, production-фреймворки post-training и отдельный пласт safety/robustness. Сильными считаются только те выводы, которые привязаны к прочитанным источникам и claim-level evidence; слабые зоны явно вынесены в ограничения.',
+    'Самые сильные части отчёта — те, где есть несколько связанных доказательных утверждений, прочитанные источники и прямые цитаты. Разделы, где опора идёт только на метаданные, аннотации, единичные источники или недоступный полный текст, отмечаются как ограничения, а не как окончательные выводы.',
+    '',
+    '## Как пользоваться отчётом',
+    '',
+    '- Названия источников и ID корпуса кликабельны, если доступен внешний URL/DOI.',
+    '- Ссылки `полный текст` открывают локально сохранённый артефакт внутри `.research/.../fulltext`.',
+    '- Доказательства уровня “только метаданные/аннотация” явно помечаются и считаются слабее полнотекстовых доказательств.',
+    '',
+    '## Матрица направлений',
+    '',
+    '| Исследовательский вопрос | Покрытие доказательствами | Сила доказательств | Ссылки на доказательства |',
+    '|---|---|---|---|',
+    ...directionRows,
     '',
     '## Метод и подход к отбору источников',
     '',
-    `Пайплайн отделяет raw discovery (${corpus.length} элементов корпуса) от доказательной базы (${selected.length} selected, ${read.length} read). Источники отбирались по topical precision, свежести, авторитетности, наличию обзорных/survey работ, доступности full text и связи с claim-level evidence. Выводы ниже строятся только на selected/read источниках и поддержанных claims, а не на сырых поисковых совпадениях.`,
+    `Пайплайн отделяет сырое обнаружение источников (${corpus.length} элементов корпуса) от доказательной базы (${selected.length} ${selectedLabel}, ${read.length} ${readLabel}). Источники отбирались по тематической точности, свежести, авторитетности, наличию обзорных работ, доступности полного текста и связи с доказательными утверждениями. Выводы ниже строятся только на отобранных/прочитанных источниках и поддержанных утверждениях, а не на сырых поисковых совпадениях.`,
     '',
     '## Метрики и критерии оценки',
     '',
-    'Работы сравниваются по типу reward signal, цели оптимизации, виду evidence, benchmark setting, свежести и тому, есть ли привязка к full-text passage или только abstract-only caveat. RL-for-reasoning анализируется отдельно от alignment/preference optimization, потому что у этих веток разные reward signals, метрики и failure modes.',
+    'Источники сравниваются по релевантности к каждому вопросу плана, виду доказательства, свежести, авторитетности, независимости и тому, есть ли привязка к полнотекстовому фрагменту или только к аннотации/метаданным. Сильные выводы требуют нескольких прочитанных источников или прямого первичного доказательства; слабые выводы помечаются явно.',
     '',
     '## Доказательная база',
     '',
+    `| # | ${sourceHeader} | ${typeHeader} | ${priorityHeader} | ${planHeader} | ${localArtifactHeader} | ${corpusIdHeader} |`,
+    '|---|---|---|---|---|---|---|',
     ...topSources,
     '',
-    '## Обзорные и survey-источники',
+    '## Обзорные источники',
     '',
     ...reviewLines,
+    '',
+    '## Недоступные источники высокого приоритета',
+    '',
+    ...unavailableLines,
     '',
     sectionText,
     '',
     '## Сквозная интерпретация',
     '',
-    'Ключевой вывод не сводится к простой формуле “RL работает” или “RL не работает”. В литературе различаются источник награды, тип оптимизации, стоимость supervision, характер benchmark и ограничения production-развёртывания. Методы preference optimization привлекательны из-за простоты и стабильности, но PPO/online RL-варианты остаются важными там, где нужна интерактивность, exploration или более сильная оптимизация поведения. Verifiable-reward подходы особенно важны для reasoning-задач, потому что уменьшают зависимость от субъективных preference labels.',
+    'Сквозная интерпретация отделяет хорошо подтверждённые выводы от правдоподобных, но тонко подкреплённых утверждений и нерешённых пробелов. Приоритет получают утверждения, связанные со стабильными ID корпуса, прямыми цитатами и локально сохранёнными прочитанными артефактами. Утверждения, основанные только на метаданных, сниппетах или недоступных high-priority источниках, остаются видимыми, но не переоцениваются.',
     '',
     '## Ограничения и риски интерпретации',
     '',
-    '- Нельзя считать evidence источники, которые остались queued, failed или были найдены только в raw corpus.',
-    '- High-priority источники с failed full-text должны быть заменены аналогами или явно отмечены как пробел.',
-    '- Citation count и venue важны для ранжирования, но свежие статьи 2025–2026 могут быть значимыми даже при низком числе цитирований.',
-    '- Generic LLM-статьи не должны попадать в ядро обзора, если в них нет прямой связи с RL, reward models, post-training, alignment или reasoning.',
+    '- Нельзя считать доказательной базой источники, которые остались в очереди, не прочитались или были найдены только в сыром корпусе.',
+    '- Источники высокого приоритета с недоступным полным текстом должны быть заменены аналогами или явно отмечены как пробел.',
+    '- Число цитирований и качество площадки важны для ранжирования, но свежие статьи 2025–2026 годов могут быть значимыми даже при низком числе цитирований.',
+    '- Общие или слишком широкие источники не должны попадать в ядро обзора, если они не отвечают напрямую на вопросы плана.',
     '',
     '## Практические выводы',
     '',
-    '- Корпус нужно строить из двух слоёв: обзорные/survey статьи для карты области и первичные method/benchmark/tool papers для конкретных утверждений.',
-    '- RL-for-reasoning, RLHF/alignment и tooling/frameworks лучше анализировать как разные ветки, а не смешивать в одну кучу.',
-    '- Для каждого крупного вывода нужен corpus ID, quote/passage и понимание, является ли источник первичным результатом, обзором или background.',
+    '- Используйте таблицу источников и секции по вопросам, чтобы быстро увидеть, какие выводы сильные, а какие требуют дополнительного чтения.',
+    '- Выводы, основанные на одном источнике, лучше считать предварительными до подтверждения независимым источником или более сильной полнотекстовой цитатой.',
+    '- Для каждого крупного вывода нужен ID корпуса, цитата/фрагмент и понимание, является ли источник первичным результатом, обзором или контекстом.',
     '',
     '## Тренды и дальнейшие направления',
     '',
-    '- Вероятно усиление работ по verifiable rewards, process supervision и гибридным RL/preference-optimization схемам для reasoning.',
-    '- Safety-направление должно отдельно отслеживать reward hacking, proxy misspecification и benchmark leakage.',
-    '- Production-пайплайны будут всё явнее разделять data curation, reward design, online evaluation и orchestration post-training.',
+    '- Следующий проход исследования должен начинаться с самых слабых секций плана: мало источников, только метаданные или недоступный полный текст.',
+    '- Следующий поиск должен приоритизировать замены для недоступных high-priority источников и первичные источники для тонко подкреплённых утверждений.',
+    '- Если отчёт используется для принятия решений, после добавления или замены evidence нужно снова прогнать проверки качества.',
     '',
-    '## Приложение: evidence claims',
+    '## Приложение: доказательные утверждения',
     '',
     ...claims.slice(0, 30).map((claim) => `- ${claim.claim} Источники: ${cite(claim)}.`),
   ].join('\n')
@@ -1659,10 +1832,10 @@ function writeFile(filePath: string, content: string, workspace: string): string
   return `Created ${filePath} (${lines} lines, ${content.length} bytes)`
 }
 
-function runNodeScript(source: string, args: string[]): string {
+function runNodeScript(source: string, args: string[], timeoutMs = 120000): string {
   return execFileSync(process.execPath, ['-e', source, ...args], {
     encoding: 'utf-8',
-    timeout: 120000,
+    timeout: timeoutMs,
     maxBuffer: 1024 * 1024 * 10,
     env: {
       ...process.env,
@@ -1670,6 +1843,25 @@ function runNodeScript(source: string, args: string[]): string {
       ELECTRON_RUN_AS_NODE: '1',
     },
   })
+}
+
+/**
+ * Snippet injected into spawned fetch scripts so every network request has a hard
+ * abort deadline. Without this a slow/hung host blocks the synchronous worker thread
+ * for the full process timeout (no events emitted), which both looks like "the search
+ * tool never responds" and eventually trips the run watchdog. Use together with a
+ * runNodeScript timeout that is a few seconds larger than the abort deadline so the
+ * fetch aborts first and produces a clean, actionable error.
+ */
+function fetchWithTimeoutSnippet(ms: number): string {
+  return `const __ctrl = new AbortController()
+const __timer = setTimeout(() => __ctrl.abort(), ${ms})
+const __abortSignal = __ctrl.signal
+const __fetchErr = (err) => {
+  const name = err && err.name
+  if (name === 'AbortError' || name === 'TimeoutError') return 'request timed out after ${Math.round(ms / 1000)}s'
+  return String((err && err.message) || err)
+}`
 }
 
 function normalizeArxivId(input: string): string {
@@ -1832,7 +2024,9 @@ function generateReport(
 
   const date = new Date().toISOString().slice(0, 10)
   const contentWithoutDuplicateTitle = trimmedContent.replace(new RegExp(`^#\\s+${escapeRegExp(trimmedTitle)}\\s*\\n+`, 'i'), '')
-  const report = `# ${trimmedTitle}\n\n*Generated: ${date}*\n\n${contentWithoutDuplicateTitle}${references}\n`
+  const isRussianReport = /[а-яё]/i.test(`${trimmedTitle}\n${contentWithoutDuplicateTitle.slice(0, 1200)}`)
+  const generatedLabel = isRussianReport ? 'Сгенерировано' : 'Generated'
+  const report = `# ${trimmedTitle}\n\n*${generatedLabel}: ${date}*\n\n${contentWithoutDuplicateTitle}${references}\n`
 
   fs.writeFileSync(targetPath, report, 'utf-8')
   const relPath = path.relative(workspace, targetPath)
@@ -1993,6 +2187,7 @@ function searchArxiv(
     ? ` AND submittedDate:[${normalizedFrom ? normalizedFrom + '0000' : '*'} TO ${normalizedTo ? normalizedTo + '2359' : '*'}]`
     : ''
   const script = `
+${fetchWithTimeoutSnippet(25000)}
 const query = process.argv[1]
 const limit = Number(process.argv[2] || '5')
 const sortBy = process.argv[3] || 'relevance'
@@ -2003,22 +2198,26 @@ const startOffset = Number(process.argv[6] || '0')
 const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=' + startOffset + '&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
 fetch(url, {
   headers: { 'User-Agent': 'one-click-research-agent/0.1' },
+  signal: __abortSignal,
 }).then(async (res) => {
   if (!res.ok) throw new Error('HTTP ' + res.status)
   const text = await res.text()
   process.stdout.write(text)
 }).catch((err) => {
-  console.error(String(err?.message || err))
+  console.error(__fetchErr(err))
   process.exit(1)
-})
+}).finally(() => clearTimeout(__timer))
 `
 
   let xml = ''
   try {
-    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)])
+    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)], 32000)
   } catch (e: any) {
-    const stderr = String(e?.stderr || e?.message || e)
-    return `Error: failed to search arXiv. ${stderr.trim()}`
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    const hint = /timed out/i.test(stderr)
+      ? ' arXiv (export.arxiv.org) did not respond in time — it may be slow or rate-limiting. Try again, narrow the query, or use search_openalex / search_semantic_scholar instead.'
+      : ''
+    return `Error: failed to search arXiv. ${stderr}${hint}`
   }
 
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map((match) => match[1]).slice(0, limit)
@@ -2093,27 +2292,32 @@ function searchWeb(
   if (effectiveTimeRange) params.set('time_range', effectiveTimeRange)
 
   const script = `
+${fetchWithTimeoutSnippet(25000)}
 const baseUrl = process.argv[1]
 const queryString = process.argv[2]
 fetch(baseUrl + '/search?' + queryString, {
   headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
+  signal: __abortSignal,
 }).then(async (res) => {
   if (!res.ok) throw new Error('HTTP ' + res.status)
   const json = await res.json()
   process.stdout.write(JSON.stringify(json))
 }).catch((err) => {
-  console.error(String(err?.message || err))
+  console.error(__fetchErr(err))
   process.exit(1)
-})
+}).finally(() => clearTimeout(__timer))
 `
 
   let payload: any
   try {
-    const out = runNodeScript(script, [searxngBaseUrl, params.toString()])
+    const out = runNodeScript(script, [searxngBaseUrl, params.toString()], 32000)
     payload = JSON.parse(out)
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
-    return `Error: failed to search via SearXNG. ${stderr}`
+    const hint = /timed out/i.test(stderr)
+      ? ` SearXNG at ${searxngBaseUrl} did not respond in time. If you are using managed SearXNG, the container may still be starting — retry once; otherwise check the backend in Settings.`
+      : ''
+    return `Error: failed to search via SearXNG. ${stderr}${hint}`
   }
 
   const results = Array.isArray(payload?.results) ? payload.results.slice(0, limit) : []
@@ -2401,28 +2605,33 @@ function downloadArxivPdf(arxivId: string, outputPath: string | undefined, works
   const pdfUrl = `https://arxiv.org/pdf/${normalizedId.replace(/v\d+$/, '')}.pdf`
 
   const script = `
+${fetchWithTimeoutSnippet(45000)}
 const url = process.argv[1]
 const outPath = process.argv[2]
 fetch(url, {
   headers: { 'User-Agent': 'one-click-research-agent/0.1' },
+  signal: __abortSignal,
 }).then(async (res) => {
   if (!res.ok) throw new Error('HTTP ' + res.status)
   const arr = new Uint8Array(await res.arrayBuffer())
   require('fs').writeFileSync(outPath, Buffer.from(arr))
   process.stdout.write(String(arr.byteLength))
 }).catch((err) => {
-  console.error(String(err?.message || err))
+  console.error(__fetchErr(err))
   process.exit(1)
-})
+}).finally(() => clearTimeout(__timer))
 `
 
   let byteCount = 0
   try {
-    const out = runNodeScript(script, [pdfUrl, targetPath]).trim()
+    const out = runNodeScript(script, [pdfUrl, targetPath], 55000).trim()
     byteCount = Number(out) || fs.statSync(targetPath).size
   } catch (e: any) {
-    const stderr = String(e?.stderr || e?.message || e)
-    return `Error: failed to download arXiv PDF. ${stderr.trim()}`
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    const hint = /timed out/i.test(stderr)
+      ? ' The PDF download timed out (large file or slow mirror). Skip this source or try the HTML version (arxiv.org/html/<id>).'
+      : ''
+    return `Error: failed to download arXiv PDF. ${stderr}${hint}`
   }
 
   return `Downloaded arXiv PDF ${normalizedId} to ${path.relative(workspace, targetPath) || targetPath} (${byteCount} bytes)`

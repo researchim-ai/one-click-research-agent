@@ -56,7 +56,34 @@ import * as recentWorkspaces from './recent-workspaces'
 import type { ToolInfo, AgentActivity } from './types'
 import { isResearchResumeMessage, compactSessionForWorkerResume } from './research-resume'
 
-const SEND_MESSAGE_TIMEOUT_MS = 20 * 60 * 1000
+// The agent watchdog is an INACTIVITY timeout, not a total-runtime cap. A deep
+// research run legitimately takes much longer than any fixed budget, so killing it
+// on wall-clock time aborts healthy runs mid-flight (the user sees a spurious "stopped
+// by user"). Instead we re-arm this timer on every message from the worker (token
+// streaming, tool calls/results, status, session updates). It only fires when the
+// worker has been genuinely silent — e.g. the inference server or a network fetch hung.
+const AGENT_INACTIVITY_TIMEOUT_MS = 8 * 60 * 1000
+let agentWatchdogTimer: NodeJS.Timeout | null = null
+
+function clearAgentWatchdog(): void {
+  if (agentWatchdogTimer) {
+    clearTimeout(agentWatchdogTimer)
+    agentWatchdogTimer = null
+  }
+}
+
+function armAgentWatchdog(): void {
+  clearAgentWatchdog()
+  agentWatchdogTimer = setTimeout(() => {
+    agentWatchdogTimer = null
+    if (!pendingSendResolve) return
+    agentRunInFlight = false
+    agentWorker?.postMessage({ type: 'cancel' })
+    const minutes = Math.round(AGENT_INACTIVITY_TIMEOUT_MS / 60000)
+    pendingSendResolve(`Error: Агент не присылал прогресс более ${minutes} минут — вероятно, inference-сервер или сетевой запрос завис. Нажмите «Стоп», проверьте сервер/поиск и отправьте «продолжай».`)
+    pendingSendResolve = null
+  }, AGENT_INACTIVITY_TIMEOUT_MS)
+}
 
 function emitAgentActivity(activity: AgentActivity): void {
   try { mainWindow?.webContents.send('agent-event', { type: 'agent_activity', activity }) } catch {}
@@ -65,6 +92,7 @@ function emitAgentActivity(activity: AgentActivity): void {
 let mainWindow: BrowserWindow | null = null
 let agentWorker: Worker | null = null
 let pendingSendResolve: ((result: string) => void) | null = null
+let agentRunInFlight = false
 
 const WORKSPACE_CHANGED_DEBOUNCE_MS = 1200
 let workspaceChangedTimer: ReturnType<typeof setTimeout> | null = null
@@ -162,6 +190,8 @@ function getAgentWorker(): Worker {
     const workerPath = path.join(__dirname, 'agent-worker.js')
     agentWorker = new Worker(workerPath, { stdout: true, stderr: true })
     agentWorker.on('message', (msg: any) => {
+      // Any message from the worker is proof of progress — re-arm the inactivity watchdog.
+      if (pendingSendResolve) armAgentWatchdog()
       if (msg.type === 'emit' && mainWindow) {
         try { mainWindow.webContents.send('agent-event', msg.event) } catch {}
       } else if (msg.type === 'approval' && mainWindow) {
@@ -184,6 +214,8 @@ function getAgentWorker(): Worker {
           agentWorker?.postMessage({ type: 'query-ctx-result', id: msg.id, ctxSize: serverManager.getCtxSize() })
         })
       } else if (msg.type === 'done') {
+        agentRunInFlight = false
+        clearAgentWatchdog()
         if (msg.session) updateSessionFromWorker(msg.session, true)
         if (pendingSendResolve) {
           pendingSendResolve(msg.result ?? '')
@@ -192,6 +224,8 @@ function getAgentWorker(): Worker {
       }
     })
     agentWorker.on('error', (err) => {
+      agentRunInFlight = false
+      clearAgentWatchdog()
       if (pendingSendResolve) {
         pendingSendResolve(`Error: ${err.message}`)
         pendingSendResolve = null
@@ -618,16 +652,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle('send-message', async (_e, msg: string, workspace: string) => {
     if (!mainWindow) throw new Error('No window')
+    if (agentRunInFlight || pendingSendResolve) {
+      return 'Error: Агент ещё выполняет предыдущий запрос. Дождитесь завершения или нажмите «Стоп».'
+    }
     return new Promise<string>((resolve) => {
-      const timer = setTimeout(() => {
-        if (!pendingSendResolve) return
-        agentWorker?.postMessage({ type: 'cancel' })
-        pendingSendResolve('Error: Агент не ответил за 20 минут. Нажмите «Стоп» и отправьте «продолжай» снова.')
-        pendingSendResolve = null
-      }, SEND_MESSAGE_TIMEOUT_MS)
+      armAgentWatchdog()
 
       pendingSendResolve = (result: string) => {
-        clearTimeout(timer)
+        agentRunInFlight = false
+        clearAgentWatchdog()
         resolve(result)
         pendingSendResolve = null
       }
@@ -685,6 +718,7 @@ function registerIpcHandlers() {
         write('}')
         await new Promise<void>((res, rej) => { stream.once('finish', res); stream.once('error', rej); stream.end() })
         emitAgentActivity({ phase: 'starting', label: 'Worker запущен — передаю управление агенту…' })
+        agentRunInFlight = true
         getAgentWorker().postMessage({
           type: 'run',
           payload: { message: msg, workspace, config: configVal, apiUrl, ctxSize, sessionPath },
@@ -695,6 +729,8 @@ function registerIpcHandlers() {
 
   ipcMain.handle('cancel-agent', () => {
     cancelAgent()
+    agentRunInFlight = false
+    clearAgentWatchdog()
     if (agentWorker && pendingSendResolve) agentWorker.postMessage({ type: 'cancel' })
   })
 

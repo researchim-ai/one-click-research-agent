@@ -121,11 +121,16 @@ function ensureManagedJsonApiEnabled(): void {
 from pathlib import Path
 
 path = Path('/etc/searxng/settings.yml')
-lines = path.read_text().splitlines()
+lines = path.read_text().splitlines() if path.exists() else []
 try:
     search_start = next(i for i, line in enumerate(lines) if line.strip() == 'search:')
 except StopIteration:
-    raise SystemExit('search section not found in settings.yml')
+    if lines and lines[-1].strip():
+        lines.append('')
+    lines.extend(['search:', '  formats:', '    - html', '    - json'])
+    path.write_text('\\n'.join(lines) + '\\n')
+    print('patched')
+    raise SystemExit(0)
 
 search_end = len(lines)
 for i in range(search_start + 1, len(lines)):
@@ -137,10 +142,14 @@ for i in range(search_start + 1, len(lines)):
 try:
     formats_start = next(i for i in range(search_start + 1, search_end) if lines[i].strip() == 'formats:')
 except StopIteration:
-    raise SystemExit('search.formats block not found in settings.yml')
+    insert_at = search_start + 1
+    updated_lines = lines[:insert_at] + ['  formats:', '    - html', '    - json'] + lines[insert_at:]
+    path.write_text('\\n'.join(updated_lines) + '\\n')
+    print('patched')
+    raise SystemExit(0)
 
 formats_end = formats_start + 1
-while formats_end < search_end and lines[formats_end].startswith('    - '):
+while formats_end < search_end and (lines[formats_end].startswith('    - ') or lines[formats_end].strip().startswith('- ')):
     formats_end += 1
 
 replacement = ['  formats:', '    - html', '    - json']
@@ -148,7 +157,7 @@ updated_lines = lines[:formats_start] + replacement + lines[formats_end:]
 if updated_lines != lines:
     path.write_text('\\n'.join(updated_lines) + '\\n')
     print('patched')
-elif '    - json' in lines:
+elif any(line.strip() == '- json' for line in lines):
     print('ok')
 else:
     raise SystemExit('failed to enable json format in settings.yml')
@@ -169,9 +178,28 @@ function waitForHealthy(baseUrl: string, timeoutMs = 60000): void {
   throw new Error(`SearXNG did not become healthy in time.\nRecent container logs:\n${logs}`)
 }
 
+// Once the managed container has been verified healthy we cache it for a short
+// window so back-to-back search_web calls don't re-run the expensive ensure path
+// (docker exec to patch settings + potential restart) on the synchronous worker
+// thread. healthcheck() queries the JSON API, so a passing check also proves the
+// json format is enabled — making the fast path correctness-safe.
+let managedVerifiedAt = 0
+const MANAGED_VERIFY_TTL_MS = 5 * 60 * 1000
+
 export function ensureManagedSearxng(): string {
   if (!dockerAvailable()) {
     throw new Error('Docker is not available. Switch web search mode to "Existing SearXNG URL" or install Docker.')
+  }
+
+  const cachedBaseUrl = managedBaseUrl()
+  if (Date.now() - managedVerifiedAt < MANAGED_VERIFY_TTL_MS) {
+    return cachedBaseUrl
+  }
+  // Not in the TTL window, but if it's already serving the JSON API just refresh
+  // the timestamp and return — no need to touch Docker at all.
+  if (healthcheck(cachedBaseUrl)) {
+    managedVerifiedAt = Date.now()
+    return cachedBaseUrl
   }
 
   const state = inspectContainerState()
@@ -186,6 +214,7 @@ export function ensureManagedSearxng(): string {
     ensureManagedJsonApiEnabled()
     const baseUrl = managedBaseUrl()
     waitForHealthy(baseUrl)
+    managedVerifiedAt = Date.now()
     return baseUrl
   } catch {
     removeManagedContainer()
@@ -193,6 +222,7 @@ export function ensureManagedSearxng(): string {
     ensureManagedJsonApiEnabled()
     const baseUrl = managedBaseUrl()
     waitForHealthy(baseUrl)
+    managedVerifiedAt = Date.now()
     return baseUrl
   }
 }

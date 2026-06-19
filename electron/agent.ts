@@ -165,6 +165,43 @@ function hasRecentPlanApprovalPrompt(messages: Message[]): boolean {
   })
 }
 
+function hasPlanCheckpointRequest(messages: Message[]): boolean {
+  return messages.slice(-12).some((m: any) => {
+    if (m.role !== 'user' || typeof m.content !== 'string') return false
+    const t = m.content.toLowerCase()
+    return /checkpoint\s*:\s*plan|user-review checkpoints:[\s\S]*-\s*plan:|checkpoints?:[\s\S]*\bplan\b|останов(и|иться)[\s\S]*план|утверд(ить|ите)[\s\S]*план/.test(t)
+  })
+}
+
+function formatPlanCheckpoint(workspacePath: string, outputDir: string | undefined): string {
+  const plan = parsePlan(workspacePath, outputDir)
+  const lines = [
+    'План исследования сохранён. Вот его структура:',
+    '',
+    '| ID | Подвопрос | Статус |',
+    '|---|---|---|',
+  ]
+  if (plan.length === 0) {
+    lines.push('| - | План сохранён, но пункты не распознаны. Откройте `plan.md` и проверьте структуру. | ⚠️ |')
+  } else {
+    for (const item of plan) {
+      const text = item.text.replace(/^([QA]\d+(\.\d+)*)\.?\s*/, '')
+      lines.push(`| ${item.id} | ${text} | ${item.done ? '✅' : '⬜'} |`)
+    }
+  }
+  lines.push(
+    '',
+    'Что вы хотите сделать?',
+    '',
+    '✅ Утвердить план и перейти к поиску источников',
+    '✏️ Редактировать — что добавить, убрать или изменить в подзадачах?',
+    '📝 Расширить/сузить — нужны ли дополнительные или fewer подзадачи?',
+    '',
+    'Жду вашего решения.',
+  )
+  return lines.join('\n')
+}
+
 function phaseForResearchTool(toolName: string): Parameters<typeof updateResearchRunState>[1]['phase'] | undefined {
   if (toolName === 'plan_research' || toolName === 'update_plan_status') return 'planning'
   if (['build_corpus', 'screen_corpus', 'assign_corpus_to_plan', 'queue_full_text', 'read_corpus_item', 'read_full_text_batch'].includes(toolName)) return 'corpus'
@@ -216,6 +253,7 @@ function followUpQualityGates(
       title: researchTitleFromOutputDir(outputDir),
       output_path: `${outputDir}/report.md`,
       session_id: session.id,
+      report_language: doGetConfig().appLanguage ?? 'ru',
     }, workspace)
     doEmit({ type: 'tool_call', name: 'generate_evidence_report', args: { output_dir: outputDir } })
     doEmit({ type: 'tool_result', name: 'generate_evidence_report', result: genResult.slice(0, 4000) })
@@ -345,6 +383,9 @@ When the task is a managed/deep research run with a \`.research/YYYY-MM-DD_HH-MM
 4. The only valid way to create or repair the final \`report.md\` is \`generate_evidence_report\`. \`write_file\`, \`edit_file\`, \`append_file\`, and \`generate_report\` are blocked for managed \`report.md\` — do not attempt or discuss them.
 5. If quality gates fail, follow the gate repair route shown in the live state, then run \`run_quality_gates\` once with the same \`output_dir\`. Do not discuss shortcuts.
 6. Do not repeat a tool with identical arguments — its result will not change. Use \`list_evidence\` / \`verify_claims\` to check existing claims before adding new ones.
+6a. \`evidence_coverage_by_plan\`, \`evidence_matrix\`, \`list_evidence\`, \`list_selected_corpus\`, \`full_text_status\`, \`verify_claims\` and \`audit_research_run\` are READ-ONLY inspection tools. Call each at most once per decision. They never change state, so re-checking coverage does not move the run forward. Once evidence is recorded, stop inspecting and call \`run_quality_gates\` — that is the terminal step and it auto-generates \`report.md\` when gates pass.
+7. User-review checkpoints are control points, not synthesis tasks. When a checkpoint is requested, finish the required state-changing tool, then stop. Do not generate the same checkpoint prose twice, and do not continue to the next phase until the user approves.
+8. Preset advice is secondary. If preset guidance suggests a tool that is not listed in the live "Allowed next tools", ignore the preset and choose an allowed workflow tool.
 
 ## Time awareness
 
@@ -363,8 +404,9 @@ When the task is a managed/deep research run with a \`.research/YYYY-MM-DD_HH-MM
 
 ## Communication
 
-- Think step by step. Before calling tools or replying, briefly reason in **hidden scratchpad** wrapped in \`<think> ... </think>\`.
-- Keep the visible answer clean: no \`<think>\` tags.
+- Use hidden reasoning internally when needed, but do not emit \`<think>\` tags yourself.
+- Emit each action as a native tool call. Do not narrate the call you are "about to make" and then stop — when you have decided on a tool, actually call it that same turn.
+- Keep the visible answer clean: no \`<think>\` tags and no raw tool-call markup unless the native tool-call channel is unavailable.
 - Be concise and practical.
 - Use markdown.
 - Respond in the language specified in the Environment section.
@@ -405,9 +447,12 @@ const COMPACT_SYSTEM_PROMPT = `You are a local-first autonomous research agent w
 - Keep outputs structured and concise
 - Use the current date from the environment for freshness-sensitive searches
 - For "latest/recent/today" requests, prefer date-aware sorting and filters over plain relevance
-- Think step by step in <think>...</think> tags
+- Use hidden reasoning internally when needed, but do not emit <think> tags or put tool calls inside reasoning
 - Be concise. Respond in the user's language
-- Prefer read_file over shell file reads`
+- Prefer read_file over shell file reads
+
+## Managed research runs
+If a \`.research/YYYY-MM-DD_HH-MM-SS_...\` run directory is present, treat it as the run database. Always pass exact \`output_dir\` to research tools. The live "Research state" block at the end of the conversation is authoritative: choose one tool from "Allowed next tools" and call it. Final \`report.md\` may be created or repaired only via \`generate_evidence_report\`. At user-review checkpoints, stop after the required state-changing tool and wait for approval; do not duplicate checkpoint prose or continue to the next phase.`
 
 function getOsInfo(): string {
   const platform = process.platform
@@ -838,6 +883,13 @@ function extractThinking(content: string): [string, string] {
     thinking += (thinking ? '\n' : '') + match[1].trim()
   }
   visible = content.replace(re, '').trim()
+  const openThink = visible.search(/<think>/i)
+  if (openThink >= 0) {
+    const before = visible.slice(0, openThink).trim()
+    const after = visible.slice(openThink).replace(/<think>/i, '').trim()
+    thinking += (thinking && after ? '\n' : '') + after
+    visible = before
+  }
   return [thinking, visible]
 }
 
@@ -2439,18 +2491,42 @@ function toolLoopSignature(toolName: string, toolArgs: Record<string, any>): str
     const claim = String(toolArgs.claim ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160)
     return `${toolName}:${claim}:${toolArgs.plan_item_id ?? ''}:${String(toolArgs.corpus_ids ?? toolArgs.corpusIds ?? '').slice(0, 48)}`
   }
-  if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName)) {
+  if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName)) {
     return `${toolName}:${toolArgs.output_dir ?? ''}`
   }
   return `${toolName}:${JSON.stringify(toolArgs)}`
 }
 
 function isLoopSensitiveTool(toolName: string): boolean {
-  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName)
+  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName)
 }
 
 function duplicateToolThreshold(toolName: string): number {
-  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus'].includes(toolName) ? 1 : 2
+  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName) ? 1 : 2
+}
+
+/**
+ * Forward-driving message returned when a read-only inspection tool is called
+ * repeatedly with identical arguments. Inspection tools never change state, so
+ * the only useful move is to advance the workflow. For research runs the
+ * terminal path is run_quality_gates (which auto-generates report.md once gates
+ * pass), so we point the model there instead of letting it re-inspect forever.
+ */
+function loopBreakDirective(toolName: string): string {
+  const INSPECTION_TOOLS = new Set([
+    'evidence_coverage_by_plan', 'evidence_matrix', 'list_evidence', 'list_selected_corpus',
+    'full_text_status', 'verify_claims', 'audit_research_run', 'gate_report',
+  ])
+  if (toolName === 'record_evidence') {
+    return `You already recorded this evidence claim. Use list_evidence / verify_claims, fix quality gate blockers if any, then proceed to generate_evidence_report. Do not re-record duplicates.`
+  }
+  if (toolName === 'run_quality_gates') {
+    return `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
+  }
+  if (INSPECTION_TOOLS.has(toolName)) {
+    return `You already called ${toolName}; this is a read-only inspection tool and its result will not change. Stop inspecting. Per-section coverage is whatever it is — if a section is genuinely short, record one more grounded claim with record_evidence/extract_evidence_from_corpus_item; otherwise call run_quality_gates now (it auto-generates report.md once gates pass). Do not call any inspection tool again.`
+  }
+  return `You already called ${toolName} with these exact arguments; the result hasn't changed. Stop re-running it and proceed with the next concrete step from the live Research state. If gates are the next step, call run_quality_gates once.`
 }
 
 export async function runAgent(userMessage: string, ws: string, bridge: AgentBridge): Promise<string> {
@@ -2807,20 +2883,57 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     }
 
     // --- Recover text-based tool calls (native API is primary; this is the fallback) ---
-    // Only parse the VISIBLE content (after stripping <think>). Tool calls the model writes
-    // inside its reasoning scratchpad are deliberation, not commitments — executing them
-    // produces phantom/looping calls. We recover only what the model actually emitted as output.
+    // Primary recovery target is the VISIBLE content (after stripping <think>).
+    //
+    // Reasoning models (Qwen3, etc.) frequently emit their committed tool call inside
+    // the reasoning channel and leave the visible content empty. Nagging them to move
+    // the call to the native channel just burns turns and eventually aborts the run, so
+    // when the model produced NOTHING but reasoning that ends in a tool call, we recover
+    // the LAST tool call it decided on and execute it as a real action. This is bounded:
+    // the loop guard below short-circuits repeated identical inspection calls and points
+    // the model forward, and we only ever take the single final call (not speculative
+    // intermediate ones), so it cannot run away.
     if (!toolCalls && content) {
       const [thinking, visibleForTools] = extractThinking(content)
-      const textCalls = extractTextToolCalls(visibleForTools)
+      let textCalls = extractTextToolCalls(visibleForTools)
+      let recoveredFromReasoning = false
+      if (textCalls.length === 0 && !visibleForTools.trim() && thinking) {
+        const hiddenCalls = extractTextToolCalls(thinking)
+        if (hiddenCalls.length > 0) {
+          textCalls = [hiddenCalls[hiddenCalls.length - 1]]
+          recoveredFromReasoning = true
+        }
+      }
       if (textCalls.length > 0) {
-        debugLog('TEXT_TOOL', `Recovered ${textCalls.length} text-based tool call(s) from visible content: ${textCalls.map((t) => t.name).join(', ')}`)
+        debugLog('TEXT_TOOL', `Recovered ${textCalls.length} text-based tool call(s) from ${recoveredFromReasoning ? 'reasoning channel' : 'visible content'}: ${textCalls.map((t) => t.name).join(', ')}`)
+        if (recoveredFromReasoning) {
+          doEmit({ type: 'status', content: '↪️ Модель оставила tool call в reasoning — выполняю его как зафиксированное действие.' })
+        }
         if (thinking) {
           doEmit( { type: 'thinking', content: cleanThinkingText(thinking) })
         }
 
         const recoveredCustomTools = doGetConfig().customTools
+        const uniqueTextCalls: typeof textCalls = []
+        const seenTextCallSigs = new Set<string>()
         for (const tc of textCalls) {
+          const rawSig = toolLoopSignature(tc.name, tc.args)
+          if (seenTextCallSigs.has(rawSig)) continue
+          seenTextCallSigs.add(rawSig)
+          uniqueTextCalls.push(tc)
+        }
+        if (uniqueTextCalls.length < textCalls.length) {
+          doEmit({
+            type: 'status',
+            content: `⚠️ Модель повторила ${textCalls.length - uniqueTextCalls.length} одинаковых tool call(s) в одном ответе; выполняю каждый уникальный вызов только один раз.`,
+          })
+          messages.push({
+            role: 'user',
+            content: `[Runtime guard] You emitted duplicate text-based tool calls in one answer. The runtime executed each unique tool+args at most once. Continue with the next allowed workflow action; do not repeat identical calls.`,
+          })
+        }
+
+        for (const tc of uniqueTextCalls) {
           const isCustom = recoveredCustomTools.some((ct: any) => ct.name === tc.name)
           const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report', 'build_corpus', 'assign_corpus_to_plan', 'record_evidence', 'extract_evidence_from_corpus_item', 'repair_evidence_quotes', 'verify_claims', 'run_quality_gates', 'gate_report', 'generate_evidence_report'])
           let toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
@@ -2833,7 +2946,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           if (textToolSig === lastToolSig && isLoopSensitiveTool(tc.name)) {
             sameToolRepeatCount++
             if (sameToolRepeatCount >= duplicateToolThreshold(tc.name)) {
-              const skipMsg = `You already called ${tc.name} with the same arguments; the result has not changed. Continue with the next concrete step (see the research state at the end of the conversation).`
+              const skipMsg = loopBreakDirective(tc.name)
               const callId = `text_tc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
               messages.push({
                 role: 'assistant',
@@ -2921,8 +3034,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     }
 
     // --- Truly empty response handling ---
-    // Also treat responses that are ONLY thinking (no visible content) as empty
-    const visibleContent = content ? extractThinking(content)[1].trim() : ''
+    // A response that is only reasoning with a committed tool call is recovered and
+    // executed in the text-tool-call recovery block above, so by this point a response
+    // with no visible content and no tool calls really is empty (pure deliberation with
+    // no committed action). Treat it as an empty response and nudge the model forward.
+    const [, visibleForEmpty] = content ? extractThinking(content) : ['', '']
+    const visibleContent = visibleForEmpty.trim()
     const isEffectivelyEmpty = !visibleContent && !toolCalls
     if (isEffectivelyEmpty) {
       const usedTokens = estimateContextTokens(messages)
@@ -2942,7 +3059,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           const afterTool = lastMsg?.role === 'tool'
           const nudge = afterTool
             ? 'The tool above returned a result. Please analyze it and continue with the task. Respond in the user\'s language.'
-            : 'Please respond to the user\'s request. Think step by step and use tools as needed.'
+            : 'Please respond to the user\'s request. Use tools as needed, but do not emit reasoning tags or tool-call markup inside reasoning.'
           messages.push({ role: 'user', content: `[System: empty response detected, retry ${emptyRetries}/${getMaxEmptyRetries()}] ${nudge}` })
           debugLog('EMPTY', `Added nudge message (afterTool=${afterTool})`)
           doEmit( { type: 'status', content: `⚠️ Пустой ответ от модели — повторяю с подсказкой (${emptyRetries}/${getMaxEmptyRetries()})…` })
@@ -3004,8 +3121,31 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       continue
     }
 
-    // Execute tool calls
+    // Execute tool calls. A single model turn may occasionally contain the same
+    // call many times; execute each unique function+args at most once.
+    const uniqueValidToolCalls: typeof validToolCalls = []
+    const seenNativeCallSigs = new Set<string>()
     for (const tc of validToolCalls) {
+      const fn = tc.function
+      let argsForSig: Record<string, any>
+      try {
+        argsForSig = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : fn.arguments
+      } catch {
+        argsForSig = {}
+      }
+      const sig = toolLoopSignature(fn.name, argsForSig)
+      if (seenNativeCallSigs.has(sig)) continue
+      seenNativeCallSigs.add(sig)
+      uniqueValidToolCalls.push(tc)
+    }
+    if (uniqueValidToolCalls.length < validToolCalls.length) {
+      doEmit({
+        type: 'status',
+        content: `⚠️ Модель повторила ${validToolCalls.length - uniqueValidToolCalls.length} одинаковых native tool call(s); выполняю каждый уникальный вызов только один раз.`,
+      })
+    }
+
+    for (const tc of uniqueValidToolCalls) {
       const fn = tc.function
       const toolName = fn.name
       let toolArgs: Record<string, any>
@@ -3034,11 +3174,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         sameToolRepeatCount++
         debugLog('LOOP', `Duplicate ${toolName} call #${sameToolRepeatCount + 1}: ${toolArgs.path ?? toolArgs.claim?.slice?.(0, 60) ?? ''}`)
         if (sameToolRepeatCount >= duplicateToolThreshold(toolName)) {
-          const skipMsg = toolName === 'record_evidence'
-            ? `You already recorded this evidence claim. Use list_evidence / verify_claims, fix quality gate blockers if any, then proceed to generate_evidence_report. Do not re-record duplicates.`
-            : (toolName === 'run_quality_gates' || toolName === 'gate_report')
-              ? `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
-              : `You already called ${toolName} with these exact arguments ${sameToolRepeatCount + 1} times. The result hasn't changed. Stop re-reading and proceed with the actual task. If you need to modify a file, use edit_file. If you're stuck, explain what you're trying to do.`
+          const skipMsg = loopBreakDirective(toolName)
           messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: skipMsg })
           doEmit({ type: 'tool_result', name: toolName, result: skipMsg })
           continue
@@ -3087,18 +3223,6 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         }
       }
 
-      // Human-in-the-loop approval for plan_research when enabled
-      const cfgSnap = doGetConfig() as any
-      if (toolName === 'plan_research' && cfgSnap.approvalForPlans) {
-        const approved = await doRequestApproval(toolName, toolArgs)
-        if (!approved) {
-          const denied = '[Denied by user] plan_research was not approved.'
-          messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: denied })
-          doEmit({ type: 'tool_result', name: toolName, result: denied })
-          continue
-        }
-      }
-
       // Request user approval when enabled for file ops or commands (or custom tools)
       let result: string
       const customTools = doGetConfig().customTools
@@ -3128,6 +3252,18 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       }
 
       result = followUpQualityGates(toolName, toolArgs, result, session, workspace)
+
+      if (toolName === 'plan_research' && !result.startsWith('Error')) {
+        const planOutputDir = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/') : activeResearchOutputDir ?? undefined
+        const savedPlan = planOutputDir ? parsePlan(workspace, planOutputDir) : []
+        if (savedPlan.length === 0) {
+          result = [
+            'Error: plan_research reported success, but plan.md was not found or could not be parsed.',
+            `output_dir=${planOutputDir || 'missing'}`,
+            'The managed research run cannot continue until plan.md exists on disk.',
+          ].join('\n')
+        }
+      }
 
       if (toolArgs.output_dir) {
         activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
@@ -3185,6 +3321,17 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       const llmResult = smartTruncateToolResult(toolName, result, maxToolChars)
 
       messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: llmResult })
+
+      if (toolName === 'plan_research' && !result.startsWith('Error') && hasPlanCheckpointRequest(messages)) {
+        const checkpoint = formatPlanCheckpoint(workspace, activeResearchOutputDir ?? toolArgs.output_dir)
+        fullResponse = fullResponse ? `${fullResponse}\n\n${checkpoint}` : checkpoint
+        messages.push({ role: 'assistant', content: checkpoint })
+        doEmit({ type: 'response', content: fullResponse, done: true })
+        session.messages = messages
+        session.updatedAt = Date.now()
+        doSaveSession(session)
+        return fullResponse
+      }
     }
 
     // Research state is injected fresh as a tail message on every LLM call

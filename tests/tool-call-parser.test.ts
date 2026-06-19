@@ -45,6 +45,31 @@ describe('extractTextToolCalls (JSON)', () => {
   })
 })
 
+describe('extractTextToolCalls (reasoning-channel recovery payloads)', () => {
+  // The runtime recovers the LAST committed tool call emitted inside the reasoning
+  // channel when the model produced no visible content or native tool call. These
+  // payloads mirror what Qwen3 actually wrote in the bug report.
+  it('parses the exact evidence_coverage_by_plan call the model wrote inside reasoning', () => {
+    const reasoning = 'Состояние: 16 доказательств. Проверю покрытие по планам.' +
+      '<tool_call><function=evidence_coverage_by_plan><parameter=output_dir>.research/2026-06-17_23-47-50_rl-b-llm</parameter></function></tool_call>'
+    const calls = extractTextToolCalls(reasoning)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('evidence_coverage_by_plan')
+    expect(calls[0].args.output_dir).toBe('.research/2026-06-17_23-47-50_rl-b-llm')
+  })
+
+  it('returns calls in order so the runtime can pick the LAST committed one', () => {
+    const reasoning = 'First I might inspect…' +
+      '<tool_call><function=evidence_coverage_by_plan><parameter=output_dir>.research/x</parameter></function></tool_call>' +
+      ' …but actually the right move is to run gates.' +
+      '<tool_call><function=run_quality_gates><parameter=output_dir>.research/x</parameter></function></tool_call>'
+    const calls = extractTextToolCalls(reasoning)
+    expect(calls.map((c) => c.name)).toEqual(['evidence_coverage_by_plan', 'run_quality_gates'])
+    const last = calls[calls.length - 1]
+    expect(last.name).toBe('run_quality_gates')
+  })
+})
+
 describe('extractTextToolCalls (empty)', () => {
   it('returns nothing for plain prose', () => {
     expect(extractTextToolCalls('Just some analysis with no tool calls.')).toEqual([])

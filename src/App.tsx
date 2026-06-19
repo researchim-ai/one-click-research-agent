@@ -161,7 +161,7 @@ export function App() {
         : '- A non-passing report is allowed: still produce it only via `generate_evidence_report`, including blockers and limitations.',
       '',
       'User-review checkpoints (stop and ask me before continuing):',
-      request.checkpoints.includes('plan') ? '- plan: stop after drafting the plan; ask what to edit/approve before searching.' : '',
+      request.checkpoints.includes('plan') ? '- plan: call `plan_research` to save `plan.md`, then stop. The runtime will show the approval checkpoint; do not continue to search before approval and do not duplicate the checkpoint prose.' : '',
       request.checkpoints.includes('corpus') ? '- corpus: stop after corpus building; ask which sources/directions to keep, remove, or prioritize.' : '',
       request.checkpoints.includes('evidence') ? '- evidence: stop after evidence extraction; ask what claims/gaps to revise.' : '',
       request.checkpoints.includes('report') ? '- report: show gaps and quality warnings before the final report; ask for approval or edits.' : '',

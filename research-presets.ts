@@ -59,9 +59,7 @@ Preferred outputs:
 - open questions;
 - practical next steps.
 
-After gathering evidence, use \`reflect\` to self-check your conclusions before presenting them.
-When you discover an important insight, use \`save_finding\` to persist it across sessions.
-At the start of a session, consider using \`recall_findings\` to check if prior research is relevant.`,
+For unmanaged chat research you may use \`reflect\`, \`save_finding\`, or \`recall_findings\` when useful. In managed research runs, only use those tools when they are explicitly listed in the live allowed actions; otherwise follow the workflow tools first.`,
   },
   {
     id: 'deep-research',
@@ -92,12 +90,12 @@ tools, and the report rules — follow them. This preset adds the research minds
 
 ### Reason about evidence
 - Aggregate across sub-questions: common themes, contradictions, consensus vs. minority view vs. speculation.
-- Call \`reflect\` after a synthesis step to surface gaps, bias, and recency issues, then fill the 1-3 most important gaps with targeted searches.
+- Self-check for gaps, bias, and recency issues after synthesis. Use \`reflect\` only when it is allowed by the live workflow state; otherwise fill the most important gaps with an allowed search/read/evidence tool.
 - Every claim must trace to a specific source; state limitations of your search (e.g. open-access / English-only).
 
 ### Output
 - The final \`report.md\` is a narrative synthesis produced by \`generate_evidence_report\`; \`evidence-report.md\` is its technical appendix.
-- Use \`export_report\` for PDF/DOCX/BibTeX and \`save_finding\` to persist key conclusions across sessions.`,
+- Use \`export_report\` only after the managed report exists and the live workflow state allows export. Use \`save_finding\` only outside managed runs or when explicitly allowed.`,
   },
   {
     id: 'ml-ai',
@@ -168,7 +166,7 @@ When producing outputs, prefer sections like:
 After building a shortlist, use \`reflect\` to check for gaps in coverage, recency, or methodological diversity.
 Use \`save_finding\` to preserve key paper comparisons across sessions.
 Use \`fetch_url\` to pull full-text HTML/PDF from any project page; \`parse_document\` when the user attaches a PDF.
-Before producing a final report, call \`verify_sources\` and then \`export_report\` to produce PDF/DOCX/BibTeX output.`,
+Before a non-managed final report, call \`verify_sources\` and optionally \`export_report\`. In managed research, follow the live workflow state and produce \`report.md\` via \`generate_evidence_report\`.`,
   },
   {
     id: 'opensource-analysis',
@@ -222,7 +220,7 @@ Preferred search entry points:
 - \`smart_search\` when you want the router to pick the right engines automatically;
 - \`fetch_url\` / \`parse_document\` to pull full text of papers and supplementary materials.
 
-Always finish with \`reflect\` and, before a final report, \`verify_sources\`.`,
+For unmanaged research, finish with \`reflect\` and source verification when useful. In managed research, follow the live workflow state and quality gates.`,
   },
   {
     id: 'mathematics',

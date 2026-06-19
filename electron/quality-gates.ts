@@ -183,19 +183,32 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   if (fs.existsSync(reportPath)) {
     const report = fs.readFileSync(reportPath, 'utf-8')
     const headings = (report.match(/^##\s+/gm) || []).length
+    const tables = (report.match(/^\|.+\|\s*$/gm) || []).length
+    const markdownLinks = (report.match(/\[[^\]]+\]\((https?:\/\/|[^)#][^)]+)\)/g) || []).length
+    const localArtifactLinks = (report.match(/\[[^\]]*(?:full text|полный текст|локальный артефакт)[^\]]*\]\((?:\.\/)?fulltext\/[^)]+\)/gi) || []).length
+    const sourceIdLinks = (report.match(/\[[a-f0-9]{10}\]\(https?:\/\/[^)]+\)/gi) || []).length
+    const metadataOnlyMentions = (report.match(/metadata-only|abstract-only|только метаданн|только аннотац/gi) || []).length
+    const qSections = (report.match(/^##\s+Q\d+\./gm) || []).length
+    const evidenceDumpIndex = report.search(/Приложение: evidence claims|Приложение: доказательные утверждения|Appendix: evidence claims/i)
+    const evidenceDumpTooEarly = evidenceDumpIndex >= 0 && evidenceDumpIndex < Math.max(2500, report.length * 0.65)
+    const unavailableSection = /Недоступные high-priority источники|Unavailable High-Priority Sources/i.test(report)
     const analyticalSections = [
       /executive summary|резюме|кратк/i,
       /method|метод|подход/i,
       /benchmark|метрик|оценк/i,
       /limitations|ограничен|риски/i,
       /future|trend|направлен|тренд/i,
+      /матрица направлений|direction matrix/i,
     ].filter((rx) => rx.test(report)).length
     const appendixMatch = report.search(/Evidence matrix|Selected Corpus Appendix|Приложение: selected corpus/i)
     const appendixHeavy = appendixMatch >= 0 && appendixMatch < Math.max(800, report.length * 0.35)
-    results.push(report.length >= 6000 && headings >= 5 && analyticalSections >= 4 && !appendixHeavy
+    const interactiveEnough = markdownLinks >= 12 && localArtifactLinks >= 3 && sourceIdLinks >= 8
+    const narrativeEnough = report.length >= 7500 && headings >= 8 && analyticalSections >= 5 && qSections >= Math.min(4, plan.length || 4)
+    const structuredEnough = tables >= 8 && unavailableSection && metadataOnlyMentions >= 1
+    results.push(narrativeEnough && structuredEnough && interactiveEnough && !appendixHeavy && !evidenceDumpTooEarly
       ? pass('final_report_structure', 100)
       : fail('final_report_structure', [
-        `report.md must be a narrative synthesis, not a technical appendix: length=${report.length}, h2=${headings}, analytical_sections=${analyticalSections}${appendixHeavy ? ', appendix appears too early' : ''}.`,
+        `report.md must be an interactive narrative synthesis: length=${report.length}, h2=${headings}, q_sections=${qSections}, analytical_sections=${analyticalSections}, table_rows=${tables}, markdown_links=${markdownLinks}, source_links=${sourceIdLinks}, local_artifact_links=${localArtifactLinks}, metadata_mentions=${metadataOnlyMentions}${appendixHeavy ? ', appendix appears too early' : ''}${evidenceDumpTooEarly ? ', evidence dump appears too early' : ''}${!unavailableSection ? ', missing unavailable-source section' : ''}.`,
       ], Math.min(100, Math.round(report.length / 60))))
   }
 

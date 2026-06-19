@@ -8,6 +8,11 @@ import { resolveResearchDir } from '../research-paths'
 import { ensureResearchRunSpec, formatWorkflowGuidance } from './research-workflow'
 
 const RESUME_RE = /^(продолжай|continue|resume|go on|дальше|продолжить|продолжение)\b/i
+const RESEARCH_ARTIFACT_RE = /\/(?:run\.json|evidence\.jsonl|corpus\.jsonl|claims\.jsonl|plan\.md|quality-gates\.json|report\.md|evidence-report\.md)$/i
+
+function normalizeExtractedOutputDir(value: string): string {
+  return value.replace(/\\/g, '/').replace(RESEARCH_ARTIFACT_RE, '')
+}
 
 export function isResearchResumeMessage(text: string): boolean {
   return RESUME_RE.test(String(text || '').trim())
@@ -28,20 +33,19 @@ export function decideResearchCommandIntent(opts: {
   hasSavedPlan: boolean
   contextModeOff: boolean
 }): { planApproved: boolean; planBootstrapApproved: boolean; researchResume: boolean } {
+  const approvalForKnownRun = !opts.contextModeOff && opts.hasOutputDir && opts.approvalLike
   const planApproved = !opts.contextModeOff
     && opts.hasOutputDir
     && opts.approvalLike
-    && opts.approvalPromptPending
     && opts.hasSavedPlan
   const planBootstrapApproved = !opts.contextModeOff
     && opts.hasOutputDir
     && opts.approvalLike
-    && opts.approvalPromptPending
     && !opts.hasSavedPlan
   const researchResume = !planApproved
     && !planBootstrapApproved
     && opts.hasOutputDir
-    && (opts.resumeLike || (opts.approvalLike && !opts.approvalPromptPending))
+    && (opts.resumeLike || (approvalForKnownRun && !opts.approvalPromptPending))
   return { planApproved, planBootstrapApproved, researchResume }
 }
 
@@ -63,11 +67,11 @@ export function findLatestResearchRunDir(workspace: string): string | null {
 export function extractResearchOutputDirFromText(text: string): string | null {
   const raw = String(text ?? '')
   const explicit = raw.match(/output_dir:\s*["'`]?(\.research\/[^\s"'`]+)["'`]?/i)?.[1]
-  if (explicit) return explicit.replace(/\\/g, '/')
+  if (explicit) return normalizeExtractedOutputDir(explicit)
   const labeled = raw.match(/Research artifact directory:\s*["'`]?(\.research\/[^\s"'`]+)["'`]?/i)?.[1]
-  if (labeled) return labeled.replace(/\\/g, '/')
+  if (labeled) return normalizeExtractedOutputDir(labeled)
   const artifact = raw.match(/(\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[^\s"'`]+)/)?.[1]
-  if (artifact) return artifact.replace(/\\/g, '/')
+  if (artifact) return normalizeExtractedOutputDir(artifact)
   return null
 }
 
@@ -154,6 +158,7 @@ export function researchRunProgressSummary(workspace: string, outputDir?: string
     '',
     'Resume instructions:',
     `- Always pass \`output_dir: "${dir}"\` to research tools.`,
+    '- The workflow state and Allowed next tools above are authoritative. Choose one allowed tool; ignore preset advice that suggests a disallowed tool.',
     '- Continue by taking the next valid pipeline action, not by brainstorming alternative report-writing strategies.',
     '- Do NOT repeat record_evidence for claims that already exist — use list_evidence / verify_claims first.',
     '- If many existing claims lack quotes, call repair_evidence_quotes once, then verify_claims and run_quality_gates.',

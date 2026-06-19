@@ -345,8 +345,6 @@ export function useAgent() {
           if (ev.content) assistant.content = ev.content
           if (ev.done) {
             assistant.done = true
-            assistantRef.current = null
-            setBusy(false)
             setAgentActivity(null)
           }
           break
@@ -397,7 +395,10 @@ export function useAgent() {
     setBusy(true)
     setAgentActivity({ phase: 'starting', label: 'Отправляю запрос…' })
     try {
-      await window.api.sendMessage(text, workspace)
+      const result = await window.api.sendMessage(text, workspace)
+      if (typeof result === 'string' && result.startsWith('Error:')) {
+        setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${result.slice('Error:'.length).trim()}` }])
+      }
     } catch (e: any) {
       setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${e.message ?? e}` }])
     } finally {
@@ -428,7 +429,10 @@ export function useAgent() {
     setBusy(true)
     setAgentActivity({ phase: 'starting', label: 'Запуск research run…' })
     try {
-      await window.api.sendMessage(text, workspace)
+      const result = await window.api.sendMessage(text, workspace)
+      if (typeof result === 'string' && result.startsWith('Error:')) {
+        setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${result.slice('Error:'.length).trim()}` }])
+      }
     } catch (e: any) {
       setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${e.message ?? e}` }])
     } finally {

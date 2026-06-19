@@ -2,10 +2,15 @@
  * Text-based tool-call parser (fallback path).
  *
  * Native OpenAI-style `tool_calls` from the API are the primary mechanism. Some
- * local models occasionally emit the call as text in the VISIBLE response instead.
- * This module recovers those — and ONLY those. Callers must strip `<think>` blocks
- * before calling: tool calls inside the reasoning scratchpad are deliberation, not
- * commitments, and executing them causes phantom/looping calls.
+ * local models (notably reasoning models like Qwen3) instead emit the call as text
+ * in the VISIBLE response, or commit it inside the reasoning channel and leave the
+ * visible content empty. This module recovers both shapes.
+ *
+ * Policy (enforced by the caller in agent.ts, not here): visible tool-call markup is
+ * always recovered; reasoning-channel markup is recovered only as a bounded fallback —
+ * the caller takes the single LAST call (the model's final decision, not speculative
+ * intermediate ones) and relies on the loop guard to short-circuit repeats. This
+ * function itself just parses; it returns every match in document order.
  */
 
 export interface ParsedToolCall {

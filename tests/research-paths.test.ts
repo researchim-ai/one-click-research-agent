@@ -27,6 +27,14 @@ describe('resolveResearchDir', () => {
     expect(resolved).toBe(path.join(ws, '.research', '2026-06-06_12-00-00_new-topic'))
   })
 
+  it('normalizes artifact file paths to their containing run directory', () => {
+    const run = path.join(ws, '.research', '2026-06-06_12-00-00_topic')
+    fs.mkdirSync(run, { recursive: true })
+    fs.writeFileSync(path.join(run, 'plan.md'), '# Plan')
+    const resolved = resolveResearchDir(ws, '.research/2026-06-06_12-00-00_topic/plan.md')
+    expect(resolved).toBe(run)
+  })
+
   it('falls back to .research for an absolute path outside the workspace', () => {
     const resolved = resolveResearchDir(ws, '/etc')
     expect(resolved).toBe(path.join(ws, '.research'))

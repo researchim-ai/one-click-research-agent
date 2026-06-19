@@ -14,13 +14,31 @@ function hasResearchArtifacts(dir: string): boolean {
     .some((name) => fs.existsSync(path.join(dir, name)))
 }
 
+const RESEARCH_ARTIFACT_FILES = new Set([
+  'run.json',
+  'evidence.jsonl',
+  'corpus.jsonl',
+  'claims.jsonl',
+  'plan.md',
+  'quality-gates.json',
+  'report.md',
+  'evidence-report.md',
+])
+
+function stripResearchArtifactFile(relOrAbs: string): string {
+  const normalized = relOrAbs.replace(/\\/g, '/').replace(/\/+$/, '')
+  const base = path.posix.basename(normalized)
+  if (RESEARCH_ARTIFACT_FILES.has(base)) return path.posix.dirname(normalized)
+  return normalized
+}
+
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)]
 }
 
 export function resolveResearchDir(workspace: string, outputDir?: string): string {
   const root = path.resolve(workspace)
-  const raw = String(outputDir || '.research').normalize('NFKC')
+  const raw = stripResearchArtifactFile(String(outputDir || '.research').normalize('NFKC'))
   const fallback = path.join(workspace, '.research')
   const candidates: string[] = []
 
@@ -41,7 +59,9 @@ export function resolveResearchDir(workspace: string, outputDir?: string): strin
   const safe = unique(candidates).filter((candidate) => isInsideWorkspace(workspace, candidate))
   const existingWithArtifacts = safe.find((candidate) => fs.existsSync(candidate) && hasResearchArtifacts(candidate))
   if (existingWithArtifacts) return existingWithArtifacts
-  const existingDir = safe.find((candidate) => fs.existsSync(candidate))
+  const existingDir = safe.find((candidate) => {
+    try { return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory() } catch { return false }
+  })
   if (existingDir) return existingDir
   return safe[safe.length - 1] || fallback
 }
