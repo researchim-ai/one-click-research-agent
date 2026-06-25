@@ -41,6 +41,22 @@ export function writePlan(workspacePath: string, question: string, subQuestions:
 }
 
 /**
+ * The research question/topic captured at the top of plan.md (`# Research Plan: X`).
+ * Used as the report title so it reflects the real topic, not the run-dir slug.
+ */
+export function planQuestion(workspacePath: string, outputDir?: string): string | null {
+  try {
+    const p = planPath(workspacePath, outputDir)
+    if (!fs.existsSync(p)) return null
+    const first = fs.readFileSync(p, 'utf-8').split('\n').find((l) => /^#\s+/.test(l)) ?? ''
+    const q = first.replace(/^#\s+/, '').replace(/^Research Plan:\s*/i, '').replace(/^План исследования:\s*/i, '').trim()
+    return q || null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Parse plan.md checkboxes into a hierarchical structure.
  */
 export function parsePlan(workspacePath: string, outputDir?: string): PlanItem[] {

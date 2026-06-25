@@ -34,10 +34,11 @@ import { getSourceTracker } from './sources'
 import * as embed from './embed'
 import * as planner from './planner'
 import * as knowledgeIndex from './knowledge-index'
-import { corpusStats } from './corpus'
+import { corpusStats, getCorpusSelection, setCorpusItemIncluded } from './corpus'
 import { evidenceStats } from './evidence'
 import { loadIdeas } from './idea-scout'
 import { getResearchProfileByPresetId, RESEARCH_PROFILES } from '../research-profiles'
+import { parseInferredResearchPatch, buildResearchIntakeRequestBody } from './research-intake-parse'
 import {
   runAgent, resetAgent, setWorkspace, cancelAgent,
   createSession, switchSession, listSessions, deleteSession,
@@ -97,14 +98,6 @@ let agentRunInFlight = false
 const WORKSPACE_CHANGED_DEBOUNCE_MS = 1200
 let workspaceChangedTimer: ReturnType<typeof setTimeout> | null = null
 
-function extractJsonObject(text: string): any | null {
-  const raw = String(text || '').trim()
-  try { return JSON.parse(raw) } catch {}
-  const match = raw.match(/\{[\s\S]*\}/)
-  if (!match) return null
-  try { return JSON.parse(match[0]) } catch { return null }
-}
-
 async function inferResearchRequest(payload: any): Promise<{ patch?: Record<string, any>; error?: string }> {
   const message = String(payload?.message ?? '').trim()
   if (!message) return { patch: {} }
@@ -112,69 +105,31 @@ async function inferResearchRequest(payload: any): Promise<{ patch?: Record<stri
   const profiles = Array.isArray(payload?.profiles) ? payload.profiles : []
   const draft = payload?.draft ?? {}
   const ctrl = new AbortController()
-  const timeout = setTimeout(() => ctrl.abort(), 12000)
+  const timeout = setTimeout(() => ctrl.abort(), 30000)
   try {
     const res = await fetch(`${serverManager.llamaApiUrl()}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: ctrl.signal,
-      body: JSON.stringify({
-        model: 'local',
-        temperature: 0.1,
-        max_tokens: 500,
-        messages: [
-          {
-            role: 'system',
-            content: [
-              'You extract parameters for a research-run UI. Return ONLY compact JSON with a top-level "patch" object.',
-              'Allowed patch keys: topic, profileId, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
-              'Allowed modes: quick, deep, systematic, reproduction, idea-scout.',
-              'Allowed dateRange: any, last-year, last-2-years, since-2024, custom.',
-              'Allowed reportLanguage: ru, en.',
-              'Do not invent a topic if the user did not provide one. Preserve user language intent.',
-            ].join('\n'),
-          },
-          {
-            role: 'user',
-            content: JSON.stringify({
-              message,
-              currentDraft: draft,
-              appLanguage: payload?.appLanguage ?? config.get('appLanguage'),
-              profiles,
-            }),
-          },
-        ],
-      }),
+      body: JSON.stringify(buildResearchIntakeRequestBody({
+        message,
+        draft,
+        appLanguage: (payload?.appLanguage ?? config.get('appLanguage')) as 'ru' | 'en',
+        profiles,
+      })),
     })
     if (!res.ok) return { error: `HTTP ${res.status}` }
     const data = await res.json()
-    const content = String(data?.choices?.[0]?.message?.content ?? '')
-    const parsed = extractJsonObject(content)
-    const patch = parsed?.patch && typeof parsed.patch === 'object' ? parsed.patch : parsed && typeof parsed === 'object' ? parsed : {}
-    return { patch: sanitizeResearchPatch(patch) }
+    const msg = data?.choices?.[0]?.message ?? {}
+    // Prefer the visible content; fall back to reasoning_content in case the model
+    // emitted the JSON there (some thinking templates do this).
+    const content = String(msg?.content ?? '') || String(msg?.reasoning_content ?? '')
+    return parseInferredResearchPatch(content)
   } catch (e: any) {
     return { error: String(e?.message || e) }
   } finally {
     clearTimeout(timeout)
   }
-}
-
-function sanitizeResearchPatch(raw: Record<string, any>): Record<string, any> {
-  const out: Record<string, any> = {}
-  const strings = ['topic', 'profileId', 'mode', 'dateRange', 'customDateRange', 'reportLanguage', 'extraDirections']
-  for (const key of strings) {
-    if (typeof raw[key] === 'string' && raw[key].trim()) out[key] = raw[key].trim()
-  }
-  for (const key of ['maxSources', 'minSelectedSources', 'minFullTextReads', 'evidencePerSection']) {
-    const n = Number(raw[key])
-    if (Number.isFinite(n)) out[key] = Math.trunc(n)
-  }
-  for (const key of ['needFullText', 'strictDateRange', 'requireQualityPass']) {
-    if (typeof raw[key] === 'boolean') out[key] = raw[key]
-  }
-  if (Array.isArray(raw.outputs)) out.outputs = raw.outputs.map(String).filter(Boolean)
-  if (Array.isArray(raw.checkpoints)) out.checkpoints = raw.checkpoints.map(String).filter(Boolean)
-  return out
 }
 
 function scheduleWorkspaceChangedNotify(): void {
@@ -797,6 +752,26 @@ function registerIpcHandlers() {
         ideas: 0,
         index: { chunks: 0, docs: 0, hasVectors: false },
       }
+    }
+  })
+
+  // Non-blocking source review: toggle a single source in/out of the selected set.
+  // The agent run is NOT paused — this just flips screeningStatus in corpus.jsonl.
+  ipcMain.handle('research-set-source-included', (_e, workspace: string, outputDir: string, id: string, included: boolean) => {
+    if (!workspace || !id) return { ok: false, selected: 0 }
+    try {
+      return setCorpusItemIncluded(workspace, id, !!included, outputDir || undefined)
+    } catch {
+      return { ok: false, selected: 0 }
+    }
+  })
+
+  ipcMain.handle('research-get-source-selection', (_e, workspace: string, outputDir: string) => {
+    if (!workspace) return []
+    try {
+      return getCorpusSelection(workspace, outputDir || undefined)
+    } catch {
+      return []
     }
   })
 

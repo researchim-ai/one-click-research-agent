@@ -191,7 +191,10 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
     const qSections = (report.match(/^##\s+Q\d+\./gm) || []).length
     const evidenceDumpIndex = report.search(/Приложение: evidence claims|Приложение: доказательные утверждения|Appendix: evidence claims/i)
     const evidenceDumpTooEarly = evidenceDumpIndex >= 0 && evidenceDumpIndex < Math.max(2500, report.length * 0.65)
-    const unavailableSection = /Недоступные high-priority источники|Unavailable High-Priority Sources/i.test(report)
+    // Must match the headings composeSynthesisReport actually emits in each language
+    // (RU: "## Недоступные источники высокого приоритета", EN: "## Unavailable High-Priority Sources").
+    // A mismatch here makes the gate impossible to satisfy and the agent regenerates forever.
+    const unavailableSection = /Недоступные источники высокого приоритета|Недоступные high-priority источники|Unavailable High-Priority Sources/i.test(report)
     const analyticalSections = [
       /executive summary|резюме|кратк/i,
       /method|метод|подход/i,
@@ -264,30 +267,61 @@ export function readQualityGateSnapshot(workspace: string, outputDir?: string): 
   return { passed, total: results.length, failed, allPassed: failed.length === 0 && results.length > 0 }
 }
 
-/** Human-readable gate status for the chat UI (Russian). */
-export function formatQualityGateUserStatus(workspace: string, outputDir?: string): string | null {
+// Internal gate names → calm, non-technical phrases for the end user. We deliberately
+// avoid exposing gate names, tool names ("generate_evidence_report"), IDs or HTTP errors
+// in the chat: this is an auto-research run, the user just needs a friendly progress note.
+// The full technical blockers still go to the model via the supervisor directive.
+const GATE_FRIENDLY: Record<string, { ru: string; en: string }> = {
+  source_coverage: { ru: 'расширяю список источников', en: 'broadening the source list' },
+  evidence_coverage: { ru: 'добираю доказательства', en: 'gathering more evidence' },
+  claim_support: { ru: 'перепроверяю утверждения', en: 'double-checking claims' },
+  plan_progress: { ru: 'закрываю пункты плана', en: 'wrapping up the plan' },
+  recency: { ru: 'добавляю свежие источники', en: 'adding recent sources' },
+  selected_corpus_minimum: { ru: 'отбираю больше источников', en: 'selecting more sources' },
+  review_source_coverage: { ru: 'добавляю обзорные статьи', en: 'adding survey/review sources' },
+  topical_precision: { ru: 'уточняю релевантность источников', en: 'refining source relevance' },
+  full_text_coverage: { ru: 'дочитываю источники', en: 'finishing full-text reads' },
+  high_priority_availability: { ru: 'заменяю недоступные источники', en: 'replacing unavailable sources' },
+  unread_top_sources: { ru: 'дочитываю ключевые источники', en: 'reading key sources' },
+  evidence_to_corpus_linkage: { ru: 'связываю доказательства с источниками', en: 'linking evidence to sources' },
+  plan_section_coverage: { ru: 'довожу покрытие по подзадачам', en: 'filling coverage per subtopic' },
+  date_range_compliance: { ru: 'привожу источники к нужному периоду', en: 'aligning sources to the date range' },
+  noise_ratio: { ru: 'чищу список источников', en: 'cleaning up the source list' },
+  report_citation_coverage: { ru: 'добавляю цитаты к выводам', en: 'adding citations to findings' },
+}
+
+/** Friendly, non-technical gate progress for the chat UI (auto-research). */
+export function formatQualityGateUserStatus(
+  workspace: string,
+  outputDir?: string,
+  lang: 'ru' | 'en' = 'ru',
+): string | null {
   const snap = readQualityGateSnapshot(workspace, outputDir)
   if (!snap) return null
+  const ru = lang === 'ru'
+
   if (snap.allPassed) {
-    return `✅ Quality gates: ${snap.passed}/${snap.total} — все проверки пройдены. Можно (и нужно) создать report.md через generate_evidence_report.`
+    return ru
+      ? '✅ Проверки качества пройдены — формирую финальный отчёт…'
+      : '✅ Quality checks passed — building the final report…'
   }
+
   if (snap.failed.length > 0 && snap.failed.every((r) => r.gate === 'final_report_structure')) {
-    return [
-      `📝 Quality gates: **${snap.passed}/${snap.total}** — данные готовы, но текущий \`report.md\` не проходит проверку структуры.`,
-      '',
-      'Это не блокирует регенерацию отчёта: нужно вызвать `generate_evidence_report`, чтобы переписать `report.md` нормальным narrative synthesis.',
-    ].join('\n')
+    return ru
+      ? '📝 Данные готовы — дорабатываю и переписываю отчёт…'
+      : '📝 Data is ready — polishing and rewriting the report…'
   }
-  const lines = snap.failed.map((r) => {
-    const detail = r.blockers[0] || r.warnings[0] || 'не пройдено'
-    return `• **${r.gate}** — ${detail}`
-  })
-  return [
-    `⚠️ Quality gates: **${snap.passed}/${snap.total}** (не все). **report.md пока не создаётся** — generate_evidence_report заблокирован.`,
-    '',
-    'Что исправить:',
-    ...lines,
-  ].join('\n')
+
+  const phrases: string[] = []
+  for (const r of snap.failed) {
+    const phrase = GATE_FRIENDLY[r.gate]?.[lang] ?? (ru ? 'довожу качество данных' : 'polishing the data')
+    if (!phrases.includes(phrase)) phrases.push(phrase)
+    if (phrases.length >= 3) break
+  }
+  const joined = phrases.join(ru ? ', ' : ', ')
+  return ru
+    ? `🔧 Дорабатываю отчёт: ${joined}. Это часть авто-ресёрча — финальный отчёт появится автоматически.`
+    : `🔧 Finishing the report: ${joined}. This is part of the auto-research — the final report will appear automatically.`
 }
 
 export function formatGateResults(workspace: string, sessionId: string | undefined, outputDir: string | undefined, results: GateResult[], summary: string): string {

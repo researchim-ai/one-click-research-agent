@@ -103,6 +103,8 @@ interface ElectronAPI {
     appLanguage: 'ru' | 'en'
     profiles: Array<{ id: string; label: string; domain: string }>
   }): Promise<{ patch?: any; error?: string }>
+  setResearchSourceIncluded(workspace: string, outputDir: string, id: string, included: boolean): Promise<{ ok: boolean; selected: number }>
+  getResearchSourceSelection(workspace: string, outputDir: string): Promise<import('../electron/types').CorpusSelectionItem[]>
   listResearchArtifacts(workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>>
   embedStatus(): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }>
   embedDownloadModel(): Promise<{ ok: boolean; path?: string; error?: string }>

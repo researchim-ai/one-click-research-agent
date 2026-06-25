@@ -3,7 +3,6 @@ import { RESEARCH_PROFILES, type ResearchProfileId } from '../../research-profil
 import {
   applyResearchIntakePatch,
   defaultResearchRequest,
-  inferResearchRequestPatch,
   missingResearchFields,
   nextResearchIntakeQuestion,
   summarizeResearchRequest,
@@ -83,7 +82,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
   const [requireQualityPass, setRequireQualityPass] = useState(true)
   const [reportLanguage, setReportLanguage] = useState<ResearchReportLanguage>(appLanguage === 'ru' ? 'ru' : 'en')
   const [outputs, setOutputs] = useState<ResearchOutput[]>(['brief', 'report', 'evidence-matrix'])
-  const [checkpoints, setCheckpoints] = useState<ResearchCheckpoint[]>(['plan', 'corpus', 'report'])
+  const [checkpoints, setCheckpoints] = useState<ResearchCheckpoint[]>(['plan'])
   const [extraDirections, setExtraDirections] = useState('')
   const [draft, setDraft] = useState<NewResearchRequest>(() => defaultResearchRequest(appLanguage))
   const [intakeInput, setIntakeInput] = useState('')
@@ -169,14 +168,14 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     setExtraDirections(next.extraDirections)
   }
 
-  const mergeDraft = (patch: ResearchIntakePatch, userText?: string): NewResearchRequest => {
+  const mergeDraft = (patch: ResearchIntakePatch, userText?: string, assistantOverride?: string): NewResearchRequest => {
     const next = applyResearchIntakePatch(draft, patch)
     setDraft(next)
     if (userText) {
       setIntakeMessages((prev) => [
         ...prev,
         { role: 'user', content: userText },
-        { role: 'assistant', content: nextResearchIntakeQuestion(next, appLanguage) },
+        { role: 'assistant', content: assistantOverride ?? nextResearchIntakeQuestion(next, appLanguage) },
       ])
     }
     return next
@@ -187,7 +186,9 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     if (!text || intakeBusy) return
     setIntakeInput('')
     setIntakeBusy(true)
-    let patch = inferResearchRequestPatch(text, draft, appLanguage)
+    let patch: ResearchIntakePatch = {}
+    let llmFailed = false
+    let llmError = ''
     try {
       if (window.api?.inferResearchRequest) {
         const inferred = await window.api.inferResearchRequest({
@@ -196,10 +197,32 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
           appLanguage,
           profiles: RESEARCH_PROFILES.map((p) => ({ id: p.id, label: p.label, domain: p.domain })),
         })
-        if (inferred?.patch) patch = { ...patch, ...inferred.patch }
+        if (inferred?.error) {
+          llmFailed = true
+          llmError = String(inferred.error)
+        } else if (inferred?.patch && Object.keys(inferred.patch).length) {
+          patch = inferred.patch
+        } else {
+          llmFailed = true
+        }
+      } else {
+        llmFailed = true
       }
-    } catch {}
-    mergeDraft(patch, text)
+    } catch (e: any) {
+      llmFailed = true
+      llmError = String(e?.message || e)
+    }
+    // No regex/heuristic parsing: the model is the only brain for parameters.
+    // If it could not analyze the request, just capture the raw text as the topic
+    // so the user can still continue (or open manual mode).
+    let assistantOverride: string | undefined
+    if (llmFailed) {
+      if (!draft.topic.trim()) patch = { ...patch, topic: text }
+      assistantOverride = appLanguage === 'ru'
+        ? `Не удалось разобрать запрос моделью${llmError ? ` (${llmError})` : ''}. Записал текст как тему — уточни остальные параметры в диалоге или открой ручной режим.`
+        : `The model could not analyze the request${llmError ? ` (${llmError})` : ''}. I saved the text as the topic — refine the rest in the dialog or open manual mode.`
+    }
+    mergeDraft(patch, text, assistantOverride)
     setIntakeBusy(false)
   }
 
@@ -486,7 +509,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
                 onChange={(e) => setMaxSources(Number(e.target.value))}
                 className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-sm text-zinc-200 focus:border-blue-500 outline-none"
               >
-                {[10, 25, 40, 50, 75].map((n) => <option key={n} value={n}>{n}</option>)}
+                {[10, 25, 40, 50, 75, 100, 150, 200].map((n) => <option key={n} value={n}>{n}</option>)}
               </select>
             </div>
             <label className="flex items-center gap-3 px-3 py-2 rounded-xl border border-zinc-800 bg-zinc-900/50 cursor-pointer mt-6">

@@ -163,7 +163,8 @@ describe('runQualityGates', () => {
       '|---|---|---|---|---|---|---|',
       fullTextRows,
       '',
-      '## Недоступные high-priority источники',
+      // Use the exact heading composeSynthesisReport emits for ru reports.
+      '## Недоступные источники высокого приоритета',
       '- [abcdef0000](https://example.org/paper-0): metadata-only / abstract-only caveat documented.',
       '',
       qSections,
@@ -185,6 +186,63 @@ describe('runQualityGates', () => {
 
     expect(gate.passed).toBe(true)
   })
+
+  // Regression: the gate's unavailable-source detection must accept the exact
+  // headings composeSynthesisReport emits. A mismatch (the gate looked for
+  // "Недоступные high-priority источники" while the generator wrote
+  // "Недоступные источники высокого приоритета") made the gate impossible to
+  // satisfy for ru reports and the agent regenerated report.md forever.
+  for (const heading of ['## Недоступные источники высокого приоритета', '## Unavailable High-Priority Sources']) {
+    it(`accepts the real generator unavailable-source heading "${heading}"`, () => {
+      writePlan()
+      writeCorpus(Array.from({ length: 8 }, (_, i) => corpusEntry(i, {
+        id: `abcdef000${i}`,
+        publicationType: i === 0 ? 'survey' : 'method',
+        url: `https://example.org/paper-${i}`,
+        localPath: `${OUT}/fulltext/abcdef000${i}.md`,
+        subQuestions: [`Q${(i % 6) + 1}`],
+      })))
+      const sourceLinks = Array.from({ length: 12 }, (_, i) => `[abcdef000${i % 8}](https://example.org/paper-${i % 8})`).join(', ')
+      const fullTextRows = Array.from({ length: 8 }, (_, i) => `| S${i + 1} | [Paper ${i}](https://example.org/paper-${i}) | method | high | Q${(i % 6) + 1} | [full text](fulltext/abcdef000${i}.md) | \`abcdef000${i}\` |`).join('\n')
+      const qSections = Array.from({ length: 6 }, (_, i) => [
+        `## Q${i + 1}. Section ${i + 1}`,
+        '',
+        `**Coverage:** 3 claims; primary/benchmark/safety=2; survey=1; metadata-only=${i === 0 ? 1 : 0}.`,
+        '',
+        `- **Claim ${i + 1}.** Evidence: ${sourceLinks}.`,
+        `  Strength: ${i === 0 ? 'metadata-only' : 'strong'}; type: primary_result; confidence=high.`,
+        '  Quote: "A concrete quoted passage supports this claim and gives enough context for review."',
+        '',
+      ].join('\n')).join('\n')
+      writeReport([
+        '# Interactive Report', '',
+        '## Краткое резюме', 'Связный синтез с кликабельными ссылками. '.repeat(80), '',
+        '## Как пользоваться отчётом', `Ссылки на источники: ${sourceLinks}.`, '',
+        '## Матрица направлений',
+        '| Направление | Reward / signal | Типовые методы | Evidence links |',
+        '|---|---|---|---|',
+        `| RLHF | preferences | PPO/DPO/GRPO | ${sourceLinks} |`,
+        `| RLVR | verifiable | GRPO | ${sourceLinks} |`, '',
+        '## Метод и подход к отбору источников', 'Методология отбора и screening. '.repeat(70), '',
+        '## Метрики и критерии оценки', 'Benchmarks, evaluation, reward signals. '.repeat(70), '',
+        '## Доказательная база',
+        '| # | Источник | Тип | Приоритет | План | Локальный артефакт | Corpus ID |',
+        '|---|---|---|---|---|---|---|',
+        fullTextRows, '',
+        heading,
+        '- [abcdef0000](https://example.org/paper-0): metadata-only / abstract-only caveat documented.', '',
+        qSections,
+        '## Сквозная интерпретация', 'Синтез по направлениям. '.repeat(90), '',
+        '## Ограничения и риски интерпретации', 'metadata-only evidence and abstract-only caveats are weaker than full-text evidence.', '',
+        '## Практические выводы', 'Практические выводы. '.repeat(40), '',
+        '## Тренды и дальнейшие направления', 'Тренды и будущие направления. '.repeat(80),
+      ].join('\n'))
+
+      const { results } = runQualityGates(ws, undefined, { minSources: 5, outputDir: OUT } as any)
+      const gate = results.find((r) => r.gate === 'final_report_structure')!
+      expect(gate.passed).toBe(true)
+    })
+  }
 })
 
 describe('escape valve end-to-end on disk', () => {

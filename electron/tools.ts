@@ -7,19 +7,21 @@ import { getWebSearchStatus, loadWebSearchConfig, resolveWebSearchBaseUrl, shoul
 import { saveFinding, recallFindings } from './memory'
 import { getSourceTracker, extractSourcesFromToolResult } from './sources'
 import * as searchCache from './search-cache'
+import { HostBreaker, AdaptiveThrottle } from './host-resilience'
 import * as cfg from './config'
 import { parseDocument, summarizeParsedForPrompt, isDocumentExtension } from './document-parser'
 import { checkUrlHealth, formatHealthBadge } from './url-health'
 import { fetchUrl as fetchUrlImpl, classifyUrl as classifyUrlImpl, extractArxivId } from './url-fetch'
 import { classifyQuery } from './query-router'
-import { writePlan, parsePlan, updatePlanItem, planProgress } from './planner'
+import { writePlan, parsePlan, updatePlanItem, planProgress, planQuestion } from './planner'
 import { runSubResearcher, canSpawnMore } from './sub-researcher'
 import { searchHybrid, indexStats, rebuildIndex, indexText as indexTextHybrid } from './knowledge-index'
 import { exportPdf, exportDocx, exportBibTex } from './export-report'
 import { screenshotPage } from './screenshot'
 import {
   addSourcesToCorpus, assignCorpusToPlan, fullTextStatus, listCorpus, listSelectedCorpus, loadCorpus, markCorpusItemRead,
-  queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats,
+  queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats, saveCorpus,
+  type CorpusEntry,
 } from './corpus'
 import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
 import { formatGateReport, formatGateResults, latestQualityGateFailure, readQualityGateSnapshot, runQualityGates, writeQualityGateSnapshot } from './quality-gates'
@@ -503,8 +505,8 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'screen_corpus',
-      description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage.',
-      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, output_dir: { type: 'string' } }, required: ['question'] },
+      description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage. max_selected caps how many are selected; min_selected sets a floor — pass the run\'s minimum-selected target so the best on-topic items are promoted to reach it (off-topic items are never promoted).',
+      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, min_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, output_dir: { type: 'string' } }, required: ['question'] },
     },
   },
   {
@@ -965,7 +967,7 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'audit_research_run':
         return formatAuditResult(auditResearchRun(workspace, { outputDir: args.output_dir, yearFrom: args.year_from, yearTo: args.year_to, minSelected: args.min_selected, minRead: args.min_read, minEvidence: args.min_evidence }))
       case 'screen_corpus':
-        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, strictDateRange: args.strict_date_range }, args.output_dir)
+        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range }, args.output_dir)
       case 'list_selected_corpus':
         return listSelectedCorpus(workspace, args.max_items, args.output_dir)
       case 'reject_corpus_items':
@@ -1159,6 +1161,7 @@ function openAlexSnowballTool(work: string, maxResults: number | undefined, mode
   if (!input) return 'Error: work is required.'
   const limit = Math.max(1, Math.min(25, Number(maxResults) || 10))
   const script = `
+${httpGetSnippet()}
 const input = process.argv[1]
 const mode = process.argv[2]
 const limit = Number(process.argv[3] || '10')
@@ -1167,9 +1170,9 @@ function cleanDoi(s) {
   return m ? m[0].replace(/[.,;)\\]]+$/, '') : ''
 }
 async function j(url) {
-  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } })
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
   if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + url)
-  return await r.json()
+  return JSON.parse(r.text)
 }
 async function resolveWork(s) {
   const doi = cleanDoi(s)
@@ -1294,8 +1297,17 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   if (!corpusId) return 'Error: id is required.'
   const entry = loadCorpus(workspace, outputDir).find((e) => e.id === corpusId)
   if (!entry) return `Error: corpus item not found: ${corpusId}`
-  if (entry.readStatus === 'read' || entry.status === 'read') {
+  if (entry.readStatus === 'read') {
     return `No-op: corpus item ${corpusId} is already marked read${entry.localPath ? ` at ${entry.localPath}` : ''}. Do not call read_corpus_item for this id again; continue with full_text_status or run_quality_gates.`
+  }
+  // Reconcile inconsistent state after a corpus rebuild: `status` (or an existing
+  // downloaded file) can say "read" while `readStatus` was reset to not_read. That
+  // mismatch makes full_text_status report the item as unread forever, so the agent
+  // loops on read_full_text_batch. Re-mark it read from the existing file instead of
+  // re-downloading or looping.
+  if (entry.localPath && fs.existsSync(entry.localPath)) {
+    markCorpusItemRead(workspace, corpusId, entry.localPath, 'read', entry.readReason ?? 'reconciled from existing full-text file after rebuild', outputDir)
+    return `Reconciled corpus ${corpusId}: existing full text at ${entry.localPath} re-marked as read (read state was out of sync after a corpus rebuild). Do not read it again; continue with full_text_status or run_quality_gates.`
   }
   if (entry.readStatus === 'failed' && /\bHTTP\s*(?:403|404|410|451)\b/i.test(entry.readReason ?? '')) {
     return `Error: corpus item ${corpusId} already failed with a non-retriable fetch error (${entry.readReason}). Do not retry this id again; treat it as unavailable, run full_text_status, then run_quality_gates so the limitation is recorded.`
@@ -1392,6 +1404,11 @@ function generateEvidenceReportTool(workspace: string, title: string, outputPath
     ? reportLanguage
     : (cfg.get('appLanguage') ?? 'ru')
   const ru = language === 'ru'
+  // Prefer the real research question (from plan.md) over the run-dir slug so the
+  // report title is meaningful ("RL в LLM…"), not "rl b llm".
+  const planTopic = planQuestion(workspace, outputDir)
+  const slugLike = !title || /^[a-z0-9]+(\s+[a-z0-9]+){0,4}$/i.test(title.trim()) && title.trim().split(/\s+/).every((w) => w.length <= 4)
+  const effectiveTitle = (planTopic && (slugLike || planTopic.length > title.length)) ? planTopic : (title || planTopic || (ru ? 'Исследовательский отчёт' : 'Research Report'))
   const stats = corpusStats(workspace, outputDir)
   const matrix = evidenceMatrix(workspace, outputDir)
   const selected = listSelectedCorpus(workspace, 40, outputDir)
@@ -1433,9 +1450,16 @@ function generateEvidenceReportTool(workspace: string, title: string, outputPath
   fs.mkdirSync(path.dirname(evidencePath), { recursive: true })
   fs.writeFileSync(evidencePath, `# ${ru ? 'Доказательный отчёт' : 'Evidence Report'}\n\n${evidenceContent}\n`, 'utf-8')
 
-  const synthesis = composeSynthesisReport(workspace, title, outputDir, ru)
+  let synthesis = composeSynthesisReport(workspace, effectiveTitle, outputDir, ru)
+  // Best-effort LLM quality pass: rate each section (read-only, no fact rewriting).
+  try {
+    const review = llmReviewReportSections(synthesis, ru)
+    if (review) {
+      synthesis += `\n\n## ${ru ? 'Контроль качества секций (LLM-проверка)' : 'Section Quality Check (LLM review)'}\n\n${review}\n`
+    }
+  } catch {}
   const result = generateReport(
-    title,
+    effectiveTitle,
     synthesis,
     outputPath || path.join(canonicalResearchOutputDir(outputDir), 'report.md'),
     undefined,
@@ -1443,16 +1467,365 @@ function generateEvidenceReportTool(workspace: string, title: string, outputPath
     { ignoreFinalReportStructureGate: true, allowEvidenceReportGenerator: true },
   )
   const relEvidence = path.relative(workspace, evidencePath)
-  return `${result}\nEvidence appendix saved to ${relEvidence}.`
+  // Refresh the quality-gate snapshot against the report we just wrote. Without this
+  // the snapshot keeps its pre-report value (final_report_structure missing/failed),
+  // the live state tail keeps asking the model to "regenerate", and the agent loops
+  // forever even though report.md is already final on disk.
+  let gateNote = ''
+  try {
+    runQualityGatesTool(workspace, sessionId, undefined, undefined, undefined, outputDir, undefined, undefined, undefined)
+    const refreshed = readQualityGateSnapshot(workspace, outputDir)
+    if (refreshed) {
+      gateNote = refreshed.allPassed
+        ? `\nQuality gates re-checked against the new report: ${refreshed.passed}/${refreshed.total} passed.`
+        : `\nQuality gates re-checked: ${refreshed.passed}/${refreshed.total}. report.md is written; remaining items are non-blocking for report finality.`
+    }
+  } catch {}
+  return `${result}\nEvidence appendix saved to ${relEvidence}.${gateNote}`
 }
 
-function composeSynthesisReport(workspace: string, title: string, outputDir: string | undefined, ru: boolean): string {
+// Titles often arrive from search snippets with arXiv-id prefixes, trailing
+// ellipses, or site suffixes ("- Springer"). Clean them for display.
+export function cleanReportTitle(raw?: string): string {
+  return String(raw ?? '')
+    .replace(/^\[\s*\d{4}\.\d{4,5}\s*\]\s*/i, '')
+    .replace(/\s*[-–—]\s*(springer|arxiv|acm digital library|sciencedirect|ieee xplore|huggingface|hugging face)\b.*$/i, '')
+    .replace(/\s*\.{3,}\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Failed-read reasons are raw error strings ("Error: fetch_url failed — HTTP 403",
+// chained arXiv fallbacks). Map them to a short, human cause.
+export function humanReadFailureReason(raw: string | undefined, ru: boolean): string | undefined {
+  if (!raw) return undefined
+  const r = String(raw)
+  if (/HTTP\s*403|forbidden/i.test(r)) return ru ? 'доступ закрыт издателем (403)' : 'blocked by publisher (403)'
+  if (/HTTP\s*404|not found/i.test(r)) return ru ? 'страница не найдена (404)' : 'not found (404)'
+  if (/HTTP\s*429|rate.?limit/i.test(r)) return ru ? 'ограничение частоты запросов (429)' : 'rate-limited (429)'
+  if (/HTTP\s*5\d\d/i.test(r)) return ru ? 'ошибка сервера источника' : 'source server error'
+  if (/timeout|timed out/i.test(r)) return ru ? 'таймаут загрузки' : 'download timeout'
+  return r.replace(/\s+/g, ' ').replace(/^error:\s*/i, '').trim().slice(0, 120)
+}
+
+// Quotes are extracted from fetched HTML/markdown and can carry tag soup, navigation
+// residue, fetch dump-headers, or even internal screening metadata. Strip markup and
+// reject junk so the report never shows garbage fragments.
+export function stripQuoteMarkup(raw?: string): string {
+  if (!raw) return ''
+  let q = String(raw)
+  q = q.replace(/<[^>]*>/g, ' ')
+  q = q.replace(/\b(?:href|title|class|src|id|style|rel|target|data-[\w-]+)\s*=\s*"[^"]*"/gi, ' ')
+  q = q.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+  q = q.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, ' ').replace(/&[a-z]+;/gi, ' ')
+  q = q.replace(/[\s\u00a0]+/g, ' ').replace(/^["'“”‹›«»\s.|>·•–—-]+/, '').trim()
+  return q
+}
+
+export function isJunkReportQuote(q: string): boolean {
+  if (q.length < 24) return true
+  if (/\btitle:\s[\s\S]*\burl:\s/i.test(q) && /(byline:|format:\s*markdown|length:\s*\d|site:\s)/i.test(q)) return true
+  if (/selected score\s*\d|precision\s*\d+\s*;|\bmatched:\s/i.test(q)) return true
+  if (/ltx_|cookies_not_supported|error=cookies|tocentry|ref_tag/i.test(q)) return true
+  // Breadcrumb / table-of-contents paths extracted from arXiv HTML ("‣ 5 Experiments ‣ Title").
+  if (/‣/.test(q)) return true
+  // Trailing section-reference residue like "...Title"> 2 ." or "> §A.5 .".
+  if (/(?:["'>]\s*)?(?:§\s*)?[\w.]+\s*\)?\s*\.?\s*$/.test(q) && /["'>]\s*(?:§|\d)/.test(q)) return true
+  const letters = (q.match(/[\p{L}]/gu) || []).length
+  if (letters / q.length < 0.55) return true
+  return false
+}
+
+export function sanitizeReportQuote(quote?: string): string {
+  const cleaned = stripQuoteMarkup(quote)
+  if (!cleaned || isJunkReportQuote(cleaned)) return ''
+  return cleaned.length > 260 ? cleaned.slice(0, 260).trimEnd() + '…' : cleaned
+}
+
+// Read-only LLM quality pass over the assembled report. It RATES each section and
+// flags issues (clarity, coherence, language consistency, thin support) but never
+// rewrites facts/numbers/citations — the report stays evidence-grounded and
+// deterministic. Best-effort: if the local model is unavailable it returns '' and the
+// report is published without the QA block.
+function llmReviewReportSections(reportBody: string, ru: boolean): string {
+  const apiUrl = 'http://127.0.0.1:7863'
+  const sections = reportBody.split(/\n(?=## )/).map((s) => s.trim()).filter((s) => s.startsWith('## '))
+  if (sections.length === 0) return ''
+  const condensed = sections.map((s) => {
+    const head = (s.match(/^##\s+(.+)/)?.[1] ?? 'Section').trim()
+    const body = s.replace(/^##\s+.+\n?/, '').replace(/\s+/g, ' ').trim().slice(0, 600)
+    return `### ${head}\n${body}`
+  }).join('\n\n').slice(0, 10000)
+  const prompt = ru
+    ? `Ты — придирчивый научный редактор. Оцени КАЖДУЮ секцию отчёта по качеству: ясность, связность, единый язык (русский), нет ли «висящих» утверждений без опоры, нет ли явного мусора (HTML-теги, обрывки навигации).
+ВАЖНО: ниже даны СОКРАЩЁННЫЕ выдержки секций (обрезаны для проверки) — НЕ считай саму обрезку/неполноту выдержки недостатком и НЕ пиши «обрезано/неполный».
+НЕ переписывай факты, числа и ссылки. Только оцени и кратко укажи замечание.
+
+Сокращённые выдержки секций:
+${condensed}
+
+Верни ТОЛЬКО markdown-таблицу, ничего больше:
+| Секция | Оценка | Замечание |
+|---|---|---|
+Оценка — одно из: ОК / Замечания / Слабая. Замечание — максимум одна короткая фраза (или «—»).`
+    : `You are a strict scientific editor. Rate EACH report section for quality: clarity, coherence, consistent language (English), no dangling unsupported claims, no obvious garbage (HTML tags, navigation fragments).
+IMPORTANT: the section excerpts below are CONDENSED (truncated for review) — do NOT treat the truncation/incompleteness of the excerpt itself as a defect and do NOT say "truncated/incomplete".
+Do NOT rewrite facts, numbers, or citations. Only rate and give a short note.
+
+Condensed section excerpts:
+${condensed}
+
+Return ONLY a markdown table, nothing else:
+| Section | Rating | Note |
+|---|---|---|
+Rating is one of: OK / Issues / Weak. Note is at most one short phrase (or "—").`
+  const script = `
+(async () => {
+  const res = await fetch(process.argv[1] + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'local',
+      messages: [
+        { role: 'system', content: 'You rate report sections and output exactly one markdown table. No prose, no code fences.' },
+        { role: 'user', content: process.argv[2] },
+      ],
+      temperature: 0.2,
+      max_tokens: 700,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+  })
+  if (!res.ok) { console.error('HTTP ' + res.status); process.exit(1) }
+  const json = await res.json()
+  process.stdout.write(String(json?.choices?.[0]?.message?.content || ''))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  try {
+    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt], {
+      encoding: 'utf-8',
+      timeout: 60000,
+      maxBuffer: 1024 * 1024 * 2,
+      env: { ...process.env, FORCE_COLOR: '0', ELECTRON_RUN_AS_NODE: '1' },
+    }).trim()
+    // Keep only the table; strip any stray prose/think the model might add.
+    const cleaned = out.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```[a-z]*\n?|```/gi, '').trim()
+    const tableStart = cleaned.indexOf('|')
+    const table = tableStart >= 0 ? cleaned.slice(tableStart).trim() : ''
+    if (!table.includes('|') || table.length < 40) return ''
+    return table
+  } catch {
+    return ''
+  }
+}
+
+/** Single synchronous chat call to the local llama-server. Returns '' on any failure. */
+function callLocalChat(system: string, user: string, opts: { maxTokens?: number; timeoutMs?: number } = {}): string {
+  const apiUrl = 'http://127.0.0.1:7863'
+  const script = `
+(async () => {
+  const res = await fetch(process.argv[1] + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'local',
+      messages: [
+        { role: 'system', content: process.argv[3] },
+        { role: 'user', content: process.argv[2] },
+      ],
+      temperature: 0.2,
+      max_tokens: ${Number(opts.maxTokens) || 800},
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+  })
+  if (!res.ok) { console.error('HTTP ' + res.status); process.exit(1) }
+  const json = await res.json()
+  process.stdout.write(String(json?.choices?.[0]?.message?.content || ''))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  try {
+    const out = execFileSync(process.execPath, ['-e', script, apiUrl, user, system], {
+      encoding: 'utf-8',
+      timeout: opts.timeoutMs ?? 90000,
+      maxBuffer: 1024 * 1024 * 4,
+      env: { ...process.env, FORCE_COLOR: '0', ELECTRON_RUN_AS_NODE: '1' },
+    }).trim()
+    return out.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```[a-z]*\n?|```/gi, '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function parseJsonStringMap(text: string): Record<string, string> {
+  const raw = String(text || '')
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start < 0 || end <= start) return {}
+  try {
+    const obj = JSON.parse(raw.slice(start, end + 1))
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(obj)) if (typeof v === 'string' && v.trim()) out[k] = v.trim()
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function readLocalExcerpt(localPath: string | undefined): string {
+  if (!localPath) return ''
+  try {
+    if (!fs.existsSync(localPath)) return ''
+    const raw = fs.readFileSync(localPath, 'utf-8')
+    const text = raw
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return text.slice(0, 1600)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Generate a per-source summary (3–5 sentences) in the report language for the
+ * presented sources. Grounded in the abstract, extracted evidence and a slice of
+ * the read full text. Best-effort: cached on the corpus entry, bounded by a wall-clock
+ * budget, and silently falls back (caller uses evidence/abstract) when the model is
+ * unavailable. Mutates and persists the corpus entries it summarizes.
+ */
+function llmSummarizeSources(
+  workspace: string,
+  outputDir: string | undefined,
+  sources: CorpusEntry[],
+  claimsByCorpus: Map<string, string[]>,
+  ru: boolean,
+): void {
+  const lang = ru ? 'ru' : 'en'
+  const need = sources.filter((e) => !(e.summary && e.summaryLang === lang))
+  if (!need.length) return
+  const budgetMs = 4 * 60 * 1000
+  const started = Date.now()
+  const batchSize = 6
+  const sys = ru
+    ? 'Ты — научный аналитик. Ты пишешь СТРОГО на русском языке и возвращаешь только JSON.'
+    : 'You are a research analyst. You write STRICTLY in English and return only JSON.'
+  let changed = false
+  for (let i = 0; i < need.length; i += batchSize) {
+    if (Date.now() - started > budgetMs) break
+    const batch = need.slice(i, i + batchSize)
+    const payload = batch.map((e) => ({
+      id: e.id,
+      title: cleanReportTitle(e.title),
+      year: e.year,
+      abstract: stripQuoteMarkup(e.snippet || '').slice(0, 700),
+      evidence: (claimsByCorpus.get(e.id) || []).slice(0, 3),
+      excerpt: readLocalExcerpt(e.localPath),
+    }))
+    const user = ru
+      ? `Для КАЖДОЙ статьи напиши развёрнутую выжимку (3–5 предложений) СТРОГО на русском языке: о чём работа, какой метод/подход предложен, ключевые результаты и числа, главный вывод. Английские термины можно оставлять как термины (DPO, GRPO, RLHF и т.п.), но связный текст обязан быть на русском. Не выдумывай факты сверх предоставленных данных; если данных мало — опиши кратко по названию и аннотации.
+Верни ТОЛЬКО JSON-объект вида {"<id>": "<выжимка>", ...} без markdown и пояснений.
+
+Данные статей (JSON):
+${JSON.stringify(payload)}`
+      : `For EACH paper write a detailed summary (3–5 sentences) STRICTLY in English: what it is about, the proposed method/approach, key results and numbers, the main takeaway. Do not invent facts beyond the provided data; if data is scarce, summarize briefly from the title and abstract.
+Return ONLY a JSON object {"<id>": "<summary>", ...} with no markdown or explanations.
+
+Paper data (JSON):
+${JSON.stringify(payload)}`
+    const out = callLocalChat(sys, user, { maxTokens: 1500, timeoutMs: 120000 })
+    const map = parseJsonStringMap(out)
+    for (const e of batch) {
+      const s = map[e.id]
+      if (s && s.length > 20) {
+        e.summary = s.replace(/\s+/g, ' ').trim()
+        e.summaryLang = lang
+        e.updatedAt = Date.now()
+        changed = true
+      }
+    }
+  }
+  if (changed && outputDir) {
+    try {
+      const full = loadCorpus(workspace, outputDir)
+      const byId = new Map(full.map((e) => [e.id, e]))
+      for (const e of sources) {
+        if (e.summary && e.summaryLang === lang) {
+          const target = byId.get(e.id)
+          if (target) { target.summary = e.summary; target.summaryLang = lang; target.updatedAt = e.updatedAt }
+        }
+      }
+      saveCorpus(workspace, full, outputDir)
+    } catch {}
+  }
+}
+
+/** Synthesize key takeaways + a closing conclusion from the supported evidence claims. */
+function llmReportSynthesis(
+  topic: string,
+  claimLines: string[],
+  ru: boolean,
+): { tldr: string[]; conclusion: string } | null {
+  if (!claimLines.length) return null
+  const sys = ru
+    ? 'Ты — научный аналитик. Пиши СТРОГО на русском языке и возвращай только JSON.'
+    : 'You are a research analyst. Write STRICTLY in English and return only JSON.'
+  const evidence = claimLines.slice(0, 60).map((c, i) => `${i + 1}. ${c}`).join('\n').slice(0, 8000)
+  const user = ru
+    ? `Тема исследования: «${topic}».
+Ниже — подтверждённые доказательные утверждения по теме (из прочитанных источников).
+Сделай синтез по всей информации СТРОГО на русском языке:
+1) "tldr" — 4–6 кратких ключевых выводов по теме в целом (каждый ≤ 25 слов);
+2) "conclusion" — связное заключение (2–4 абзаца): главные тенденции, что считается установленным, открытые проблемы и направления.
+Опирайся только на приведённые утверждения, не выдумывай.
+Верни ТОЛЬКО JSON: {"tldr": ["...", "..."], "conclusion": "..."}.
+
+Утверждения:
+${evidence}`
+    : `Research topic: "${topic}".
+Below are supported evidence claims (from read sources).
+Synthesize across all of it STRICTLY in English:
+1) "tldr" — 4–6 concise key takeaways about the topic overall (each ≤ 25 words);
+2) "conclusion" — a coherent conclusion (2–4 paragraphs): main trends, what is established, open problems and directions.
+Rely only on the provided claims; do not invent.
+Return ONLY JSON: {"tldr": ["...", "..."], "conclusion": "..."}.
+
+Claims:
+${evidence}`
+  const out = callLocalChat(sys, user, { maxTokens: 1600, timeoutMs: 120000 })
+  const start = out.indexOf('{')
+  const end = out.lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  try {
+    const obj = JSON.parse(out.slice(start, end + 1))
+    const tldr = Array.isArray(obj?.tldr) ? obj.tldr.map((x: any) => String(x).replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 8) : []
+    const conclusion = typeof obj?.conclusion === 'string' ? obj.conclusion.trim() : ''
+    if (!tldr.length && !conclusion) return null
+    return { tldr, conclusion }
+  } catch {
+    return null
+  }
+}
+
+export function composeSynthesisReport(workspace: string, title: string, outputDir: string | undefined, ru: boolean): string {
   const corpus = loadCorpus(workspace, outputDir)
   const selected = corpus.filter((e) => e.screeningStatus === 'selected')
   const read = selected.filter((e) => e.readStatus === 'read' || e.status === 'read')
   const unavailable = selected.filter((e) => e.readStatus === 'failed')
-  const reviews = read.filter((e) => e.publicationType === 'survey' || e.publicationType === 'review')
   const claims = loadEvidence(workspace, outputDir).filter((e) => e.status === 'supported')
+  // How many sources the user wants PRESENTED in the report. Discovery/reads may be
+  // larger; the report shows the top-N most relevant read sources. Explicit
+  // reportSourceCount wins; otherwise fall back to the selected floor (minSelected).
+  const spec = (() => { try { return outputDir ? ensureResearchRunSpec(workspace, outputDir) : null } catch { return null } })()
+  const th = (spec?.thresholds || {}) as Record<string, number | boolean | string>
+  const reportCount = Number(th.reportSourceCount) > 0
+    ? Number(th.reportSourceCount)
+    : (Number(th.minSelected) > 0 ? Number(th.minSelected) : 0)
+  const rankedRead = [...read].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0) || ((b.year ?? 0) - (a.year ?? 0)))
+  const reportSources = reportCount > 0 ? rankedRead.slice(0, reportCount) : rankedRead
+  const reportSourceIds = new Set(reportSources.map((e) => e.id))
+  const reviews = reportSources.filter((e) => e.publicationType === 'survey' || e.publicationType === 'review')
   const plan = parsePlan(workspace, outputDir)
   const byPlan = new Map<string, typeof claims>()
   for (const claim of claims) {
@@ -1478,7 +1851,7 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
   const sourceLabel = (id: string) => {
     const src = sourceById.get(id)
     if (!src) return id
-    return `${src.title}${src.year ? ` (${src.year})` : ''}`
+    return `${cleanTitle(src.title)}${src.year ? ` (${src.year})` : ''}`
   }
   const cite = (claim: { corpusIds?: string[] }) => (claim.corpusIds || []).slice(0, 3).map(sourceTag).join(', ') || (ru ? 'источник не привязан' : 'no linked source')
   const evidenceStrength = (claim: { quote?: string; notes?: string; evidenceType?: string; confidence?: string }) => {
@@ -1519,9 +1892,9 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
   const typeHeader = ru ? 'Тип' : 'Type'
   const priorityHeader = ru ? 'Приоритет' : 'Priority'
   const planHeader = ru ? 'План' : 'Plan links'
-  const compactQuote = (quote?: string) => quote
-    ? quote.replace(/\s+/g, ' ').trim().slice(0, 260) + (quote.replace(/\s+/g, ' ').trim().length > 260 ? '...' : '')
-    : ''
+  const cleanTitle = cleanReportTitle
+  const cleanReadReason = (raw?: string) => humanReadFailureReason(raw, ru)
+  const compactQuote = sanitizeReportQuote
   const sourceType = (e: { publicationType?: string }) => {
     if (!ru) return e.publicationType || 'unclassified'
     if (e.publicationType === 'survey') return 'обзор'
@@ -1533,11 +1906,51 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     if (e.publicationType === 'background') return 'контекст'
     return 'не классифицирован'
   }
-  const topSources = read.slice(0, 24).map((e, i) => {
+  // Per-source one-line summary in the report language. Prefer a recorded evidence
+  // claim citing the source (already in the report language and grounded); fall back
+  // to the cleaned abstract/snippet.
+  const claimByCorpus = new Map<string, string>()
+  const claimsByCorpusAll = new Map<string, string[]>()
+  for (const c of claims) {
+    for (const id of c.corpusIds || []) {
+      if (!c.claim) continue
+      if (!claimByCorpus.has(id)) claimByCorpus.set(id, c.claim)
+      claimsByCorpusAll.set(id, [...(claimsByCorpusAll.get(id) || []), c.claim])
+    }
+  }
+  // Best-effort: generate consistent, in-language, multi-sentence summaries for the
+  // sources presented in the report. Mutates/caches onto the corpus entries.
+  const lang = ru ? 'ru' : 'en'
+  try { llmSummarizeSources(workspace, outputDir, reportSources, claimsByCorpusAll, ru) } catch {}
+  const sourceSummary = (e: CorpusEntry): string => {
+    if (e.summary && e.summaryLang === lang) return e.summary
+    const claim = claimByCorpus.get(e.id)
+    if (claim) {
+      const t = claim.replace(/\s+/g, ' ').trim()
+      return t.length > 300 ? t.slice(0, 300).trimEnd() + '…' : t
+    }
+    const snip = stripQuoteMarkup(e.snippet)
+    if (snip && !isJunkReportQuote(snip)) return snip.length > 240 ? snip.slice(0, 240).trimEnd() + '…' : snip
+    return ru ? '— (выжимка появится после извлечения доказательств)' : '— (summary pending evidence extraction)'
+  }
+  // Cross-source synthesis: key takeaways (top) + closing conclusion (end).
+  const synthesis = (() => {
+    try { return llmReportSynthesis(title, claims.map((c) => c.claim).filter(Boolean), ru) } catch { return null }
+  })()
+  const keyTakeawaysBlock = synthesis?.tldr?.length
+    ? [ru ? '## Ключевые выводы' : '## Key Takeaways', '', ...synthesis.tldr.map((t) => `- ${t}`), '']
+    : []
+  const conclusionBlock = synthesis?.conclusion
+    ? [ru ? '## Заключение' : '## Conclusion', '', synthesis.conclusion, '']
+    : []
+  const annotationLines = reportSources.length
+    ? reportSources.map((e, i) => `${i + 1}. **${link(cleanTitle(e.title), e.url)}**${e.year ? ` (${e.year})` : ''} \`${e.id}\`\n   ${sourceSummary(e)}`)
+    : [ru ? '- Нет прочитанных источников.' : '- No read sources.']
+  const topSources = reportSources.map((e, i) => {
     const local = localHref(e.localPath)
     return [
       `| S${i + 1}`,
-      `${link(e.title, e.url)}${e.year ? ` (${e.year})` : ''}`,
+      `${link(cleanTitle(e.title), e.url)}${e.year ? ` (${e.year})` : ''}`,
       sourceType(e),
       priorityLabel(e.readPriority),
       e.subQuestions?.join(', ') || '-',
@@ -1546,10 +1959,13 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     ].join(' | ')
   })
   const reviewLines = reviews.length
-    ? reviews.map((e) => `- ${link(e.title, e.url)}${e.year ? ` (${e.year})` : ''} (${sourceTag(e.id)}): ${ru ? 'обзорная рамка для интерпретации первичных результатов' : 'review context for interpreting primary results'}.`)
+    ? reviews.map((e) => {
+      const covers = e.subQuestions?.length ? ` — ${ru ? 'покрывает' : 'covers'} ${e.subQuestions.join(', ')}` : ''
+      return `- ${link(cleanTitle(e.title), e.url)}${e.year ? ` (${e.year})` : ''} (${sourceTag(e.id)})${covers}`
+    })
     : [ru ? '- Обзорных источников среди прочитанных отобранных источников недостаточно; это ограничение.' : '- Review/survey coverage among read selected sources is insufficient; this is a limitation.']
   const unavailableLines = unavailable.length
-    ? unavailable.map((e) => `- ${sourceTag(e.id)} ${link(e.title, e.url)}: ${e.readReason ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`)
+    ? unavailable.map((e) => `- ${sourceTag(e.id)} ${link(cleanTitle(e.title), e.url)}: ${cleanReadReason(e.readReason) ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`)
     : [ru ? '- Нет отобранных источников с недоступным полным текстом.' : '- No selected sources have failed full-text reads.']
   const planSections = plan.length ? plan : [{ id: 'Q1', text: ru ? 'Основные результаты исследования' : 'Main research findings', done: true, level: 0, children: [] }]
   const directionRows = planSections.slice(0, 8).map((item) => {
@@ -1558,12 +1974,12 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     const strongCount = rows.filter((claim) => evidenceStrength(claim) === (ru ? 'сильная' : 'strong')).length
     const weakCount = rows.length - strongCount
     const titleText = item.text.replace(/^Q\d+\.\s*/, '').replace(/\|/g, '\\|')
+    const citeIds = [...new Set(rows.flatMap((c) => c.corpusIds ?? []))].slice(0, 5).map(sourceTag).join(', ') || '-'
     return [
       `| ${item.id}: ${titleText}`,
       ru ? `${rows.length} утвержд.; ${sourceCount} источн.` : `${rows.length} claims; ${sourceCount} source(s)`,
       ru ? `${strongCount} сильных; ${weakCount} ограниченных` : `${strongCount} strong; ${weakCount} limited`,
-      rows.map(cite).join('; ') || '-',
-      '|',
+      `${citeIds} |`,
     ].join(' | ')
   })
   const sectionText = planSections.map((item) => {
@@ -1606,10 +2022,11 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     return [
       '## Executive Summary',
       '',
-      `This synthesis is based on ${selected.length} selected sources, ${read.length} read full-text sources, ${reviews.length} review/survey sources, and ${claims.length} supported evidence claims. It separates raw discovery from the evidence base: only selected and read material is used for conclusions.`,
+      `This report presents the ${reportSources.length} most relevant sources, drawn from ${read.length} read full-text sources and ${selected.length} selected (out of a larger raw corpus). It includes ${reviews.length} review/survey sources and ${claims.length} supported evidence claims. It separates raw discovery from the evidence base: only selected and read material is used for conclusions.`,
       '',
       `The strongest parts of the report are the sections with multiple linked claims, read sources, and direct quotes. Sections with metadata-only evidence, failed full-text access, or few independent sources are treated as limitations rather than settled conclusions.`,
       '',
+      ...keyTakeawaysBlock,
       '## How To Use This Report',
       '',
       '- Source IDs are clickable when an external URL is available, for example `[S1](...)` links to the paper page or DOI.',
@@ -1635,6 +2052,12 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
       `| # | ${sourceHeader} | ${typeHeader} | ${priorityHeader} | ${planHeader} | ${localArtifactHeader} | ${corpusIdHeader} |`,
       '|---|---|---|---|---|---|---|',
       ...topSources,
+      '',
+      '## Source Annotations',
+      '',
+      `Short summary for each of the ${reportSources.length} sources presented in the report (the most relevant out of ${read.length} read). Summaries come from extracted evidence (in the report language) or the source abstract.`,
+      '',
+      ...annotationLines,
       '',
       '## Review And Survey Anchors',
       '',
@@ -1667,16 +2090,19 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
       '- Follow-up work should target the weakest plan sections first: low source diversity, metadata-only support, or failed full-text access.',
       '- The next search pass should prioritize replacement sources for unavailable high-priority items and direct primary evidence for thin claims.',
       '- If this report is used for decision-making, rerun quality gates after adding or replacing evidence so limitations stay visible.',
+      '',
+      ...conclusionBlock,
     ].join('\n')
   }
 
   return [
     '## Краткое резюме',
     '',
-    `Этот обзор основан на ${selected.length} отобранных источниках, ${read.length} прочитанных полнотекстовых источниках, ${reviews.length} обзорных источниках и ${claims.length} поддержанных доказательных утверждениях. Важно: сырой корпус не считается доказательной базой; выводы строятся только по отобранным и прочитанным источникам.`,
+    `В отчёте представлены ${reportSources.length} наиболее релевантных источников (отобраны из ${read.length} прочитанных полнотекстовых и ${selected.length} отобранных, при большем сыром корпусе). Включено ${reviews.length} обзорных источников и ${claims.length} поддержанных доказательных утверждений. Важно: сырой корпус не считается доказательной базой; выводы строятся только по отобранным и прочитанным источникам.`,
     '',
     'Самые сильные части отчёта — те, где есть несколько связанных доказательных утверждений, прочитанные источники и прямые цитаты. Разделы, где опора идёт только на метаданные, аннотации, единичные источники или недоступный полный текст, отмечаются как ограничения, а не как окончательные выводы.',
     '',
+    ...keyTakeawaysBlock,
     '## Как пользоваться отчётом',
     '',
     '- Названия источников и ID корпуса кликабельны, если доступен внешний URL/DOI.',
@@ -1702,6 +2128,14 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     `| # | ${sourceHeader} | ${typeHeader} | ${priorityHeader} | ${planHeader} | ${localArtifactHeader} | ${corpusIdHeader} |`,
     '|---|---|---|---|---|---|---|',
     ...topSources,
+    '',
+    '## Аннотации источников',
+    '',
+    ru
+      ? `Краткая выжимка по каждому из ${reportSources.length} источников, представленных в отчёте (из ${read.length} прочитанных отобраны самые релевантные). Выжимка берётся из извлечённых доказательств (на языке отчёта) или из аннотации источника.`
+      : '',
+    '',
+    ...annotationLines,
     '',
     '## Обзорные источники',
     '',
@@ -1739,6 +2173,8 @@ function composeSynthesisReport(workspace: string, title: string, outputDir: str
     '## Приложение: доказательные утверждения',
     '',
     ...claims.slice(0, 30).map((claim) => `- ${claim.claim} Источники: ${cite(claim)}.`),
+    '',
+    ...conclusionBlock,
   ].join('\n')
 }
 
@@ -1845,6 +2281,46 @@ function runNodeScript(source: string, args: string[], timeoutMs = 120000): stri
   })
 }
 
+/** Block the current thread for `ms` without busy-waiting. Safe here because the
+ * search tools already run synchronously via execFileSync. */
+function sleepSync(ms: number): void {
+  if (!(ms > 0)) return
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.ceil(ms))
+  } catch {
+    const end = Date.now() + ms
+    while (Date.now() < end) { /* fallback spin */ }
+  }
+}
+
+// Per-host minimum spacing between outbound requests. Some scholarly APIs
+// (notably arXiv's export endpoint and key-less Semantic Scholar) return
+// 500/429 for rapid bursts no matter how many times we retry, because the whole
+// burst lands inside the same rate-limit window. Spacing requests out turns a
+// burst into a sequence the API actually accepts.
+const lastRequestAtByHost: Record<string, number> = {}
+function throttleHost(host: string, minIntervalMs: number): void {
+  const now = Date.now()
+  const earliest = (lastRequestAtByHost[host] ?? 0) + minIntervalMs
+  const delay = Math.max(0, earliest - now)
+  // Reserve this slot now (wall clock after the delay) so concurrent/sequential
+  // callers each get their own spaced slot.
+  lastRequestAtByHost[host] = now + delay
+  sleepSync(delay)
+}
+
+// Circuit breaker: once a host rate-limits us (e.g. arXiv answering 400/429/500),
+// it stays angry for a while. Hammering it just keeps the penalty alive and wastes
+// time. After a trip we "open the breaker" for a cooldown window and short-circuit
+// further calls so the agent immediately pivots to alternative sources instead.
+// arXiv is a primary source, so prefer adaptive backoff over abandoning it: only
+// open the breaker after a *sustained* streak (4 in a row), and keep the cooldown
+// short. The adaptive throttle below does the real work of staying under the limit.
+const hostBreaker = new HostBreaker(4, 15000)
+// Base 3s spacing (arXiv's published guideline), widening up to 30s when it
+// rate-limits and decaying back to 3s as requests succeed again.
+const arxivThrottle = new AdaptiveThrottle(3000, 30000, 2)
+
 /**
  * Snippet injected into spawned fetch scripts so every network request has a hard
  * abort deadline. Without this a slow/hung host blocks the synchronous worker thread
@@ -1861,6 +2337,87 @@ const __fetchErr = (err) => {
   const name = err && err.name
   if (name === 'AbortError' || name === 'TimeoutError') return 'request timed out after ${Math.round(ms / 1000)}s'
   return String((err && err.message) || err)
+}`
+}
+
+/**
+ * Injects __fetchRetry(url, init, retries, baseDelayMs) into a spawned script.
+ * Used only for arXiv's export API, which — on rapid bursts — rate-limits with
+ * 400/429/500 (confirmed: a burst returns HTTP 400 even for well-formed queries).
+ * Our arXiv queries are always well-formed (all:...), so all of these are treated
+ * as transient and retried with backoff.
+ * Retries on transient failures (HTTP 5xx / 429 and network errors) with
+ * exponential backoff, while propagating abort/timeout immediately. APIs like
+ * arXiv's export endpoint return 500/503 when hit in rapid bursts, so a couple
+ * of polite retries turn a hard failure into a successful response.
+ */
+function fetchRetrySnippet(): string {
+  return `async function __fetchRetry(url, init, retries, baseDelayMs) {
+  let lastErr
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, init)
+      if ((res.status >= 500 || res.status === 429 || res.status === 400) && attempt < retries) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)))
+        continue
+      }
+      return res
+    } catch (err) {
+      lastErr = err
+      const name = err && err.name
+      if (name === 'AbortError' || name === 'TimeoutError') throw err
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)))
+        continue
+      }
+      throw err
+    }
+  }
+  throw lastErr
+}`
+}
+
+/**
+ * Injects a self-contained __httpGet(url, init, opts) into a spawned script.
+ * It applies a per-request abort timeout (so a stalled connection can't block
+ * for the whole runNodeScript budget), retries transient 5xx/429/network/timeout
+ * failures with exponential backoff, and reads the body within the timeout
+ * window. Returns { ok, status, url, text }. Ideal for the JSON/HTML search APIs
+ * which otherwise have no timeout and no retry. opts: { retries, baseDelayMs, timeoutMs }.
+ */
+function httpGetSnippet(): string {
+  return `async function __httpGet(url, init, opts) {
+  const o = opts || {}
+  const retries = o.retries == null ? 3 : o.retries
+  const baseDelayMs = o.baseDelayMs == null ? 1500 : o.baseDelayMs
+  const timeoutMs = o.timeoutMs == null ? 20000 : o.timeoutMs
+  let lastErr
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const res = await fetch(url, Object.assign({}, init || {}, { signal: ctrl.signal }))
+      if ((res.status >= 500 || res.status === 429) && attempt < retries) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)))
+        continue
+      }
+      const text = await res.text()
+      return { ok: res.ok, status: res.status, url: res.url || url, text }
+    } catch (err) {
+      lastErr = err
+      const name = err && err.name
+      const isTimeout = name === 'AbortError' || name === 'TimeoutError'
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)))
+        continue
+      }
+      if (isTimeout) throw new Error('request timed out after ' + Math.round(timeoutMs / 1000) + 's')
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  throw lastErr
 }`
 }
 
@@ -2170,6 +2727,17 @@ function searchArxiv(
 
   const limit = clampSearchLimit(maxResults)
   const startOffset = Number.isFinite(Number(start)) ? Math.max(0, Math.trunc(Number(start))) : 0
+
+  const cacheParams = { q: trimmedQuery.toLowerCase(), limit, fromDate: fromDate ?? null, toDate: toDate ?? null, sortBy: sortBy ?? null, sortOrder: sortOrder ?? null, start: startOffset }
+  const cached = searchCache.get('search_arxiv', cacheParams)
+  if (cached) return `[cached]\n${cached}`
+
+  // If arXiv recently rate-limited us, don't hit it again — pivot to alternatives.
+  const cooldown = hostBreaker.coolingDownFor('arxiv')
+  if (cooldown > 0) {
+    return `Error: arXiv is cooling down after rate-limiting (~${Math.ceil(cooldown / 1000)}s left). Do NOT keep retrying arXiv now. Use search_openalex, search_semantic_scholar, or search_crossref instead — they index most arXiv papers — or call smart_search to query several sources at once.`
+  }
+
   const inferredWindow = inferDateWindow(trimmedQuery)
   const freshnessHints = detectFreshnessHints(trimmedQuery)
   const normalizedFrom = normalizeIsoDate(fromDate) ?? inferredWindow.fromDate
@@ -2188,6 +2756,7 @@ function searchArxiv(
     : ''
   const script = `
 ${fetchWithTimeoutSnippet(25000)}
+${fetchRetrySnippet()}
 const query = process.argv[1]
 const limit = Number(process.argv[2] || '5')
 const sortBy = process.argv[3] || 'relevance'
@@ -2195,11 +2764,16 @@ const sortOrder = process.argv[4] || 'descending'
 const dateFilter = process.argv[5] || ''
 const searchQuery = dateFilter ? '(all:' + query + ')' + dateFilter : 'all:' + query
 const startOffset = Number(process.argv[6] || '0')
-const url = 'http://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=' + startOffset + '&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
-fetch(url, {
-  headers: { 'User-Agent': 'one-click-research-agent/0.1' },
+// Use https directly: http://export.arxiv.org now 301-redirects to https, and
+// the extra hop is a needless failure point.
+const url = 'https://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=' + startOffset + '&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
+// Fail fast: do NOT retry. arXiv's export API rate-limits per IP, and retrying a
+// 429/500 only deepens the penalty (and the website CDN stays up, which is why
+// arxiv.org loads in a browser while this API 500s). One attempt, then pivot.
+__fetchRetry(url, {
+  headers: { 'User-Agent': 'one-click-research-agent/0.1 (mailto:research@example.com)' },
   signal: __abortSignal,
-}).then(async (res) => {
+}, 0, 0).then(async (res) => {
   if (!res.ok) throw new Error('HTTP ' + res.status)
   const text = await res.text()
   process.stdout.write(text)
@@ -2209,16 +2783,37 @@ fetch(url, {
 }).finally(() => clearTimeout(__timer))
 `
 
+  // arXiv asks for no more than ~1 request every 3s and a single connection at a
+  // time. Use adaptive spacing: stays at 3s normally, widens automatically if arXiv
+  // starts rate-limiting, so a long run keeps using arXiv without tripping the limit.
+  throttleHost('arxiv', arxivThrottle.current('arxiv'))
+
   let xml = ''
   try {
-    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)], 32000)
+    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)], 40000)
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
-    const hint = /timed out/i.test(stderr)
-      ? ' arXiv (export.arxiv.org) did not respond in time — it may be slow or rate-limiting. Try again, narrow the query, or use search_openalex / search_semantic_scholar instead.'
-      : ''
-    return `Error: failed to search arXiv. ${stderr}${hint}`
+    const rateLimited = /HTTP 5\d\d|HTTP 429|HTTP 400|timed out/i.test(stderr)
+    // Back off adaptively so the NEXT arXiv call waits longer instead of piling
+    // onto the limit. Only open the breaker after a *sustained* streak.
+    if (rateLimited) arxivThrottle.onRateLimited('arxiv')
+    const tripped = rateLimited && hostBreaker.recordFailure('arxiv')
+    const cause = /timed out/i.test(stderr)
+      ? ' arXiv (export.arxiv.org) did not respond in time.'
+      : /HTTP 5\d\d|HTTP 429|HTTP 400/i.test(stderr)
+        ? ' arXiv throttles rapid bursts with 400/429/500 (the export API is a separate service, so it can be busy even when arxiv.org opens fine in a browser).'
+        : ''
+    const guidance = tripped
+      ? ' arXiv is now on a short cooldown — pause it and use search_openalex / search_semantic_scholar / search_crossref (they index most arXiv papers) or smart_search.'
+      : rateLimited
+        ? ' This is usually transient — wait a few seconds and retry, or query search_openalex / search_semantic_scholar / search_crossref / smart_search meanwhile.'
+        : ''
+    return `Error: failed to search arXiv.${cause}${guidance} ${stderr}`.trim()
   }
+  // Successful contact clears any prior penalty assumption and decays the spacing
+  // back toward the base interval so arXiv speeds up again once it's happy.
+  hostBreaker.recordSuccess('arxiv')
+  arxivThrottle.onSuccess('arxiv')
 
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map((match) => match[1]).slice(0, limit)
   if (entries.length === 0) return `No arXiv papers found for "${trimmedQuery}".`
@@ -2252,7 +2847,9 @@ fetch(url, {
   if (normalizedFrom) filters.push(`from ${normalizedFrom.slice(0, 4)}-${normalizedFrom.slice(4, 6)}-${normalizedFrom.slice(6, 8)}`)
   if (normalizedTo) filters.push(`to ${normalizedTo.slice(0, 4)}-${normalizedTo.slice(4, 6)}-${normalizedTo.slice(6, 8)}`)
   filters.push(`sort ${safeSortBy} ${safeSortOrder}`)
-  return `Found ${entries.length} arXiv paper(s) for "${trimmedQuery}" (${filters.join(', ')}):\n\n${lines.join('\n\n')}`
+  const out = `Found ${entries.length} arXiv paper(s) for "${trimmedQuery}" (${filters.join(', ')}):\n\n${lines.join('\n\n')}`
+  searchCache.set('search_arxiv', cacheParams, out)
+  return out
 }
 
 function searchWeb(
@@ -2350,6 +2947,7 @@ function searchHuggingFacePapers(query: string, maxResults?: number): string {
   const limit = clampSearchLimit(maxResults)
   const inferredWindow = inferDateWindow(trimmedQuery)
   const script = `
+${httpGetSnippet()}
 const query = process.argv[1]
 const limit = Number(process.argv[2] || '5')
 const latestMode = process.argv[3] === '1'
@@ -2392,26 +2990,25 @@ function extractObjects(text, limit) {
   return out
 }
 const url = latestMode ? 'https://huggingface.co/papers' : 'https://huggingface.co/papers?q=' + encodeURIComponent(query)
-fetch(url, {
-  headers: { 'User-Agent': 'one-click-research-agent/0.1' },
-}).then(async (res) => {
-  if (!res.ok) throw new Error('HTTP ' + res.status)
-  const html = decodeHtmlText(await res.text())
+;(async () => {
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1' } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  const html = decodeHtmlText(r.text)
   process.stdout.write(JSON.stringify(extractObjects(html, limit)))
-}).catch((err) => {
-  console.error(String(err?.message || err))
-  process.exit(1)
-})
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
 
   let items: any[] = []
   try {
     const freshnessOnly = inferredWindow.freshness && isFreshnessOnlyQuery(trimmedQuery)
-    const out = runNodeScript(script, [trimmedQuery, String(limit), freshnessOnly ? '1' : '0'])
+    const out = runNodeScript(script, [trimmedQuery, String(limit), freshnessOnly ? '1' : '0'], 30000)
     items = JSON.parse(out)
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
-    return `Error: failed to search Hugging Face Papers. ${stderr}`
+    const hint = /HTTP 5\d\d|HTTP 429|timed out/i.test(stderr)
+      ? ' Hugging Face Papers was slow or rate-limited even after retries. Try again shortly or use search_arxiv / search_openalex.'
+      : ''
+    return `Error: failed to search Hugging Face Papers. ${stderr}${hint}`
   }
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -2480,24 +3077,24 @@ function searchOpenAlex(query: string, maxResults?: number, yearFrom?: number, y
   if (inferredWindow.freshness) params.set('sort', 'publication_date:desc')
 
   const script = `
+${httpGetSnippet()}
 const url = 'https://api.openalex.org/works?' + process.argv[1]
-fetch(url, {
-  headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
-}).then(async (res) => {
-  if (!res.ok) throw new Error('HTTP ' + res.status)
-  process.stdout.write(JSON.stringify(await res.json()))
-}).catch((err) => {
-  console.error(String(err?.message || err))
-  process.exit(1)
-})
+;(async () => {
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(r.text)
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
 
   let payload: any
   try {
-    payload = JSON.parse(runNodeScript(script, [params.toString()]))
+    payload = JSON.parse(runNodeScript(script, [params.toString()], 30000))
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
-    return `Error: failed to search OpenAlex. ${stderr}`
+    const hint = /HTTP 5\d\d|HTTP 429|timed out/i.test(stderr)
+      ? ' OpenAlex was slow or rate-limited even after retries. Wait a moment and retry, or use search_crossref / search_semantic_scholar.'
+      : ''
+    return `Error: failed to search OpenAlex. ${stderr}${hint}`
   }
 
   const items = Array.isArray(payload?.results) ? payload.results.slice(0, limit) : []
@@ -2562,24 +3159,20 @@ function downloadArxivHtml(arxivId: string, outputPath: string | undefined, work
 
   const htmlUrl = `https://arxiv.org/html/${normalizedId}`
   const script = `
+${httpGetSnippet()}
 const url = process.argv[1]
 const outPath = process.argv[2]
-fetch(url, {
-  headers: { 'User-Agent': 'one-click-research-agent/0.1' },
-}).then(async (res) => {
-  if (!res.ok) throw new Error('HTTP ' + res.status)
-  const text = await res.text()
-  require('fs').writeFileSync(outPath, text, 'utf-8')
-  process.stdout.write(String(text.length))
-}).catch((err) => {
-  console.error(String(err?.message || err))
-  process.exit(1)
-})
+;(async () => {
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1' } }, { timeoutMs: 30000 })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  require('fs').writeFileSync(outPath, r.text, 'utf-8')
+  process.stdout.write(String(r.text.length))
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
 
   let charCount = 0
   try {
-    const out = runNodeScript(script, [htmlUrl, targetPath]).trim()
+    const out = runNodeScript(script, [htmlUrl, targetPath], 40000).trim()
     charCount = Number(out) || fs.readFileSync(targetPath, 'utf-8').length
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
@@ -2906,16 +3499,21 @@ function searchCrossref(query: string, maxResults?: number, yearFrom?: number, y
   if (mailto) params.set('mailto', mailto)
 
   const script = `
+${httpGetSnippet()}
 (async () => {
   const url = 'https://api.crossref.org/works?' + process.argv[1]
-  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1 (${mailto || 'mailto:researcher@example.com'})' } })
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1 (${mailto || 'mailto:researcher@example.com'})' } }, { timeoutMs: 20000 })
   if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
-  process.stdout.write(JSON.stringify(await r.json()))
+  process.stdout.write(r.text)
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
   let payload: any
-  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
-    return `Error: Crossref search failed. ${String(e?.stderr || e?.message || e).trim()}`
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()], 30000)) } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    const hint = /HTTP 5\d\d|HTTP 429|timed out/i.test(stderr)
+      ? ' Crossref was slow or rate-limited even after retries. Try again shortly or use search_openalex / search_semantic_scholar.'
+      : ''
+    return `Error: Crossref search failed. ${stderr}${hint}`
   }
   const items: any[] = Array.isArray(payload?.message?.items) ? payload.message.items : []
   if (items.length === 0) return `No Crossref works found for "${q}".`
@@ -2968,20 +3566,27 @@ function searchSemanticScholar(query: string, maxResults?: number, yearFrom?: nu
 
   const headerLiteral = apiKey ? `, 'x-api-key': '${apiKey.replace(/'/g, "\\'")}'` : ''
   const script = `
+${httpGetSnippet()}
 (async () => {
   const url = 'https://api.semanticscholar.org/graph/v1/paper/search?' + process.argv[1]
-  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1'${headerLiteral} } })
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1'${headerLiteral} } }, { timeoutMs: 20000 })
   if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
-  process.stdout.write(JSON.stringify(await r.json()))
+  process.stdout.write(r.text)
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
+  // Key-less Semantic Scholar shares a strict pool (~1 req/s) and 429s on bursts.
+  throttleHost('semantic-scholar', 1200)
+
   let payload: any
-  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()], 30000)) } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
     if (stderr.includes('HTTP 403') || stderr.includes('HTTP 429')) {
       return `Semantic Scholar is rate-limited or unavailable (${stderr.match(/HTTP \d+/)?.[0] || 'network error'}). Try search_crossref or search_openalex instead.`
     }
-    return `Error: Semantic Scholar search failed. ${stderr}`
+    const hint = /HTTP 5\d\d|timed out/i.test(stderr)
+      ? ' Semantic Scholar was slow or returned a server error even after retries. Try search_crossref or search_openalex.'
+      : ''
+    return `Error: Semantic Scholar search failed. ${stderr}${hint}`
   }
   const items: any[] = Array.isArray(payload?.data) ? payload.data : []
   if (items.length === 0) return `No Semantic Scholar papers found for "${q}".`
@@ -3031,16 +3636,21 @@ function searchPubMed(query: string, maxResults?: number, yearFrom?: number, yea
   params.set('resultType', 'core')
 
   const script = `
+${httpGetSnippet()}
 (async () => {
   const url = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?' + process.argv[1]
-  const r = await fetch(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } })
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
   if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
-  process.stdout.write(JSON.stringify(await r.json()))
+  process.stdout.write(r.text)
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
   let payload: any
-  try { payload = JSON.parse(runNodeScript(script, [params.toString()])) } catch (e: any) {
-    return `Error: Europe PMC (PubMed) search failed. ${String(e?.stderr || e?.message || e).trim()}`
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()], 30000)) } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    const hint = /HTTP 5\d\d|HTTP 429|timed out/i.test(stderr)
+      ? ' Europe PMC was slow or rate-limited even after retries. Try again shortly or use search_crossref / search_openalex.'
+      : ''
+    return `Error: Europe PMC (PubMed) search failed. ${stderr}${hint}`
   }
   const items: any[] = Array.isArray(payload?.resultList?.result) ? payload.resultList.result : []
   if (items.length === 0) return `No PubMed / Europe PMC papers found for "${q}".`

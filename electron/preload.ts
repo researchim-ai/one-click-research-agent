@@ -120,6 +120,14 @@ contextBridge.exposeInMainWorld('api', {
   getResearchProfiles: (): Promise<any[]> => ipcRenderer.invoke('get-research-profiles'),
   getResearchDashboard: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-dashboard', workspace),
   inferResearchRequest: (payload: any): Promise<any> => ipcRenderer.invoke('infer-research-request', payload),
+  setResearchSourceIncluded: (
+    workspace: string, outputDir: string, id: string, included: boolean,
+  ): Promise<{ ok: boolean; selected: number }> =>
+    ipcRenderer.invoke('research-set-source-included', workspace, outputDir, id, included),
+  getResearchSourceSelection: (
+    workspace: string, outputDir: string,
+  ): Promise<import('./types').CorpusSelectionItem[]> =>
+    ipcRenderer.invoke('research-get-source-selection', workspace, outputDir),
   listResearchArtifacts: (workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>> =>
     ipcRenderer.invoke('list-research-artifacts', workspace),
   embedStatus: (): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }> =>

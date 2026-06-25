@@ -9,6 +9,7 @@ import { getWebSearchStatus } from './searxng'
 import { getResearchPresetById } from '../research-presets'
 import { formatResearchProfileForPrompt, getResearchProfileByPresetId } from '../research-profiles'
 import { getSourceTracker, extractSourcesFromToolResult } from './sources'
+import { getCorpusSelection } from './corpus'
 import { loadPriorKnowledge } from './memory'
 import { skillPackForPreset } from './research-skills'
 import {
@@ -105,6 +106,23 @@ let currentBridge: AgentBridge | null = null
 function doEmit(e: AgentEvent): void { currentBridge!.emit(e) }
 function emitActivity(phase: AgentActivity['phase'], label: string, detail?: string): void {
   doEmit({ type: 'agent_activity', activity: { phase, label, detail } })
+}
+
+/**
+ * After screening/assignment, surface the currently-selected sources to the UI as a
+ * NON-BLOCKING review panel. The run keeps going; the user can prune or restore sources
+ * via an IPC that toggles screeningStatus. We never pause for this.
+ */
+function maybeEmitCorpusSelection(toolName: string, result: string, workspace: string): void {
+  if (toolName !== 'screen_corpus' && toolName !== 'assign_corpus_to_plan') return
+  if (/^error/i.test(String(result || '').trim())) return
+  const outputDir = activeResearchOutputDir ?? undefined
+  try {
+    const items = getCorpusSelection(workspace, outputDir)
+    if (items.length > 0) {
+      doEmit({ type: 'corpus_selection', corpusSelection: { outputDir: outputDir ?? '', items } })
+    }
+  } catch {}
 }
 function doRequestApproval(name: string, args: Record<string, any>): Promise<boolean> { return currentBridge!.requestApproval(name, args) }
 function doGetConfig(): AppConfig { return currentBridge!.getConfig() }
@@ -224,7 +242,7 @@ function followUpQualityGates(
   const outputDir = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/') : activeResearchOutputDir
   if (!outputDir) return result
 
-  const userStatus = formatQualityGateUserStatus(workspace, outputDir)
+  const userStatus = formatQualityGateUserStatus(workspace, outputDir, doGetConfig().appLanguage ?? 'ru')
   if (userStatus) doEmit({ type: 'status', content: userStatus })
 
   const snap = readQualityGateSnapshot(workspace, outputDir)
@@ -284,7 +302,7 @@ function followUpQualityGates(
     const verifyResult = executeTool('run_quality_gates', verifyArgs, workspace)
     doEmit({ type: 'tool_call', name: 'run_quality_gates', args: verifyArgs })
     doEmit({ type: 'tool_result', name: 'run_quality_gates', result: verifyResult.slice(0, 4000) })
-    const finalStatus = formatQualityGateUserStatus(workspace, outputDir)
+    const finalStatus = formatQualityGateUserStatus(workspace, outputDir, doGetConfig().appLanguage ?? 'ru')
     if (finalStatus) doEmit({ type: 'status', content: finalStatus })
 
     return `${result}\n\n---\n[Auto] ${genResult}\n\n---\n[Post-report verification]\n${verifyResult}`
@@ -1657,6 +1675,25 @@ function stripThinking(content: string): string {
   return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
 }
 
+/**
+ * Append a visible-text segment to the streamed response, skipping duplicates.
+ * The model sometimes narrates the same prose twice — once alongside a tool call
+ * and again as its final answer (common at checkpoints) — which previously got
+ * concatenated and shown to the user twice. If the new segment is already present
+ * we keep the accumulator; if it is a superset we replace it.
+ */
+export function appendVisibleSegment(acc: string, segment: string): string {
+  const seg = (segment || '').trim()
+  if (!seg) return acc
+  if (!acc) return seg
+  const norm = (x: string) => x.replace(/\s+/g, ' ').trim()
+  const na = norm(acc)
+  const ns = norm(seg)
+  if (na.includes(ns)) return acc
+  if (ns.includes(na)) return seg
+  return `${acc}\n\n${seg}`
+}
+
 function compressToolResultText(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content
   const headSize = Math.floor(maxChars * 0.6)
@@ -2491,18 +2528,18 @@ function toolLoopSignature(toolName: string, toolArgs: Record<string, any>): str
     const claim = String(toolArgs.claim ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160)
     return `${toolName}:${claim}:${toolArgs.plan_item_id ?? ''}:${String(toolArgs.corpus_ids ?? toolArgs.corpusIds ?? '').slice(0, 48)}`
   }
-  if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName)) {
+  if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName)) {
     return `${toolName}:${toolArgs.output_dir ?? ''}`
   }
   return `${toolName}:${JSON.stringify(toolArgs)}`
 }
 
 function isLoopSensitiveTool(toolName: string): boolean {
-  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName)
+  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName)
 }
 
 function duplicateToolThreshold(toolName: string): number {
-  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run'].includes(toolName) ? 1 : 2
+  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName) ? 1 : 2
 }
 
 /**
@@ -2522,6 +2559,9 @@ function loopBreakDirective(toolName: string): string {
   }
   if (toolName === 'run_quality_gates') {
     return `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
+  }
+  if (toolName === 'generate_evidence_report') {
+    return `report.md has already been generated on disk and regenerating with the same inputs produces an identical file. The only outstanding gate is final_report_structure, which is a non-blocking structural/cosmetic check — it does NOT prevent the report from being final. Stop calling generate_evidence_report. Give the user a short final summary and point them to the report.md you produced.`
   }
   if (INSPECTION_TOOLS.has(toolName)) {
     return `You already called ${toolName}; this is a read-only inspection tool and its result will not change. Stop inspecting. Per-section coverage is whatever it is — if a section is genuinely short, record one more grounded claim with record_evidence/extract_evidence_from_corpus_item; otherwise call run_quality_gates now (it auto-generates report.md once gates pass). Do not call any inspection tool again.`
@@ -3002,6 +3042,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
             if (researchContextMode === 'off') researchContextMode = 'active'
           }
+          maybeEmitCorpusSelection(tc.name, result, workspace)
           if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name)) {
             const snap = readQualityGateSnapshot(workspace, activeResearchOutputDir)
             const gatePhase = tc.name === 'run_quality_gates' || tc.name === 'gate_report'
@@ -3083,7 +3124,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     // "bypass" interception is needed here.
     if (!toolCalls || toolCalls.length === 0) {
       const finalText = visible || content
-      fullResponse += (fullResponse ? '\n\n' : '') + finalText
+      fullResponse = appendVisibleSegment(fullResponse, finalText)
       doEmit( { type: 'response', content: fullResponse, done: true })
       emitActivity('done', 'Готово')
       messages.push({ role: 'assistant', content: stripThinking(content) })
@@ -3095,7 +3136,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
     // Has tool calls — accumulate partial text
     if (visible) {
-      fullResponse += (fullResponse ? '\n\n' : '') + visible
+      fullResponse = appendVisibleSegment(fullResponse, visible)
     }
 
     // Store without <think> blocks; only valid tool_calls
@@ -3110,7 +3151,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       // All tool calls were broken (truncated mid-JSON) — treat as text response
       const brokenText = visible || stripThinking(content)
       if (brokenText) {
-        fullResponse += (fullResponse ? '\n\n' : '') + brokenText
+        fullResponse = appendVisibleSegment(fullResponse, brokenText)
       }
       const notice = 'Модель попыталась выполнить действие, но ответ был обрезан. Попробую ещё раз.'
       doEmit( { type: 'status', content: `⚠️ ${notice}` })
@@ -3275,6 +3316,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           if (researchContextMode === 'off') researchContextMode = 'active'
         }
       }
+      maybeEmitCorpusSelection(toolName, result, workspace)
       if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(toolName)) {
         const snap = readQualityGateSnapshot(workspace, activeResearchOutputDir)
         const spec = updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, toolName, {
@@ -3324,7 +3366,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
       if (toolName === 'plan_research' && !result.startsWith('Error') && hasPlanCheckpointRequest(messages)) {
         const checkpoint = formatPlanCheckpoint(workspace, activeResearchOutputDir ?? toolArgs.output_dir)
-        fullResponse = fullResponse ? `${fullResponse}\n\n${checkpoint}` : checkpoint
+        fullResponse = appendVisibleSegment(fullResponse, checkpoint)
         messages.push({ role: 'assistant', content: checkpoint })
         doEmit({ type: 'response', content: fullResponse, done: true })
         session.messages = messages

@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback, type KeyboardEvent } from 'react'
 import { MessageBubble } from './MessageBubble'
+import { SourceSelectionCard } from './SourceSelectionCard'
 import type { ChatMessage } from '../hooks/useAgent'
 
 interface AttachedFile {
@@ -280,6 +281,18 @@ export function Chat({
             </div>
           )}
           {messages.map((msg) => {
+            if (msg.corpusSelection) {
+              return (
+                <div key={msg.id} className="msg-auto-contain">
+                  <SourceSelectionCard
+                    payload={msg.corpusSelection}
+                    workspace={workspace}
+                    appLanguage={appLanguage}
+                    onOpenLink={onOpenExternalLink}
+                  />
+                </div>
+              )
+            }
             const isDone = msg.role === 'status' || msg.done === true || msg.role === 'user'
             return (
               <div key={msg.id} className={isDone ? 'msg-auto-contain' : undefined}>

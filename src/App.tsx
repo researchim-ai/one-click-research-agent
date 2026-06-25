@@ -121,13 +121,40 @@ export function App() {
       ? request.customDateRange || 'custom range not specified'
       : request.dateRange
     const reportLanguageLabel = request.reportLanguage === 'ru' ? 'Russian / русский' : 'English'
+    // Resolve the date range into explicit year bounds so the period is actually
+    // ENFORCED by search (year_from/year_to) and screening (strict cutoff). Without
+    // explicit years, strict_date_range has nothing to compare against and is a no-op.
+    const nowYear = new Date().getFullYear()
+    const yearBounds: { from?: number; to?: number } = (() => {
+      switch (request.dateRange) {
+        case 'any': return {}
+        case 'last-year': return { from: nowYear - 1, to: nowYear }
+        case 'last-2-years': return { from: nowYear - 2, to: nowYear }
+        case 'since-2024': return { from: 2024, to: nowYear }
+        case 'custom': {
+          const ys = (request.customDateRange.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number)
+          return ys.length ? { from: Math.min(...ys), to: Math.max(...ys) } : {}
+        }
+        default: return {}
+      }
+    })()
+    const fromDate = request.dateRange === 'custom'
+      ? (request.customDateRange.split('..')[0]?.trim() || (yearBounds.from ? `${yearBounds.from}-01-01` : ''))
+      : (yearBounds.from ? `${yearBounds.from}-01-01` : '')
+    const toDate = request.dateRange === 'custom'
+      ? (request.customDateRange.split('..')[1]?.trim() || (yearBounds.to ? `${yearBounds.to}-12-31` : ''))
+      : (yearBounds.to ? `${yearBounds.to}-12-31` : '')
+    const hasBounds = yearBounds.from != null || yearBounds.to != null
+    const yearArgs = hasBounds
+      ? `\`year_from: ${yearBounds.from ?? '*'}\`, \`year_to: ${yearBounds.to ?? nowYear}\`, `
+      : ''
     return [
       '# Start managed research run',
       '',
       `Topic: ${request.topic}`,
       `Research profile: ${profile.label} (${profile.domain})`,
       `Mode: ${request.mode}`,
-      `Date range: ${dateRange}`,
+      `Date range: ${dateRange}${hasBounds ? ` (years ${yearBounds.from ?? '*'}–${yearBounds.to ?? nowYear})` : ' (no date restriction)'}`,
       `Max sources: ${request.maxSources}`,
       `Need full text: ${request.needFullText ? 'yes' : 'no'}`,
       `Minimum selected sources: ${request.minSelectedSources}`,
@@ -153,9 +180,13 @@ export function App() {
       '',
       'Run parameters:',
       `- Store all artifacts in \`${runDir}\` (not the shared \`.research/\` root). Treat the directory as an opaque id: copy it exactly into \`output_dir\` for every tool that supports it. Never translate or re-slugify it.`,
-      `- screen_corpus: \`max_selected: ${request.minSelectedSources}\`, \`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`.`,
+      hasBounds
+        ? `- Date period is ${yearBounds.from ?? '*'}–${yearBounds.to ?? nowYear}. ENFORCE it: pass ${yearArgs}(or \`from_date: ${fromDate}\`, \`to_date: ${toDate}\`) to search_arxiv/search tools, and the same \`year_from\`/\`year_to\` to screen_corpus. ${request.strictDateRange ? 'strict_date_range is true — sources outside this period must be rejected, not just down-ranked.' : 'strict_date_range is false — prefer in-period sources but older seminal works are allowed.'}`
+        : '- No date restriction: do not filter by year, but still prefer recent work for fast-moving topics.',
+      `- The final report.md must PRESENT exactly the top ${request.minSelectedSources} most relevant read sources (each with a short summary in ${reportLanguageLabel}, plus an overall synthesis). Discovery and full-text reading are intentionally LARGER than ${request.minSelectedSources} so the best ${request.minSelectedSources} can be chosen — do not stop discovery/reading at ${request.minSelectedSources}.`,
+      `- screen_corpus: \`min_selected: ${request.minSelectedSources}\` (FLOOR — at least this many on-topic selected so the report can present ${request.minSelectedSources}), \`max_selected: ${Math.min(request.maxSources, Math.max(request.minSelectedSources + 5, Math.round(request.minSelectedSources * 1.4)))}\` (select a bit more than the report needs), ${yearArgs}\`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`. To get the freshest work, pass \`sub_questions\` and prefer recent items; when discovering via search_arxiv use \`sort_by: 'submittedDate'\` for "latest/новые" requests.`,
       `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`.`,
-      `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources you may claim as read. Report found/selected/read/evidence counts separately.`,
+      `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources presented in the report (${request.minSelectedSources}). Report found/selected/read/evidence counts separately.`,
       request.requireQualityPass
         ? '- A quality pass is required before the report: data/evidence gates must pass before `generate_evidence_report`.'
         : '- A non-passing report is allowed: still produce it only via `generate_evidence_report`, including blockers and limitations.',

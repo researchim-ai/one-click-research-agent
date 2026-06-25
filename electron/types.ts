@@ -46,8 +46,24 @@ export interface DownloadProgress {
   status: string
 }
 
+export interface CorpusSelectionItem {
+  id: string
+  title: string
+  year?: number
+  url: string
+  publicationType?: string
+  subQuestions?: string[]
+  included: boolean
+}
+
+export interface CorpusSelectionPayload {
+  /** The run directory this selection belongs to (passed back when toggling). */
+  outputDir: string
+  items: CorpusSelectionItem[]
+}
+
 export interface AgentEvent {
-  type: 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'command_approval' | 'context_usage' | 'new_turn' | 'tool_streaming' | 'stream_stats' | 'open_file' | 'agent_activity'
+  type: 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'command_approval' | 'context_usage' | 'new_turn' | 'tool_streaming' | 'stream_stats' | 'open_file' | 'agent_activity' | 'corpus_selection'
   content?: string
   name?: string
   args?: Record<string, unknown>
@@ -67,6 +83,8 @@ export interface AgentEvent {
   tokensPerSecond?: number
   /** Live agent phase for the activity bar (session load, GPU inference, tools, etc.). */
   activity?: AgentActivity
+  /** Non-blocking corpus selection review (emitted after screen_corpus). */
+  corpusSelection?: CorpusSelectionPayload
 }
 
 export type AgentActivityPhase =

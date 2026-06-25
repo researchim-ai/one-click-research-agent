@@ -66,4 +66,22 @@ describe('read_corpus_item', () => {
     expect(result).toContain('already failed')
     expect(result).toContain('Do not retry')
   })
+
+  it('reconciles a rebuild mismatch (status=read but readStatus=not_read) instead of looping', () => {
+    const localPath = path.join(ws, OUT, 'fulltext', 'item1.html')
+    fs.mkdirSync(path.dirname(localPath), { recursive: true })
+    fs.writeFileSync(localPath, '<html>already downloaded</html>')
+    // After a corpus rebuild the read state can desync: status says read while
+    // readStatus was reset. The existing full-text file should let us reconcile.
+    writeCorpus([corpusEntry({ status: 'read', readStatus: 'not_read', localPath })])
+
+    const result = executeTool('read_corpus_item', { id: 'item1', output_dir: OUT }, ws)
+
+    expect(result).toContain('Reconciled corpus item1')
+    expect(result).not.toContain('No-op')
+
+    // full_text_status must now agree that the item is read (no more loop).
+    const status = executeTool('full_text_status', { output_dir: OUT }, ws)
+    expect(status).toContain('1/1 selected read')
+  })
 })

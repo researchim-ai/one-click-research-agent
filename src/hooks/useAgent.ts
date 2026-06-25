@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
-import type { AgentEvent, AgentActivity, DownloadProgress, AppStatus, SystemResources } from '../../electron/types'
+import type { AgentEvent, AgentActivity, DownloadProgress, AppStatus, SystemResources, CorpusSelectionPayload } from '../../electron/types'
 import type { SessionInfo } from '../../electron/agent'
 
 export interface ToolCall {
@@ -25,6 +25,7 @@ export interface ChatMessage {
   toolCalls?: ToolCall[]
   streamingFile?: StreamingFile
   done?: boolean
+  corpusSelection?: CorpusSelectionPayload
 }
 
 function isInternalStatus(content: string): boolean {
@@ -287,6 +288,22 @@ export function useAgent() {
     }
     if (ev.type === 'open_file') {
       if (ev.filePath) setAutoOpenFile({ path: ev.filePath, token: Date.now() })
+      return
+    }
+    if (ev.type === 'corpus_selection') {
+      const payload = ev.corpusSelection
+      if (!payload) return
+      // Keep a single live review panel: refresh the latest one rather than stacking duplicates.
+      setMessages((prev) => {
+        const idx = [...prev].reverse().findIndex((m) => m.corpusSelection)
+        if (idx >= 0) {
+          const realIdx = prev.length - 1 - idx
+          const next = [...prev]
+          next[realIdx] = { ...next[realIdx], corpusSelection: payload }
+          return next
+        }
+        return [...prev, { id: nextId(), role: 'status', content: '', corpusSelection: payload }]
+      })
       return
     }
 
