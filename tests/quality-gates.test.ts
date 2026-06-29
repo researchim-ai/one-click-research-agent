@@ -74,6 +74,26 @@ describe('runQualityGates', () => {
     expect(byGate.review_source_coverage.passed).toBe(false)
   })
 
+  it('general research relaxes academic-only gates (review coverage + recency)', () => {
+    // Survey-less corpus with NO publication year — academic would fail review+recency.
+    const entries = Array.from({ length: 6 }, (_, i) => corpusEntry(i, { year: undefined, publicationType: 'unknown' }))
+    writeCorpus(entries)
+
+    const academic = runQualityGates(ws, undefined, { minSources: 5, outputDir: OUT } as any).results
+    const aBy = Object.fromEntries(academic.map((r) => [r.gate, r]))
+    expect(aBy.review_source_coverage.passed).toBe(false)
+    expect(aBy.recency.passed).toBe(false)
+
+    const general = runQualityGates(ws, undefined, { minSources: 5, outputDir: OUT, researchKind: 'general' } as any).results
+    const gBy = Object.fromEntries(general.map((r) => [r.gate, r]))
+    expect(gBy.review_source_coverage.passed).toBe(true)
+    expect(gBy.recency.passed).toBe(true)
+    // Non-academic relaxation must NOT touch the core gates.
+    expect(gBy.source_coverage.passed).toBe(true)
+    expect(gBy.selected_corpus_minimum.passed).toBe(true)
+    expect(gBy.topical_precision.passed).toBe(true)
+  })
+
   it('passes review coverage when a survey is present', () => {
     const entries = Array.from({ length: 6 }, (_, i) => corpusEntry(i))
     entries[0].publicationType = 'survey'

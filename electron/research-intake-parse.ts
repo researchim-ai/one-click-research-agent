@@ -60,6 +60,8 @@ export function sanitizeResearchPatch(raw: Record<string, any> | null | undefine
   }
   if (Array.isArray(raw.outputs)) out.outputs = raw.outputs.map(String).filter(Boolean)
   if (Array.isArray(raw.checkpoints)) out.checkpoints = raw.checkpoints.map(String).filter(Boolean)
+  // researchKind is an enum, not a free string — only accept the two known values.
+  if (raw.researchKind === 'general' || raw.researchKind === 'academic') out.researchKind = raw.researchKind
   return out
 }
 
@@ -73,8 +75,9 @@ export interface ResearchIntakeInferInput {
 const INTAKE_SYSTEM_PROMPT = [
   'You are the parameter planner for a research-run UI. You are the ONLY component that fills these parameters — there is no fallback keyword/regex parser, so analyze the user request carefully and return complete, sensible values.',
   'Return ONLY compact JSON with a top-level "patch" object. No prose, no markdown, no code fences.',
-  'Allowed patch keys: topic, profileId, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
-  'Choose profileId from the provided profiles list by matching the domain of the request (e.g. ML/AI, biology, mathematics, finance). If nothing matches, use "universal".',
+  'Allowed patch keys: topic, profileId, researchKind, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
+  'Choose profileId from the provided profiles list by matching the domain of the request (e.g. ML/AI, biology, mathematics, finance). If nothing matches, use "universal". IMPORTANT: the domain profiles (finance, ml-ai, biology, mathematics, paper-reproduction) are for scholarly/professional analysis. For general/consumer/everyday questions (researchKind "general") use profileId "universal" — e.g. "сколько стоят квартиры", "стоимость недвижимости", "какой ноутбук купить" are universal, NOT finance. Pick a domain profile only when the user truly wants domain-expert, source-grounded analysis.',
+  'CRITICAL — researchKind decides whether SCIENTIFIC quality gates apply. Set researchKind to "academic" ONLY when the user genuinely needs scholarly/scientific literature: research papers, studies, systematic reviews, citations, arXiv/PubMed/OpenAlex-style sources, or rigorous scientific evidence. For everyday / consumer / how-to / product / shopping / pricing / market-price / local-info / news topics use "general" — even when the topic brushes a domain like finance or biology (e.g. "квартиры в Магадане", "стоимость недвижимости", "какой ноутбук купить", "рецепт", "как настроить роутер" are ALL general). The "general" kind relaxes academic-only gates (survey/review coverage and recency) and prioritizes web sources. When unsure, prefer "general"; reserve "academic" for clearly scholarly intent. This is independent of profileId: a finance/biology profile can still be researchKind "general" for a consumer question.',
   'Allowed modes: quick, deep, systematic, reproduction, idea-scout. Pick the mode that matches the requested depth/rigor; default to deep, use systematic for "обзор/review/строго", quick for "быстро/кратко".',
   'Allowed dateRange: any, last-year, last-2-years, since-2024, custom. Use custom + customDateRange "YYYY-01-01..YYYY-12-31" when the user gives explicit years. Set strictDateRange true unless the user allows any period.',
   'Allowed reportLanguage: ru, en. Infer from the user request; otherwise use appLanguage.',

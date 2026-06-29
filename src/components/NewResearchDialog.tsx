@@ -15,10 +15,12 @@ export type ResearchDateRange = 'any' | 'last-year' | 'last-2-years' | 'since-20
 export type ResearchCheckpoint = 'plan' | 'corpus' | 'evidence' | 'report'
 export type ResearchOutput = 'brief' | 'report' | 'evidence-matrix' | 'export'
 export type ResearchReportLanguage = 'ru' | 'en'
+export type ResearchKind = 'general' | 'academic'
 
 export interface NewResearchRequest {
   topic: string
   profileId: ResearchProfileId
+  researchKind: ResearchKind
   mode: ResearchRunMode
   dateRange: ResearchDateRange
   customDateRange: string
@@ -70,6 +72,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
   const [modeView, setModeView] = useState<'dialog' | 'manual'>('dialog')
   const [topic, setTopic] = useState('')
   const [profileId, setProfileId] = useState<ResearchProfileId>('universal')
+  const [researchKind, setResearchKind] = useState<ResearchKind>('general')
   const [mode, setMode] = useState<ResearchRunMode>('deep')
   const [dateRange, setDateRange] = useState<ResearchDateRange>('last-2-years')
   const [customDateRange, setCustomDateRange] = useState('')
@@ -113,6 +116,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     onStart({
       topic: topic.trim(),
       profileId,
+      researchKind,
       mode,
       dateRange,
       customDateRange: customDateRange.trim(),
@@ -133,6 +137,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
   const requestFromManualForm = (): NewResearchRequest => ({
     topic: topic.trim(),
     profileId,
+    researchKind,
     mode,
     dateRange,
     customDateRange: customDateRange.trim(),
@@ -152,6 +157,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
   const applyDraftToManualForm = (next: NewResearchRequest) => {
     setTopic(next.topic)
     setProfileId(next.profileId)
+    setResearchKind(next.researchKind)
     setMode(next.mode)
     setDateRange(next.dateRange)
     setCustomDateRange(next.customDateRange)
@@ -410,6 +416,22 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
                     <div className="text-[11px] text-zinc-500 mt-0.5">{profile.domain}</div>
                   </button>
                 ))}
+              </div>
+              <div className="mt-3">
+                <label className="block text-xs font-medium text-zinc-400 mb-2">{L ? 'Тип источников' : 'Source kind'}</label>
+                <select
+                  value={researchKind}
+                  onChange={(e) => setResearchKind(e.target.value as ResearchKind)}
+                  className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-sm text-zinc-200 focus:border-blue-500 outline-none"
+                >
+                  <option value="general">{L ? 'Общий (web) — без научных гейтов' : 'General (web) — no academic gates'}</option>
+                  <option value="academic">{L ? 'Научный — обзоры/свежесть обязательны' : 'Academic — survey/recency required'}</option>
+                </select>
+                <div className="text-[11px] text-zinc-500 mt-1">
+                  {L
+                    ? '«Общий» для бытовых/рыночных тем (web-источники). «Научный» — только когда реально нужны статьи и исследования.'
+                    : '“General” for everyday/market topics (web sources). “Academic” only when papers/studies are truly needed.'}
+                </div>
               </div>
             </div>
 

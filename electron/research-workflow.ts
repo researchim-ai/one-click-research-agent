@@ -269,6 +269,82 @@ export function applyGateEscapeValve(
   return { results, downgraded }
 }
 
+/**
+ * Recovery tools surfaced when a run cannot gather enough usable data. These let
+ * the agent escape the READING/CORPUS dead-end (where only reading tools are
+ * allowed) by re-screening, re-searching, or proceeding to an honest report.
+ */
+export const DATA_STALL_RECOVERY_ACTIONS = [
+  'screen_corpus', 'build_corpus', 'search_web', 'search_openalex', 'search_arxiv',
+  'assign_corpus_to_plan', 'record_evidence', 'run_quality_gates', 'generate_evidence_report',
+]
+
+export interface DataStallInfo {
+  stalled: boolean
+  reason: string
+  recoveryActions: string[]
+}
+
+/**
+ * Detect a data-gathering stall: the run is past planning but cannot accumulate
+ * usable read sources because reads keep failing or screening over-filtered the
+ * corpus to almost nothing. This is the "system can't get data from sources"
+ * situation — without an escape the agent loops on failing reads forever.
+ *
+ * Deliberately conservative so it does NOT fire on a healthy READING phase that
+ * simply has unread-but-not-failed items pending.
+ */
+export function detectDataGatheringStall(args: {
+  state: ResearchWorkflowState
+  reportExists: boolean
+  totalCorpus: number
+  selected: number
+  selectedRead: number
+  failedReads: number
+  evidenceTotal: number
+  target: number
+}): DataStallInfo {
+  const { state, reportExists, totalCorpus, selected, selectedRead, failedReads, evidenceTotal, target } = args
+  const inGathering = state === 'CORPUS_READY' || state === 'READING' || state === 'EVIDENCE'
+  if (reportExists || !inGathering) return { stalled: false, reason: '', recoveryActions: [] }
+
+  const need = Math.max(1, Math.min(3, target || 3))
+  const lowYield = selectedRead < need && evidenceTotal < need
+  // Two independent stall signals: lots of failed reads, or a collapsed/over-filtered selection.
+  const manyFailures = failedReads >= 3
+  const collapsedSelection = selected <= 2 && selectedRead <= 1
+  if (!lowYield || !(manyFailures || collapsedSelection)) return { stalled: false, reason: '', recoveryActions: [] }
+
+  const reasonParts: string[] = []
+  reasonParts.push(`only ${selectedRead} usable source(s) read (target ${target || need}), ${evidenceTotal} evidence claim(s)`) 
+  if (manyFailures) reasonParts.push(`${failedReads} source read(s) failed`)
+  if (collapsedSelection) reasonParts.push(`only ${selected} item(s) selected out of ${totalCorpus} discovered`)
+  return { stalled: true, reason: reasonParts.join('; '), recoveryActions: DATA_STALL_RECOVERY_ACTIONS }
+}
+
+/**
+ * Strong, kind-aware recovery directive shown when a data-gathering stall is
+ * detected. Tells the agent to stop hammering failing fetches and either recover
+ * (re-screen / re-search / snippet-evidence for general) or finish honestly.
+ */
+export function formatDataStallDirective(reason: string, researchKind?: string): string {
+  const general = String(researchKind || 'academic') === 'general'
+  const lines = [
+    `⚠️ DATA-GATHERING STALL: ${reason}.`,
+    'Do NOT keep calling read_corpus_item / read_full_text_batch on URLs that already failed with network/HTTP errors — one retry max, then mark them unavailable and move on. Repeating failing fetches will not change the result.',
+    'Recover in this order:',
+    '1. RE-SCREEN: call screen_corpus with a higher `max_selected` (and the run\'s `min_selected`) to pull more candidates from the items already discovered — your selected set is too small / over-filtered.',
+    general
+      ? '2. RE-SEARCH the web with different / broader phrasings (search_web, or smart_search), then build_corpus + screen_corpus to add fresh, reachable sources.'
+      : '2. RE-SEARCH with different phrasings and other indexes (search_openalex, search_arxiv, search_web), then build_corpus + screen_corpus to add fresh sources.',
+    general
+      ? '3. If full pages will not fetch, you MAY record evidence grounded in the search-result snippet + source URL (note it is snippet-based) instead of full text — do not block the whole run on unfetchable pages.'
+      : '3. For sources whose full text is unavailable, mark them unavailable and prefer other selected sources; do not fabricate quotes.',
+    '4. If after TWO honest recovery rounds you still cannot reach the target, STOP gathering: call run_quality_gates (unmet structural gaps downgrade to documented limitations after repeated attempts) and then generate_evidence_report to produce an HONEST report that explicitly states the data-availability limitation. Do not loop.',
+  ]
+  return lines.join('\n')
+}
+
 export function formatWorkflowGuidance(spec: ResearchRunSpec): string {
   const failures = spec.lastGateFailures ?? []
   const lines = [

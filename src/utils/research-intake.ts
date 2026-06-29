@@ -13,6 +13,7 @@ export function defaultResearchRequest(appLanguage: 'ru' | 'en' = 'ru'): NewRese
   return {
     topic: '',
     profileId: profile.id,
+    researchKind: 'general',
     mode: 'deep',
     dateRange: 'last-2-years',
     customDateRange: '',
@@ -37,6 +38,12 @@ export function defaultResearchRequest(appLanguage: 'ru' | 'en' = 'ru'): NewRese
 export function applyResearchIntakePatch(base: NewResearchRequest, patch: ResearchIntakePatch): NewResearchRequest {
   const next = { ...base, ...patch }
   if (!RESEARCH_PROFILES.some((p) => p.id === next.profileId)) next.profileId = 'universal'
+  if (next.researchKind !== 'general' && next.researchKind !== 'academic') next.researchKind = base.researchKind ?? 'general'
+  // General (web) research uses the universal profile. The domain profiles (finance,
+  // ml-ai, biology, mathematics, paper-reproduction) inject academic-leaning tools and
+  // instructions that don't fit a consumer/everyday topic — keep them for academic runs
+  // only. This is why "сколько стоят квартиры" must not stay on the finance profile.
+  if (next.researchKind === 'general' && next.profileId !== 'universal') next.profileId = 'universal'
   next.maxSources = clampInt(next.maxSources, 10, 200, base.maxSources)
   next.minSelectedSources = clampInt(next.minSelectedSources, 1, 200, base.minSelectedSources)
   next.minFullTextReads = clampInt(next.minFullTextReads, 0, 200, base.minFullTextReads)
@@ -71,6 +78,7 @@ export function summarizeResearchRequest(request: NewResearchRequest, appLanguag
   return [
     [L ? 'Тема' : 'Topic', request.topic || (L ? 'не указана' : 'not set')],
     [L ? 'Профиль' : 'Profile', profile?.label ?? request.profileId],
+    [L ? 'Тип источников' : 'Source kind', request.researchKind === 'academic' ? (L ? 'научный' : 'academic') : (L ? 'общий (web)' : 'general (web)')],
     [L ? 'Режим' : 'Mode', request.mode],
     [L ? 'Период' : 'Date range', date],
     [L ? 'Язык отчёта' : 'Report language', request.reportLanguage === 'ru' ? 'Русский' : 'English'],

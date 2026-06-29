@@ -41,6 +41,31 @@ describe('applyResearchIntakePatch — validation of a model-produced patch', ()
     expect(next.checkpoints).toEqual(base.checkpoints)
   })
 
+  it('defaults researchKind to general', () => {
+    expect(defaultResearchRequest('ru').researchKind).toBe('general')
+  })
+
+  it('general research forces the universal profile even if the model picked a domain one', () => {
+    const base = defaultResearchRequest('ru')
+    // a consumer topic the model mislabeled as "finance" must drop back to universal/general
+    const consumer = applyResearchIntakePatch(base, { topic: 'стоимость квартир в Магадане', profileId: 'finance', researchKind: 'general' })
+    expect(consumer.researchKind).toBe('general')
+    expect(consumer.profileId).toBe('universal')
+  })
+
+  it('academic research keeps the chosen domain profile', () => {
+    const base = defaultResearchRequest('ru')
+    const scholarly = applyResearchIntakePatch(base, { topic: 'обзор методов RL', profileId: 'ml-ai', researchKind: 'academic' })
+    expect(scholarly.researchKind).toBe('academic')
+    expect(scholarly.profileId).toBe('ml-ai')
+  })
+
+  it('falls back to the base researchKind when the model sends an invalid value', () => {
+    const base = defaultResearchRequest('ru')
+    const next = applyResearchIntakePatch(base, { researchKind: 'bogus' as never })
+    expect(next.researchKind).toBe(base.researchKind)
+  })
+
   it('topic is the only hard requirement before a run can start', () => {
     const base = defaultResearchRequest('ru')
     expect(missingResearchFields(base)).toContain('topic')

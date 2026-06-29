@@ -12,6 +12,7 @@ import { getSourceTracker, extractSourcesFromToolResult } from './sources'
 import { getCorpusSelection } from './corpus'
 import { loadPriorKnowledge } from './memory'
 import { skillPackForPreset } from './research-skills'
+import { resolveResearchDir } from '../research-paths'
 import {
   decideResearchCommandIntent,
   isResearchResumeMessage,
@@ -33,7 +34,7 @@ import {
   updateResearchRunState,
   wantsCompactContext,
 } from './research-context'
-import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool } from './research-workflow'
+import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool, formatDataStallDirective } from './research-workflow'
 import { extractTextToolCalls } from './tool-call-parser'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
@@ -100,10 +101,37 @@ const SUMMARIZE_TIMEOUT_MS = 20000
 /** Research context policy for the current runAgent invocation. */
 let researchContextMode: ResearchContextMode = 'off'
 let activeResearchOutputDir: string | null = null
+let activeWorkspace: string | null = null
 
 let currentBridge: AgentBridge | null = null
 
-function doEmit(e: AgentEvent): void { currentBridge!.emit(e) }
+// Per-run durable trace of the model's reasoning chain + actions. The live UI only
+// streams 'thinking' transiently and the debug log keeps short previews, so a failed or
+// looping research run cannot be reconstructed afterwards. When a managed run is active
+// we append reasoning, tool calls/results, status and errors to reasoning-trace.jsonl
+// inside the run directory so we can diagnose exactly what the model did and why.
+const TRACE_EVENT_TYPES = new Set(['thinking', 'tool_call', 'tool_result', 'status', 'error', 'response'])
+function appendRunReasoningTrace(e: AgentEvent): void {
+  if (!activeResearchOutputDir || !activeWorkspace) return
+  if (!TRACE_EVENT_TYPES.has((e as any).type)) return
+  try {
+    const dir = resolveResearchDir(activeWorkspace, activeResearchOutputDir)
+    const anyE = e as any
+    const entry: Record<string, any> = { at: new Date().toISOString(), type: anyE.type }
+    if (typeof anyE.content === 'string' && anyE.content.length) entry.content = anyE.content
+    if (anyE.name) entry.name = anyE.name
+    if (anyE.args !== undefined) entry.args = anyE.args
+    if (typeof anyE.result === 'string') entry.result = anyE.result.slice(0, 4000)
+    if (entry.content === undefined && entry.name === undefined && entry.result === undefined) return
+    fs.mkdirSync(dir, { recursive: true })
+    fs.appendFileSync(path.join(dir, 'reasoning-trace.jsonl'), JSON.stringify(entry) + '\n')
+  } catch {}
+}
+
+function doEmit(e: AgentEvent): void {
+  currentBridge!.emit(e)
+  appendRunReasoningTrace(e)
+}
 function emitActivity(phase: AgentActivity['phase'], label: string, detail?: string): void {
   doEmit({ type: 'agent_activity', activity: { phase, label, detail } })
 }
@@ -2528,18 +2556,40 @@ function toolLoopSignature(toolName: string, toolArgs: Record<string, any>): str
     const claim = String(toolArgs.claim ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160)
     return `${toolName}:${claim}:${toolArgs.plan_item_id ?? ''}:${String(toolArgs.corpus_ids ?? toolArgs.corpusIds ?? '').slice(0, 48)}`
   }
+  if (toolName === 'extract_evidence_from_corpus_item') {
+    // Key on the source + plan item + claim, ignoring volatile session_id/output_dir.
+    // Re-extracting the SAME corpus item for the SAME plan item never changes state,
+    // so identical calls across turns must collapse to a single loop signature.
+    const claim = String(toolArgs.claim ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 120)
+    return `${toolName}:${toolArgs.corpus_id ?? toolArgs.corpusId ?? ''}:${toolArgs.plan_item_id ?? ''}:${claim}`
+  }
   if (['run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName)) {
     return `${toolName}:${toolArgs.output_dir ?? ''}`
   }
   return `${toolName}:${JSON.stringify(toolArgs)}`
 }
 
+/** Read/fetch tools whose repeated failures indicate a data-gathering stall. */
+function isSourceReadTool(toolName: string): boolean {
+  return toolName === 'read_corpus_item' || toolName === 'read_full_text_batch' || toolName === 'fetch_url'
+}
+
+/** Heuristic: did a source-read tool fail to retrieve usable content? */
+function isFailedReadResult(toolName: string, result: string): boolean {
+  if (!isSourceReadTool(toolName)) return false
+  const r = String(result || '')
+  if (r.startsWith('Error')) return true
+  // read_full_text_batch returns a summary; treat as failure only if nothing was read.
+  if (toolName === 'read_full_text_batch') return /\b0\s+(?:read|succeeded|ok)\b/i.test(r) && /fail/i.test(r)
+  return /fetch_url failed|fetch failed|:\s*failed\b|HTTP\s+\d{3}|could not (?:fetch|retrieve|read)|unavailable/i.test(r)
+}
+
 function isLoopSensitiveTool(toolName: string): boolean {
-  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName)
+  return ['read_file', 'list_directory', 'find_files', 'record_evidence', 'extract_evidence_from_corpus_item', 'run_quality_gates', 'gate_report', 'list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName)
 }
 
 function duplicateToolThreshold(toolName: string): number {
-  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report'].includes(toolName) ? 1 : 2
+  return ['list_selected_corpus', 'list_evidence', 'full_text_status', 'verify_claims', 'screen_corpus', 'build_corpus', 'evidence_coverage_by_plan', 'evidence_matrix', 'audit_research_run', 'generate_evidence_report', 'extract_evidence_from_corpus_item'].includes(toolName) ? 1 : 2
 }
 
 /**
@@ -2556,6 +2606,9 @@ function loopBreakDirective(toolName: string): string {
   ])
   if (toolName === 'record_evidence') {
     return `You already recorded this evidence claim. Use list_evidence / verify_claims, fix quality gate blockers if any, then proceed to generate_evidence_report. Do not re-record duplicates.`
+  }
+  if (toolName === 'extract_evidence_from_corpus_item') {
+    return `You already extracted this SAME claim from this SAME corpus item for this SAME plan item — re-extracting it never adds a new evidence row and never changes state. STOP re-extracting it. If a plan item is still short on evidence, you MUST do ONE of these instead: (a) extract a DIFFERENT claim, or extract from a DIFFERENT corpus_id, for that plan item; (b) if no corpus item contains usable new information for that plan item, accept that the data is insufficient — do NOT fabricate or duplicate — and move on; (c) when every plan item has the evidence the corpus can support, call run_quality_gates once (it auto-generates report.md when gates pass). A plan item with fewer rows than ideal is acceptable when the sources genuinely lack more data; padding it with duplicate extractions is not.`
   }
   if (toolName === 'run_quality_gates') {
     return `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
@@ -2604,6 +2657,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   }
 
   activeResearchOutputDir = resolveResearchOutputDir(ws, messages, userMessage)
+  activeWorkspace = ws
   researchContextMode = resolveResearchContextMode({
     userMessage,
     presetId: (doGetConfig() as any).selectedPreset,
@@ -2716,6 +2770,55 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   // General loop detection: same tool + same args repeated (single loop-breaker)
   let lastToolSig = ''
   let sameToolRepeatCount = 0
+  // Data-gathering stall guard: count consecutive failing source reads (different
+  // IDs each time, so the identical-args loop guard never catches it). After a
+  // streak we inject a one-time recovery directive so the agent stops hammering
+  // unfetchable URLs and re-screens / re-searches / finishes honestly.
+  let consecutiveReadFailures = 0
+  let stallDirectiveInjected = false
+  // Evidence-loop escalation: when the model keeps re-issuing the SAME evidence /
+  // extraction call (loop-break directive ignored), the duplicate guard short-
+  // circuits each turn but the model keeps burning context. After a few ignored
+  // breaks in a managed research run we force-advance to quality gates (which
+  // auto-generates report.md once gates pass) so the run terminates instead of
+  // padding evidence forever / overflowing context.
+  let evidenceLoopBreaks = 0
+  let forcedGateRunDone = false
+
+  const EVIDENCE_LOOP_TOOLS = new Set(['record_evidence', 'extract_evidence_from_corpus_item'])
+  /**
+   * Called whenever a duplicate loop-break fires. For repeated evidence/extraction
+   * loops in a research run, force run_quality_gates once and inject a hard "stop
+   * gathering, finish honestly" directive. Returns true if it injected the forced
+   * directive (so callers can avoid double-injecting the normal skip message).
+   */
+  const escalateEvidenceLoop = (toolName: string): boolean => {
+    if (!EVIDENCE_LOOP_TOOLS.has(toolName)) return false
+    evidenceLoopBreaks++
+    if (evidenceLoopBreaks < 3 || forcedGateRunDone || !activeResearchOutputDir) return false
+    forcedGateRunDone = true
+    try {
+      const gateArgs = { output_dir: activeResearchOutputDir, session_id: session.id }
+      doEmit({ type: 'status', content: '⛔ Модель зациклилась на извлечении доказательств — принудительно запускаю quality gates и перехожу к отчёту.' })
+      doEmit({ type: 'tool_call', name: 'run_quality_gates', args: gateArgs })
+      // Route through followUpQualityGates so report.md is auto-generated when
+      // gates pass (same path as a normal run_quality_gates call), rather than
+      // relying on the model to obey the directive below.
+      let gateResult = executeTool('run_quality_gates', gateArgs, workspace)
+      gateResult = followUpQualityGates('run_quality_gates', gateArgs, gateResult, session, workspace)
+      doEmit({ type: 'tool_result', name: 'run_quality_gates', result: gateResult.length > 4000 ? gateResult.slice(0, 4000) + '\n… [truncated]' : gateResult })
+      messages.push({
+        role: 'user',
+        content: [
+          '[Runtime hard stop] You repeatedly re-issued the SAME evidence/extraction call; the runtime ran quality gates for you (result above).',
+          'STOP extracting evidence now. Re-extracting the same claim from the same source never adds rows.',
+          'A plan item with fewer rows than ideal is ACCEPTABLE when the sources genuinely lack more data — do not pad it with duplicates and do not fabricate.',
+          'If gates passed, report.md was already generated for you — just give the user a short final summary. If gates list blockers, fix only what a NEW, distinct source/claim can fix; otherwise document the data-availability limitation honestly and finish. Do not loop.',
+        ].join('\n'),
+      })
+    } catch {}
+    return true
+  }
 
   for (let i = 0; i < getMaxIterations(); i++) {
     if (doIsCancelRequested()) {
@@ -2995,6 +3098,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
               })
               messages.push({ role: 'tool', tool_call_id: callId, content: skipMsg })
               doEmit({ type: 'tool_result', name: tc.name, result: skipMsg })
+              escalateEvidenceLoop(tc.name)
               continue
             }
           } else {
@@ -3065,6 +3169,23 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(toolArgs) } }],
           })
           messages.push({ role: 'tool', tool_call_id: callId, content: smartTruncateToolResult(tc.name, result, dynamicToolResultLimit()) })
+
+          // Data-gathering stall guard (mirror of native path).
+          if (isSourceReadTool(tc.name)) {
+            if (isFailedReadResult(tc.name, result)) {
+              consecutiveReadFailures++
+              if (consecutiveReadFailures >= 4 && !stallDirectiveInjected && activeResearchOutputDir) {
+                const kind = String((ensureResearchRunSpec(workspace, activeResearchOutputDir).thresholds || {}).researchKind || 'academic')
+                const directive = formatDataStallDirective(`${consecutiveReadFailures} source reads in a row failed`, kind)
+                messages.push({ role: 'user', content: `[Runtime recovery] ${directive}` })
+                doEmit({ type: 'status', content: '⚠️ Источники не читаются — переключаюсь на восстановление (re-screen / re-search / честный отчёт).' })
+                stallDirectiveInjected = true
+              }
+            } else {
+              consecutiveReadFailures = 0
+              stallDirectiveInjected = false
+            }
+          }
         }
 
         session.messages = messages
@@ -3218,6 +3339,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           const skipMsg = loopBreakDirective(toolName)
           messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: skipMsg })
           doEmit({ type: 'tool_result', name: toolName, result: skipMsg })
+          escalateEvidenceLoop(toolName)
           continue
         }
       } else {
@@ -3364,6 +3486,26 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
       messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: llmResult })
 
+      // Data-gathering stall guard: consecutive failing source reads use different
+      // IDs, so the identical-args loop guard never catches them. After a streak,
+      // inject a one-time recovery directive so the agent stops hammering
+      // unfetchable URLs and recovers (re-screen / re-search / honest report).
+      if (isSourceReadTool(toolName)) {
+        if (isFailedReadResult(toolName, result)) {
+          consecutiveReadFailures++
+          if (consecutiveReadFailures >= 4 && !stallDirectiveInjected && activeResearchOutputDir) {
+            const kind = String((ensureResearchRunSpec(workspace, activeResearchOutputDir).thresholds || {}).researchKind || 'academic')
+            const directive = formatDataStallDirective(`${consecutiveReadFailures} source reads in a row failed`, kind)
+            messages.push({ role: 'user', content: `[Runtime recovery] ${directive}` })
+            doEmit({ type: 'status', content: '⚠️ Источники не читаются — переключаюсь на восстановление (re-screen / re-search / честный отчёт).' })
+            stallDirectiveInjected = true
+          }
+        } else {
+          consecutiveReadFailures = 0
+          stallDirectiveInjected = false
+        }
+      }
+
       if (toolName === 'plan_research' && !result.startsWith('Error') && hasPlanCheckpointRequest(messages)) {
         const checkpoint = formatPlanCheckpoint(workspace, activeResearchOutputDir ?? toolArgs.output_dir)
         fullResponse = appendVisibleSegment(fullResponse, checkpoint)
@@ -3392,6 +3534,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   } finally {
     researchContextMode = 'off'
     activeResearchOutputDir = null
+    activeWorkspace = null
     currentBridge = null
   }
 }

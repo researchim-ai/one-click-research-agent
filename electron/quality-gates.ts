@@ -63,7 +63,12 @@ function uniqueClaims<T extends { claim: string; planItemId?: string; topic?: st
   return [...byKey.values()]
 }
 
-export function runQualityGates(workspace: string, sessionId?: string, opts?: { minSources?: number; minEvidence?: number; requirePlanCompletion?: boolean; outputDir?: string }): { results: GateResult[]; summary: string } {
+export function runQualityGates(workspace: string, sessionId?: string, opts?: { minSources?: number; minEvidence?: number; requirePlanCompletion?: boolean; outputDir?: string; researchKind?: string }): { results: GateResult[]; summary: string } {
+  // 'general' = non-academic web research. It reuses the whole tuned pipeline but
+  // relaxes the academic-only gates (survey/review coverage and recency), because
+  // general web pages rarely are surveys and often carry no publication year.
+  // 'academic' (default) keeps the science pipeline byte-for-byte unchanged.
+  const general = String(opts?.researchKind || 'academic') === 'general'
   const minSources = Math.max(1, Number(opts?.minSources) || 5)
   const minEvidence = Math.max(0, Number(opts?.minEvidence) || 3)
   const minSelected = Math.max(1, Number((opts as any)?.minSelected) || Math.min(12, minSources))
@@ -106,8 +111,10 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   const currentYear = new Date().getFullYear()
   const fresh = entries.filter((e) => e.year && e.year >= currentYear - 1).length
   if (entries.length > 0) {
-    results.push(fresh > 0
-      ? pass('recency', Math.min(100, Math.round(fresh / entries.length * 100)), [`${fresh}/${entries.length} corpus item(s) are from ${currentYear - 1}+.`])
+    results.push(general || fresh > 0
+      ? pass('recency', general ? 100 : Math.min(100, Math.round(fresh / entries.length * 100)), general
+        ? ['Recency is not enforced for general (web) research; web pages often lack a publication year.']
+        : [`${fresh}/${entries.length} corpus item(s) are from ${currentYear - 1}+.`])
       : fail('recency', ['No recent corpus item found from the last two years.'], 0))
   }
 
@@ -122,8 +129,10 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
     ? pass('selected_corpus_minimum', Math.min(100, Math.round(selected.length / minSelected * 100)))
     : fail('selected_corpus_minimum', [`Only ${selected.length} selected corpus item(s); target is at least ${minSelected}.`], Math.round(selected.length / minSelected * 100)))
 
-  results.push(selected.length === 0 || selectedReviewLike.length >= minReviewLike
-    ? pass('review_source_coverage', selected.length ? Math.min(100, Math.round(selectedReviewLike.length / minReviewLike * 100)) : 100)
+  results.push(general || selected.length === 0 || selectedReviewLike.length >= minReviewLike
+    ? pass('review_source_coverage', selected.length ? Math.min(100, Math.round(selectedReviewLike.length / minReviewLike * 100)) : 100, general && selected.length
+      ? ['Survey/review coverage is not required for general (web) research.']
+      : [])
     : fail('review_source_coverage', [`Only ${selectedReviewLike.length} selected review/survey source(s); target is at least ${minReviewLike}. Add survey/review/systematic overview papers before synthesis.`], Math.round(selectedReviewLike.length / minReviewLike * 100)))
 
   results.push(weakTopicSelected.length === 0

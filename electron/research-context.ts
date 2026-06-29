@@ -22,7 +22,7 @@ import {
   isCompactResumeMessage,
   isResearchResumeMessage,
 } from './research-resume'
-import { ensureResearchRunSpec, formatWorkflowGuidance } from './research-workflow'
+import { ensureResearchRunSpec, formatWorkflowGuidance, detectDataGatheringStall, formatDataStallDirective } from './research-workflow'
 import { resolveResearchDir } from '../research-paths'
 
 export type ResearchContextMode = 'off' | 'active' | 'resume'
@@ -229,14 +229,37 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
 
   const nextSteps = recommendNextSteps(workspace, outputDir, stats, evidence, blockers, reportExists)
 
+  // Detect a "system can't gather data" stall and, if present, surface recovery
+  // tools + a strong directive so the agent escapes the reading dead-end instead
+  // of looping on failing fetches.
+  const th = (spec.thresholds || {}) as Record<string, number | boolean | string>
+  const target = Number(th.minFullTextReads) || Number(th.minSelected) || 5
+  const stall = detectDataGatheringStall({
+    state: spec.state,
+    reportExists,
+    totalCorpus: stats.total,
+    selected: stats.selected,
+    selectedRead: stats.selectedRead,
+    failedReads: stats.failed,
+    evidenceTotal: evidence.total,
+    target,
+  })
+  const allowedForDisplay = stall.stalled
+    ? [...new Set([...spec.allowedActions, ...stall.recoveryActions])]
+    : spec.allowedActions
+
   const lines = [
     RESEARCH_STATE_MARKER.trim(),
     '',
     `**Run directory:** \`${outputDir}\``,
     `**Workflow state:** ${spec.state}`,
-    `**Allowed next tools:** ${spec.allowedActions.join(', ') || 'none'}`,
+    `**Allowed next tools:** ${allowedForDisplay.join(', ') || 'none'}`,
     `**Plan:** ${progress.done}/${progress.total} complete (${progress.pct}%)`,
   ]
+
+  if (stall.stalled) {
+    lines.push('', ...formatDataStallDirective(stall.reason, String(th.researchKind || 'academic')).split('\n'))
+  }
 
   if (pending.length) {
     lines.push('**Open plan items:**')

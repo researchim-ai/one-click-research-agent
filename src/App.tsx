@@ -148,6 +148,17 @@ export function App() {
     const yearArgs = hasBounds
       ? `\`year_from: ${yearBounds.from ?? '*'}\`, \`year_to: ${yearBounds.to ?? nowYear}\`, `
       : ''
+    // Non-academic ("general") topics use a separate, web-first contract: the tuned
+    // academic pipeline stays the default, but for the general profile we tell the
+    // agent to rely on web search and we relax academic-only quality gates.
+    // researchKind is classified at intake (model + heuristic safety net) and is
+    // independent of the profile domain. A consumer/market topic mapped to the
+    // finance profile must NOT trigger the academic science pipeline. Fall back to
+    // the old profile-domain heuristic only if the field is somehow unset.
+    const researchKind = request.researchKind === 'general' || request.researchKind === 'academic'
+      ? request.researchKind
+      : (profile.domain === 'general' ? 'general' : 'academic')
+    const isGeneral = researchKind === 'general'
     return [
       '# Start managed research run',
       '',
@@ -185,7 +196,10 @@ export function App() {
         : '- No date restriction: do not filter by year, but still prefer recent work for fast-moving topics.',
       `- The final report.md must PRESENT exactly the top ${request.minSelectedSources} most relevant read sources (each with a short summary in ${reportLanguageLabel}, plus an overall synthesis). Discovery and full-text reading are intentionally LARGER than ${request.minSelectedSources} so the best ${request.minSelectedSources} can be chosen — do not stop discovery/reading at ${request.minSelectedSources}.`,
       `- screen_corpus: \`min_selected: ${request.minSelectedSources}\` (FLOOR — at least this many on-topic selected so the report can present ${request.minSelectedSources}), \`max_selected: ${Math.min(request.maxSources, Math.max(request.minSelectedSources + 5, Math.round(request.minSelectedSources * 1.4)))}\` (select a bit more than the report needs), ${yearArgs}\`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`. To get the freshest work, pass \`sub_questions\` and prefer recent items; when discovering via search_arxiv use \`sort_by: 'submittedDate'\` for "latest/новые" requests.`,
-      `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`.`,
+      `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`, \`research_kind: '${researchKind}'\`.`,
+      isGeneral
+        ? '- GENERAL (non-academic) research: prioritize web sources. Use `smart_search`/`search_web` to discover pages and `fetch_url` to read them; arXiv/OpenAlex/PubMed are optional and only when actually relevant. Survey/review coverage and recency are NOT required for this kind — do not waste turns hunting for academic surveys or recent-year papers; rank by topical relevance and source authority/credibility instead. Still ground every claim in a read source with a quote/passage.'
+        : '',
       `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources presented in the report (${request.minSelectedSources}). Report found/selected/read/evidence counts separately.`,
       request.requireQualityPass
         ? '- A quality pass is required before the report: data/evidence gates must pass before `generate_evidence_report`.'

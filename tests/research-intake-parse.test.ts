@@ -82,6 +82,14 @@ describe('sanitizeResearchPatch', () => {
     expect(sanitizeResearchPatch(null)).toEqual({})
     expect(sanitizeResearchPatch(undefined)).toEqual({})
   })
+
+  it('accepts researchKind only for the known enum values', () => {
+    expect(sanitizeResearchPatch({ researchKind: 'general' })).toEqual({ researchKind: 'general' })
+    expect(sanitizeResearchPatch({ researchKind: 'academic' })).toEqual({ researchKind: 'academic' })
+    // anything else (free text, wrong type) is dropped — never silently coerced
+    expect(sanitizeResearchPatch({ researchKind: 'scientific' })).toEqual({})
+    expect(sanitizeResearchPatch({ researchKind: true })).toEqual({})
+  })
 })
 
 describe('parseInferredResearchPatch — end-to-end model output handling', () => {

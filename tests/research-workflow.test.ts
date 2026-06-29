@@ -5,6 +5,8 @@ import {
   repairActionsForGateResults,
   formatWorkflowGuidance,
   computeGateEscapeValve,
+  detectDataGatheringStall,
+  formatDataStallDirective,
   GATE_DOWNGRADE_AFTER_ATTEMPTS,
   type ResearchRunSpec,
 } from '../electron/research-workflow'
@@ -116,5 +118,50 @@ describe('formatWorkflowGuidance', () => {
     expect(text).toContain('State: GATES_FAILED')
     expect(text).toContain('repair_evidence_quotes')
     expect(text).toContain('report_citation_coverage')
+  })
+})
+
+describe('detectDataGatheringStall', () => {
+  const base = {
+    state: 'READING' as const,
+    reportExists: false,
+    totalCorpus: 100,
+    selected: 1,
+    selectedRead: 0,
+    failedReads: 0,
+    evidenceTotal: 0,
+    target: 50,
+  }
+
+  it('fires when reads keep failing and almost nothing is usable', () => {
+    const r = detectDataGatheringStall({ ...base, failedReads: 8, selected: 12 })
+    expect(r.stalled).toBe(true)
+    expect(r.recoveryActions).toContain('screen_corpus')
+    expect(r.recoveryActions).toContain('generate_evidence_report')
+  })
+
+  it('fires when screening collapsed the corpus to a couple of items', () => {
+    const r = detectDataGatheringStall({ ...base, selected: 1, selectedRead: 1, failedReads: 0 })
+    expect(r.stalled).toBe(true)
+  })
+
+  it('does NOT fire on a healthy READING phase with unread-but-not-failed items', () => {
+    const r = detectDataGatheringStall({
+      ...base, selected: 20, selectedRead: 4, failedReads: 0, evidenceTotal: 4, target: 50,
+    })
+    expect(r.stalled).toBe(false)
+  })
+
+  it('does NOT fire once the report exists', () => {
+    const r = detectDataGatheringStall({ ...base, reportExists: true, failedReads: 9 })
+    expect(r.stalled).toBe(false)
+  })
+
+  it('directive is kind-aware (general allows snippet-based evidence)', () => {
+    const general = formatDataStallDirective('x', 'general')
+    expect(general).toMatch(/snippet/i)
+    const academic = formatDataStallDirective('x', 'academic')
+    expect(academic).toMatch(/unavailable/i)
+    expect(academic).not.toMatch(/snippet-based/i)
   })
 })

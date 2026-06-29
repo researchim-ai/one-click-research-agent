@@ -681,6 +681,7 @@ export const TOOL_DEFINITIONS = [
           evidence_per_section: { type: 'number', description: 'Minimum evidence rows per plan section.' },
           require_plan_completion: { type: 'boolean', description: 'If true, fail when plan progress is under 80%.' },
           output_dir: { type: 'string', description: 'Optional research artifact directory for quality-gates.json.' },
+          research_kind: { type: 'string', enum: ['academic', 'general'], description: "Research kind. 'academic' (default) enforces survey/review coverage and recency. 'general' is for non-academic web research and relaxes those academic-only gates. Pass the value given in the run parameters." },
         },
         required: [],
       },
@@ -1003,7 +1004,7 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'verify_claims':
         return verifyClaims(workspace, args.session_id, args.output_dir)
       case 'run_quality_gates':
-        return runQualityGatesTool(workspace, args.session_id, args.min_sources, args.min_evidence, args.require_plan_completion, args.output_dir, args.min_selected, args.min_full_text_reads, args.evidence_per_section)
+        return runQualityGatesTool(workspace, args.session_id, args.min_sources, args.min_evidence, args.require_plan_completion, args.output_dir, args.min_selected, args.min_full_text_reads, args.evidence_per_section, args.research_kind)
       case 'gate_report':
         return formatGateReport(workspace, args.session_id, args.output_dir)
       case 'generate_evidence_report':
@@ -1246,8 +1247,14 @@ function runQualityGatesTool(
   minSelected?: number,
   minFullTextReads?: number,
   evidencePerSection?: number,
+  researchKind?: string,
 ): string {
-  const { results: rawResults } = runQualityGates(workspace, sessionId, { minSources, minEvidence, requirePlanCompletion, outputDir, minSelected, minFullTextReads, evidencePerSection } as any)
+  // Resolve the research kind: explicit arg wins, otherwise reuse what was stored
+  // on the run (so the post-report refresh keeps the same relaxation). Defaults to
+  // 'academic' — the science pipeline is unaffected.
+  const storedKind = outputDir ? (ensureResearchRunSpec(workspace, outputDir).thresholds?.researchKind as string | undefined) : undefined
+  const kind = (researchKind === 'general' || researchKind === 'academic') ? researchKind : (storedKind || 'academic')
+  const { results: rawResults } = runQualityGates(workspace, sessionId, { minSources, minEvidence, requirePlanCompletion, outputDir, minSelected, minFullTextReads, evidencePerSection, researchKind: kind } as any)
 
   // No managed run directory → no escape valve / run.json bookkeeping.
   if (!outputDir) {
@@ -1256,13 +1263,14 @@ function runQualityGatesTool(
   }
 
   // Persist the thresholds used so the run is reproducible / inspectable.
-  const thresholds: Record<string, number | boolean> = {}
+  const thresholds: Record<string, number | boolean | string> = {}
   if (minSources != null) thresholds.minSources = Number(minSources)
   if (minEvidence != null) thresholds.minEvidence = Number(minEvidence)
   if (minSelected != null) thresholds.minSelected = Number(minSelected)
   if (minFullTextReads != null) thresholds.minFullTextReads = Number(minFullTextReads)
   if (evidencePerSection != null) thresholds.evidencePerSection = Number(evidencePerSection)
   if (requirePlanCompletion != null) thresholds.requirePlanCompletion = Boolean(requirePlanCompletion)
+  thresholds.researchKind = kind
   if (Object.keys(thresholds).length) ensureResearchRunSpec(workspace, outputDir, { thresholds })
 
   // Escape valve: structural gates that have failed repeated honest repair
@@ -1620,6 +1628,8 @@ Rating is one of: OK / Issues / Weak. Note is at most one short phrase (or "—"
 
 /** Single synchronous chat call to the local llama-server. Returns '' on any failure. */
 function callLocalChat(system: string, user: string, opts: { maxTokens?: number; timeoutMs?: number } = {}): string {
+  // Keep unit tests hermetic and fast: never hit a (possibly running) local server.
+  if (process.env.VITEST) return ''
   const apiUrl = 'http://127.0.0.1:7863'
   const script = `
 (async () => {
@@ -1997,7 +2007,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
         const quote = compactQuote(claim.quote)
         return [
           `- **${claim.claim}**`,
-          `  ${ru ? 'Опора' : 'Evidence'}: ${srcs || cite(claim)}.`,
+          `  ${ru ? 'Источник' : 'Source'}: ${srcs || cite(claim)}.`,
           `  ${ru ? 'Сила доказательства' : 'Strength'}: ${evidenceStrength(claim)}; ${ru ? 'тип' : 'type'}: ${evidenceTypeLabel(claim.evidenceType)}; ${ru ? 'уверенность' : 'confidence'}=${confidenceLabel(claim.confidence)}.`,
           quote ? `  ${ru ? 'Фрагмент' : 'Quote'}: "${quote}"` : '',
         ].filter(Boolean).join('\n')
@@ -2888,26 +2898,24 @@ function searchWeb(
     || (freshnessHints.today ? 'day' : freshnessHints.week || freshnessHints.month ? 'month' : freshnessHints.year ? 'year' : '')
   if (effectiveTimeRange) params.set('time_range', effectiveTimeRange)
 
+  // Retry transient SearXNG failures (cold container start, upstream-engine 5xx/429)
+  // with backoff instead of failing the first time — matches the academic search tools.
   const script = `
-${fetchWithTimeoutSnippet(25000)}
+${httpGetSnippet()}
 const baseUrl = process.argv[1]
 const queryString = process.argv[2]
-fetch(baseUrl + '/search?' + queryString, {
-  headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
-  signal: __abortSignal,
-}).then(async (res) => {
-  if (!res.ok) throw new Error('HTTP ' + res.status)
-  const json = await res.json()
-  process.stdout.write(JSON.stringify(json))
-}).catch((err) => {
-  console.error(__fetchErr(err))
-  process.exit(1)
-}).finally(() => clearTimeout(__timer))
+;(async () => {
+  const r = await __httpGet(baseUrl + '/search?' + queryString, {
+    headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
+  }, { retries: 2, baseDelayMs: 1200, timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(r.text)
+})().catch((err) => { console.error(String((err && err.message) || err)); process.exit(1) })
 `
 
   let payload: any
   try {
-    const out = runNodeScript(script, [searxngBaseUrl, params.toString()], 32000)
+    const out = runNodeScript(script, [searxngBaseUrl, params.toString()], 75000)
     payload = JSON.parse(out)
   } catch (e: any) {
     const stderr = String(e?.stderr || e?.message || e).trim()
@@ -2917,8 +2925,19 @@ fetch(baseUrl + '/search?' + queryString, {
     return `Error: failed to search via SearXNG. ${stderr}${hint}`
   }
 
+  // SearXNG returns the engines that failed/were rate-limited for this query.
+  const unresponsive: string[] = Array.isArray(payload?.unresponsive_engines)
+    ? payload.unresponsive_engines.map((u: any) => (Array.isArray(u) ? String(u[0]) : String(u))).filter(Boolean)
+    : []
   const results = Array.isArray(payload?.results) ? payload.results.slice(0, limit) : []
-  if (results.length === 0) return `No web results found for "${trimmedQuery}".`
+  if (results.length === 0) {
+    // Distinguish "genuinely nothing" from "engines were throttled/unreachable" so the
+    // model retries or switches tools instead of concluding the topic has no sources.
+    if (unresponsive.length) {
+      return `No web results for "${trimmedQuery}" right now — ${unresponsive.length} SearXNG engine(s) were unresponsive or rate-limited (${unresponsive.slice(0, 6).join(', ')}). This is usually transient: wait a few seconds and retry, narrow the query, or use smart_search to also query academic sources.`
+    }
+    return `No web results found for "${trimmedQuery}".`
+  }
 
   const lines = results.map((entry: any, idx: number) => {
     const title = String(entry?.title || 'Untitled').trim()
@@ -2937,7 +2956,10 @@ fetch(baseUrl + '/search?' + queryString, {
     ].filter(Boolean).join('\n')
   })
 
-  return `Found ${results.length} web result(s) for "${trimmedQuery}"${effectiveTimeRange ? ` (time_range=${effectiveTimeRange})` : ''}:\n\n${lines.join('\n\n')}`
+  const throttleNote = unresponsive.length
+    ? `\n\n(Note: ${unresponsive.length} engine(s) were unresponsive/rate-limited this time: ${unresponsive.slice(0, 6).join(', ')}. Re-run for broader coverage if needed.)`
+    : ''
+  return `Found ${results.length} web result(s) for "${trimmedQuery}"${effectiveTimeRange ? ` (time_range=${effectiveTimeRange})` : ''}:\n\n${lines.join('\n\n')}${throttleNote}`
 }
 
 function searchHuggingFacePapers(query: string, maxResults?: number): string {

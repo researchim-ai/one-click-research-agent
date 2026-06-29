@@ -39,6 +39,7 @@ import { evidenceStats } from './evidence'
 import { loadIdeas } from './idea-scout'
 import { getResearchProfileByPresetId, RESEARCH_PROFILES } from '../research-profiles'
 import { parseInferredResearchPatch, buildResearchIntakeRequestBody } from './research-intake-parse'
+import { classifyQuery } from './query-router'
 import {
   runAgent, resetAgent, setWorkspace, cancelAgent,
   createSession, switchSession, listSessions, deleteSession,
@@ -98,6 +99,24 @@ let agentRunInFlight = false
 const WORKSPACE_CHANGED_DEBOUNCE_MS = 1200
 let workspaceChangedTimer: ReturnType<typeof setTimeout> | null = null
 
+// Profiles whose intent is inherently scholarly (papers/studies/proofs). For these
+// we default to academic when the model didn't classify; finance/universal are NOT
+// here because they commonly cover consumer/market topics that need only web sources.
+const SCHOLARLY_PROFILE_IDS = new Set(['ml-ai', 'biology', 'mathematics', 'paper-reproduction'])
+
+/**
+ * Safety net for researchKind: the intake model is the primary classifier, but if it
+ * forgets the field we infer it from the query content (NOT from the profile domain,
+ * which is what historically mis-routed consumer topics like "квартиры в Магадане" into
+ * the academic science pipeline). Only clearly scholarly signals → academic.
+ */
+function resolveResearchKindFallback(message: string, profileId: string | undefined): 'general' | 'academic' {
+  const { classes } = classifyQuery(message)
+  if (classes.includes('academic') || classes.includes('biology')) return 'academic'
+  if (profileId && SCHOLARLY_PROFILE_IDS.has(profileId)) return 'academic'
+  return 'general'
+}
+
 async function inferResearchRequest(payload: any): Promise<{ patch?: Record<string, any>; error?: string }> {
   const message = String(payload?.message ?? '').trim()
   if (!message) return { patch: {} }
@@ -124,7 +143,11 @@ async function inferResearchRequest(payload: any): Promise<{ patch?: Record<stri
     // Prefer the visible content; fall back to reasoning_content in case the model
     // emitted the JSON there (some thinking templates do this).
     const content = String(msg?.content ?? '') || String(msg?.reasoning_content ?? '')
-    return parseInferredResearchPatch(content)
+    const parsed = parseInferredResearchPatch(content)
+    if (parsed.patch && parsed.patch.researchKind !== 'general' && parsed.patch.researchKind !== 'academic') {
+      parsed.patch.researchKind = resolveResearchKindFallback(message, parsed.patch.profileId ?? draft?.profileId)
+    }
+    return parsed
   } catch (e: any) {
     return { error: String(e?.message || e) }
   } finally {
