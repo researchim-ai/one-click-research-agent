@@ -3,6 +3,9 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import { executeTool } from '../electron/tools'
+import { loadCorpus } from '../electron/corpus'
+import { ensureResearchRunSpec } from '../electron/research-workflow'
+import { getSourceTracker } from '../electron/sources'
 
 let ws: string
 const OUT = '.research/run'
@@ -38,6 +41,47 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(ws, { recursive: true, force: true })
+})
+
+describe('build_corpus auto-screens against the saved screening contract', () => {
+  it('leaves no unscreened raw backlog once a screen contract exists', () => {
+    // Simulate: the model already screened once, so the contract is stored on the spec.
+    const sessionId = `sess_${Date.now()}`
+    ensureResearchRunSpec(ws, OUT, {
+      topic: 'reinforcement learning for LLM',
+      screenParams: { question: 'reinforcement learning LLM', subQuestions: [], researchKind: 'academic' },
+    })
+
+    // Fresh sources gathered by a later search wave: on-topic + clearly off-topic.
+    getSourceTracker(sessionId).addMany([
+      { title: 'Reinforcement Learning for LLM alignment with RLHF and DPO', url: 'https://arxiv.org/abs/2401.00001', tier: 'primary' },
+      { title: 'Reinforcement Learning for LLM reasoning via GRPO', url: 'https://arxiv.org/abs/2401.00002', tier: 'primary' },
+      { title: 'Primordial Black Holes in a Radiation-Dominated Universe', url: 'https://arxiv.org/abs/2401.00003', tier: 'primary' },
+    ] as any)
+
+    const result = executeTool('build_corpus', { session_id: sessionId, output_dir: OUT }, ws)
+    expect(result).toContain('Auto-screened')
+
+    const corpus = loadCorpus(ws, OUT)
+    // The whole point: nothing is left in the unscreened `raw` limbo.
+    expect(corpus.filter((e) => !e.screeningStatus || e.screeningStatus === 'raw')).toHaveLength(0)
+    // On-topic gets selected; the astrophysics paper is rejected, not silently selected.
+    expect(corpus.filter((e) => e.screeningStatus === 'selected').length).toBeGreaterThanOrEqual(1)
+    expect(corpus.some((e) => /Primordial Black Holes/.test(e.title) && e.screeningStatus === 'rejected')).toBe(true)
+  })
+
+  it('leaves items raw before any screening contract exists (first build)', () => {
+    const sessionId = `sess_${Date.now()}_2`
+    ensureResearchRunSpec(ws, OUT, { topic: 'reinforcement learning for LLM' })
+    getSourceTracker(sessionId).addMany([
+      { title: 'Reinforcement Learning for LLM alignment', url: 'https://arxiv.org/abs/2402.00001', tier: 'primary' },
+    ] as any)
+
+    const result = executeTool('build_corpus', { session_id: sessionId, output_dir: OUT }, ws)
+    expect(result).not.toContain('Auto-screened')
+    const corpus = loadCorpus(ws, OUT)
+    expect(corpus.every((e) => !e.screeningStatus || e.screeningStatus === 'raw')).toBe(true)
+  })
 })
 
 describe('read_corpus_item', () => {

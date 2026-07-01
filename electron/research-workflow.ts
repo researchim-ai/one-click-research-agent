@@ -3,7 +3,7 @@ import * as path from 'path'
 import { corpusStats } from './corpus'
 import { evidenceStats } from './evidence'
 import { parsePlan, planProgress } from './planner'
-import { readQualityGateSnapshot, type GateResult } from './quality-gates'
+import { readQualityGateSnapshot, isQualityGateSnapshotFresh, type GateResult } from './quality-gates'
 import { resolveResearchDir } from '../research-paths'
 
 export type ResearchWorkflowState =
@@ -25,6 +25,21 @@ export interface ResearchRunSpec {
   state: ResearchWorkflowState
   topic?: string
   thresholds?: Record<string, number | boolean | string>
+  /**
+   * The screening contract captured from the latest screen_corpus call. Once set,
+   * build_corpus re-applies it automatically to any freshly gathered raw items so the
+   * corpus can never accumulate an unscreened backlog (the root cause of search loops).
+   */
+  screenParams?: {
+    question: string
+    subQuestions?: string[]
+    yearFrom?: number
+    yearTo?: number
+    maxSelected?: number
+    minSelected?: number
+    strictDateRange?: boolean
+    researchKind?: string
+  }
   lastTool?: string
   lastGateFailures?: Array<{ gate: string; blockers: string[]; repairTools: string[] }>
   allowedActions: string[]
@@ -61,8 +76,14 @@ export const GATE_DOWNGRADE_AFTER_ATTEMPTS = 3
 const ALLOWED_ACTIONS: Record<ResearchWorkflowState, string[]> = {
   INIT: ['plan_research'],
   PLANNED: ['search_arxiv', 'search_openalex', 'search_huggingface_papers', 'search_web', 'build_corpus', 'screen_corpus', 'assign_corpus_to_plan'],
-  CORPUS_READY: ['queue_full_text', 'read_full_text_batch', 'read_corpus_item', 'full_text_status', 'assign_corpus_to_plan'],
-  READING: ['read_full_text_batch', 'read_corpus_item', 'full_text_status', 'extract_evidence_batch'],
+  // screen_corpus FIRST: right after build_corpus the corpus may hold unscreened raw
+  // items; screening (not reading raw noise) is the correct next step.
+  CORPUS_READY: ['screen_corpus', 'read_full_text_batch', 'read_corpus_item', 'full_text_status', 'queue_full_text', 'assign_corpus_to_plan'],
+  // READING must allow evidence extraction: otherwise the run cannot bootstrap from
+  // READING to EVIDENCE (EVIDENCE is only inferred once evidence exists, but the tools
+  // that create evidence were not listed here — a deadlock that made the model deliberate
+  // in circles after finishing its reads).
+  READING: ['read_full_text_batch', 'read_corpus_item', 'full_text_status', 'assign_corpus_to_plan', 'extract_evidence_batch', 'extract_evidence_from_corpus_item', 'record_evidence', 'run_quality_gates'],
   EVIDENCE: ['record_evidence', 'extract_evidence_from_corpus_item', 'repair_evidence_quotes', 'verify_claims', 'audit_research_run', 'run_quality_gates'],
   GATES_PENDING: ['run_quality_gates', 'audit_research_run'],
   GATES_FAILED: ['search_openalex', 'search_arxiv', 'repair_evidence_quotes', 'read_full_text_batch', 'read_corpus_item', 'screen_corpus', 'build_corpus', 'assign_corpus_to_plan', 'record_evidence', 'verify_claims', 'update_plan_status', 'run_quality_gates'],
@@ -89,7 +110,9 @@ export function repairToolsForGate(gate: string): string[] {
       return ['full_text_status', 'read_full_text_batch', 'read_corpus_item', 'run_quality_gates']
     case 'selected_corpus_minimum':
     case 'review_source_coverage':
-      return ['search_openalex', 'search_arxiv', 'build_corpus', 'screen_corpus', 'read_full_text_batch', 'run_quality_gates']
+      // screen_corpus / build_corpus first: an unscreened corpus is the usual cause, and
+      // screening the sources already gathered is far cheaper than searching for more.
+      return ['screen_corpus', 'build_corpus', 'read_full_text_batch', 'search_openalex', 'search_arxiv', 'run_quality_gates']
     case 'topical_precision':
     case 'noise_ratio':
     case 'date_range_compliance':
@@ -129,7 +152,10 @@ export function inferResearchWorkflowState(workspace: string, outputDir: string)
   const abs = resolveResearchDir(workspace, outputDir)
   if (fs.existsSync(path.join(abs, 'report.md'))) return 'REPORT_READY'
 
-  const gates = readQualityGateSnapshot(workspace, outputDir)
+  // Only trust gate results that are newer than the current corpus/evidence. A stale
+  // snapshot (gates run earlier at a smaller corpus) must not pin the run to
+  // GATES_FAILED while the agent is still legitimately gathering/extracting.
+  const gates = isQualityGateSnapshotFresh(workspace, outputDir) ? readQualityGateSnapshot(workspace, outputDir) : null
   if (gates?.allPassed) return 'GATES_PASSED'
   if (gates && gates.failed.length > 0) return gates.failed.every((r) => r.gate === 'final_report_structure') ? 'GATES_PASSED' : 'GATES_FAILED'
 
@@ -172,6 +198,7 @@ export function ensureResearchRunSpec(workspace: string, outputDir: string, patc
     state: inferredState,
     topic: patch.topic ?? prev?.topic,
     thresholds: patch.thresholds ?? prev?.thresholds,
+    screenParams: patch.screenParams ?? prev?.screenParams,
     lastTool: patch.lastTool ?? prev?.lastTool,
     lastGateFailures,
     allowedActions: allowedActionsForState(inferredState, lastGateFailures),

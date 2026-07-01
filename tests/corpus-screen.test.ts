@@ -77,6 +77,57 @@ describe('screen_corpus min_selected soft floor', () => {
     }
   })
 
+  it('ignores uniform query-level topic tags so off-topic sources are still rejected', () => {
+    // build_corpus applies the same topic tags to every source. These tags must NOT
+    // be treated as the paper's own subject, otherwise every item looks on-topic.
+    const topicTags = ['RL', 'LLM', 'RLHF', 'DPO', 'GRPO', 'reasoning', 'alignment']
+    const offTopic = [
+      raw('off1', 'Primordial Black Holes in a Radiation-Dominated Universe'),
+      raw('off2', 'Cavity-mediated probabilistic magic T-gate injection'),
+      raw('off3', 'Poisson bracket and L-infinity algebras'),
+    ].map((e) => ({ ...e, tags: [...topicTags] }))
+    writeCorpus([
+      { ...raw('s1', 'Reinforcement Learning for LLM alignment with RLHF and DPO'), tags: [...topicTags] },
+      ...offTopic,
+    ])
+
+    executeTool('screen_corpus', { question: 'reinforcement learning LLM', output_dir: OUT }, ws)
+    const corpus = loadCorpus(ws, OUT)
+
+    for (const off of corpus.filter((e) => e.id.startsWith('off'))) {
+      expect(off.topicalPrecisionScore ?? 0).toBeLessThan(30)
+      expect(off.screeningStatus).toBe('rejected')
+    }
+    expect(corpus.find((e) => e.id === 's1')?.screeningStatus).toBe('selected')
+  })
+
+  it('general (web) research filters off-topic by query-term coverage, not RL/LLM vocabulary', () => {
+    // A general query has no RL/LLM vocabulary, so the academic precision heuristic would
+    // be a flat no-op and let everything through. The generic strategy must still reject
+    // pages that share none of the query terms while keeping on-topic ones.
+    const onTopic = [
+      { ...raw('g1', 'Цены и стоимость квартир в Магадане в 2026 году'), url: 'https://example.com/magadan-prices' },
+      { ...raw('g2', 'Обзор рынка недвижимости: стоимость квартир в Магадане'), url: 'https://example.com/magadan-market' },
+    ]
+    const offTopic = [
+      { ...raw('o1', 'Лучшие рецепты борща и домашней выпечки'), url: 'https://example.com/recipes' },
+      { ...raw('o2', 'Гайд по настройке игрового ноутбука для стриминга'), url: 'https://example.com/laptop' },
+    ]
+    writeCorpus([...onTopic, ...offTopic])
+
+    executeTool('screen_corpus', {
+      question: 'стоимость квартир в Магадане',
+      research_kind: 'general',
+      output_dir: OUT,
+    }, ws)
+    const corpus = loadCorpus(ws, OUT)
+
+    for (const off of corpus.filter((e) => e.id.startsWith('o'))) {
+      expect(off.screeningStatus).toBe('rejected')
+    }
+    expect(corpus.filter((e) => e.id.startsWith('g') && e.screeningStatus === 'selected').length).toBeGreaterThanOrEqual(1)
+  })
+
   it('does not force selections when no minimum is requested', () => {
     writeCorpus([
       raw('b1', 'Reinforcement learning for robotics control policy'),

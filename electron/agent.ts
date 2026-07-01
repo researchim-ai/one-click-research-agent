@@ -9,7 +9,7 @@ import { getWebSearchStatus } from './searxng'
 import { getResearchPresetById } from '../research-presets'
 import { formatResearchProfileForPrompt, getResearchProfileByPresetId } from '../research-profiles'
 import { getSourceTracker, extractSourcesFromToolResult } from './sources'
-import { getCorpusSelection } from './corpus'
+import { getCorpusSelection, loadCorpus } from './corpus'
 import { loadPriorKnowledge } from './memory'
 import { skillPackForPreset } from './research-skills'
 import { resolveResearchDir } from '../research-paths'
@@ -102,6 +102,7 @@ const SUMMARIZE_TIMEOUT_MS = 20000
 let researchContextMode: ResearchContextMode = 'off'
 let activeResearchOutputDir: string | null = null
 let activeWorkspace: string | null = null
+let activeSessionId: string | null = null
 
 let currentBridge: AgentBridge | null = null
 
@@ -2418,10 +2419,17 @@ async function manageContext(
  */
 function appendResearchTail(msgs: Message[]): Message[] {
   if (researchContextMode === 'off' || !activeResearchOutputDir) return msgs
+  // Sources discovered via search live in the session tracker, NOT on disk, until
+  // build_corpus runs. Surfacing that count lets the working set tell the model
+  // "you already gathered N sources — build the corpus" instead of letting it think
+  // (from corpus=0 on disk) that it still needs to search.
+  let gatheredSources = 0
+  try { if (activeSessionId) gatheredSources = getSourceTracker(activeSessionId).count() } catch {}
   const tail = buildResearchTailMessage(
     workspace,
     activeResearchOutputDir,
     Math.floor(getMessageBudget() * calibratedRatio * 0.15),
+    gatheredSources,
   )
   if (!tail) return msgs
   return [...msgs, tail as Message]
@@ -2658,6 +2666,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
   activeResearchOutputDir = resolveResearchOutputDir(ws, messages, userMessage)
   activeWorkspace = ws
+  activeSessionId = session.id
   researchContextMode = resolveResearchContextMode({
     userMessage,
     presetId: (doGetConfig() as any).selectedPreset,
@@ -2815,6 +2824,157 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           'A plan item with fewer rows than ideal is ACCEPTABLE when the sources genuinely lack more data — do not pad it with duplicates and do not fabricate.',
           'If gates passed, report.md was already generated for you — just give the user a short final summary. If gates list blockers, fix only what a NEW, distinct source/claim can fix; otherwise document the data-availability limitation honestly and finish. Do not loop.',
         ].join('\n'),
+      })
+    } catch {}
+    return true
+  }
+
+  // Search-loop escalation: search tools are NOT in the consecutive loop guard because a
+  // rotating batch of distinct queries never repeats consecutively. But academic runs can
+  // re-issue the SAME batch of searches every turn (cached, identical results) and never
+  // advance to build_corpus, burning context forever. We dedup searches across the whole
+  // run and, once the model re-runs enough already-seen queries, force build_corpus so the
+  // workflow moves to screening instead of re-searching.
+  const SEARCH_LOOP_TOOLS = new Set([
+    'search_arxiv', 'search_openalex', 'search_web', 'search_huggingface_papers',
+    'search_crossref', 'search_semantic_scholar', 'search_pubmed', 'smart_search',
+  ])
+  const executedSearchSigs = new Set<string>()
+  let duplicateSearchHits = 0
+  let corpusBuiltThisRun = false
+  let forcedCorpusBuildDone = false
+
+  const searchSignature = (name: string, args: any): string => {
+    const a = args || {}
+    const q = String(a.query ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+    return [name, q, a.year_from ?? '', a.year_to ?? '', a.from_date ?? '', a.to_date ?? '', a.sort_by ?? ''].join('|')
+  }
+  /**
+   * For a search tool call: returns a forward directive (and marks it as a duplicate)
+   * when the EXACT same search already ran this run, or null for a fresh search that
+   * should execute normally. First sight of a query is recorded and allowed through.
+   */
+  const duplicateSearchDirective = (name: string, args: any): string | null => {
+    if (!SEARCH_LOOP_TOOLS.has(name)) return null
+    const sig = searchSignature(name, args)
+    if (!executedSearchSigs.has(sig)) { executedSearchSigs.add(sig); return null }
+    duplicateSearchHits++
+    return `Duplicate search: you already ran this exact query this run — results are cached and unchanged, so re-running it adds no new sources. You have ${executedSearchSigs.size} distinct searches gathered already. STOP re-searching: call build_corpus now to turn the gathered results into the ranked corpus, then screen_corpus. Only search again if you have a genuinely NEW, specific query targeting a real gap.`
+  }
+  /**
+   * Called after a duplicate search is skipped. Once the model has clearly re-issued a
+   * stale batch (many duplicates over a non-trivial set of searches) without ever
+   * building the corpus, force build_corpus once and inject a hard "stop searching,
+   * move to screening" directive so the run advances instead of looping.
+   */
+  const escalateSearchLoop = (): boolean => {
+    if (forcedCorpusBuildDone || corpusBuiltThisRun || !activeResearchOutputDir) return false
+    if (duplicateSearchHits < 6 || executedSearchSigs.size < 6) return false
+    forcedCorpusBuildDone = true
+    try {
+      const args = { output_dir: activeResearchOutputDir, session_id: session.id }
+      doEmit({ type: 'status', content: '⛔ Модель зациклилась на повторных поисках — принудительно собираю corpus и перехожу к скринингу.' })
+      doEmit({ type: 'tool_call', name: 'build_corpus', args })
+      const res = executeTool('build_corpus', args, workspace)
+      doEmit({ type: 'tool_result', name: 'build_corpus', result: res.length > 4000 ? res.slice(0, 4000) + '\n… [truncated]' : res })
+      if (!res.startsWith('Error')) corpusBuiltThisRun = true
+      try {
+        const spec = updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, 'build_corpus')
+        updateResearchRunState(workspace, { outputDir: activeResearchOutputDir, phase: phaseForResearchTool('build_corpus'), lastTool: 'build_corpus' })
+        void spec
+      } catch {}
+      messages.push({
+        role: 'user',
+        content: [
+          '[Runtime hard stop] You repeatedly re-issued the SAME searches; the runtime built the corpus for you from everything gathered so far (result above).',
+          'STOP searching now — repeating identical or again-broad searches adds nothing.',
+          'Next, follow the live Research state: call screen_corpus to select the on-topic sources, then read full text and extract evidence. Do not search again unless you have a genuinely NEW, specific query that targets a concrete gap.',
+        ].join('\n'),
+      })
+    } catch {}
+    return true
+  }
+
+  // Distinct-query search loops bypass the duplicate-search guard above (every query
+  // differs), so the model can keep "discovering" forever while a large backlog of
+  // UNSCREENED raw corpus items piles up on disk. `selected` never grows, the
+  // selected_corpus_minimum gate stays red, and the run never reaches the report
+  // (observed: 50+ searches, 97 raw items, 0 screen_corpus calls). When enough searches
+  // fire while many raw items sit unscreened, fold everything into the corpus and SCREEN
+  // it — screening (not more discovery) is what actually raises `selected`.
+  let searchesSinceScreen = 0
+  let forcedScreenRuns = 0
+  const MAX_FORCED_SCREENS = 4
+
+  const forceScreenBacklog = (): boolean => {
+    if (!activeResearchOutputDir) return false
+    if (forcedScreenRuns >= MAX_FORCED_SCREENS) return false
+    if (searchesSinceScreen < 4) return false
+    let total = 0
+    let raw = 0
+    try {
+      const corpus = loadCorpus(workspace, activeResearchOutputDir)
+      total = corpus.length
+      raw = corpus.filter((e) => !e.screeningStatus || e.screeningStatus === 'raw').length
+    } catch { return false }
+    // Only intervene once there is a real screening backlog; early discovery (nothing
+    // built/screened yet) must be left alone.
+    if (total === 0 || raw < 10) return false
+    forcedScreenRuns++
+    searchesSinceScreen = 0
+    try {
+      const spec = ensureResearchRunSpec(workspace, activeResearchOutputDir)
+      const th = (spec.thresholds || {}) as Record<string, number | boolean | string>
+      const flat: string[] = []
+      const walk = (items: Array<{ text?: string; children?: any[] }>) => {
+        for (const it of items) {
+          if (it?.text) flat.push(String(it.text))
+          if (it?.children?.length) walk(it.children)
+        }
+      }
+      try { walk(parsePlan(workspace, activeResearchOutputDir) as any) } catch {}
+      const buildArgs = { output_dir: activeResearchOutputDir, session_id: session.id }
+      const screenArgs: Record<string, unknown> = {
+        question: String(spec.topic || flat[0] || 'research topic'),
+        sub_questions: flat.slice(0, 12),
+        output_dir: activeResearchOutputDir,
+        session_id: session.id,
+      }
+      if (Number(th.minSelected) > 0) screenArgs.min_selected = Number(th.minSelected)
+      if (th.researchKind === 'general' || th.researchKind === 'academic') screenArgs.research_kind = th.researchKind
+
+      doEmit({ type: 'status', content: `⛔ Модель ищет вместо скрининга (${raw} неотобранных источников в корпусе) — принудительно собираю corpus и запускаю screen_corpus.` })
+      doEmit({ type: 'tool_call', name: 'build_corpus', args: buildArgs })
+      const buildRes = executeTool('build_corpus', buildArgs, workspace)
+      doEmit({ type: 'tool_result', name: 'build_corpus', result: buildRes.length > 2000 ? buildRes.slice(0, 2000) + '\n… [truncated]' : buildRes })
+      corpusBuiltThisRun = true
+      doEmit({ type: 'tool_call', name: 'screen_corpus', args: screenArgs })
+      const screenRes = executeTool('screen_corpus', screenArgs, workspace)
+      doEmit({ type: 'tool_result', name: 'screen_corpus', result: screenRes.length > 3000 ? screenRes.slice(0, 3000) + '\n… [truncated]' : screenRes })
+      try {
+        updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, 'screen_corpus')
+        updateResearchRunState(workspace, { outputDir: activeResearchOutputDir, phase: phaseForResearchTool('screen_corpus'), lastTool: 'screen_corpus' })
+      } catch {}
+      // Honest, situation-aware directive: only tell the model to stop searching when
+      // screening actually produced enough on-topic sources. If most gathered items were
+      // off-topic (selected still below target), screening is not the remedy — the model
+      // must search with NEW TARGETED queries (and every build_corpus now auto-screens).
+      let selectedNow = 0
+      try { selectedNow = loadCorpus(workspace, activeResearchOutputDir).filter((e) => e.screeningStatus === 'selected').length } catch {}
+      const target = Number(th.minSelected) || 0
+      const enough = target > 0 ? selectedNow >= target : selectedNow >= 10
+      messages.push({
+        role: 'user',
+        content: enough
+          ? [
+            `[Runtime] You kept searching while ${raw} gathered source(s) were still UNSCREENED. The runtime built + screened the corpus for you (results above): ${selectedNow} on-topic source(s) are now selected — enough for the report.`,
+            'STOP searching now. Follow the live Research state: read full text for the selected items and extract evidence, then run_quality_gates. Only search again for a genuinely NEW, specific gap.',
+          ].join('\n')
+          : [
+            `[Runtime] You kept searching while ${raw} gathered source(s) were still UNSCREENED. The runtime built + screened the corpus for you (results above): only ${selectedNow}${target ? ` of ${target}` : ''} on-topic source(s) are selected — most gathered items were off-topic for this query.`,
+            'Screening is now AUTOMATIC on every build_corpus, so do NOT screen manually and do NOT re-run broad/identical searches.',
+            'To close the gap, search with NEW, TARGETED queries — one concrete query per remaining plan subtopic (use precise topic terms, not generic ones). Newly gathered sources are screened automatically; once selected reaches the target, read full text and extract evidence.',
+          ].join('\n'),
       })
     } catch {}
     return true
@@ -3106,6 +3266,21 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           }
           lastToolSig = textToolSig
 
+          // Cross-turn search dedup (mirror of native path).
+          const dupSearchMsg = duplicateSearchDirective(tc.name, toolArgs)
+          if (dupSearchMsg) {
+            const callId = `text_tc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+            messages.push({
+              role: 'assistant',
+              content: stripThinking(content),
+              tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(toolArgs) } }],
+            })
+            messages.push({ role: 'tool', tool_call_id: callId, content: dupSearchMsg })
+            doEmit({ type: 'tool_result', name: tc.name, result: dupSearchMsg })
+            escalateSearchLoop()
+            continue
+          }
+
           doEmit( { type: 'tool_call', name: tc.name, args: toolArgs })
 
           if (needsApprovalForTool(tc.name, isCustom)) {
@@ -3129,6 +3304,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             result = executeTool(tc.name, toolArgs, workspace)
           }
           result = followUpQualityGates(tc.name, toolArgs, result, session, workspace)
+          if (tc.name === 'build_corpus' && !result.startsWith('Error')) corpusBuiltThisRun = true
 
           const uiResult = result.length > 5000 ? result.slice(0, 5000) + '\n… [truncated]' : result
           doEmit( { type: 'tool_result', name: tc.name, result: uiResult })
@@ -3169,6 +3345,14 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             tool_calls: [{ id: callId, type: 'function', function: { name: tc.name, arguments: JSON.stringify(toolArgs) } }],
           })
           messages.push({ role: 'tool', tool_call_id: callId, content: smartTruncateToolResult(tc.name, result, dynamicToolResultLimit()) })
+
+          // Search-vs-screen backlog guard (mirror of native path).
+          if (SEARCH_LOOP_TOOLS.has(tc.name) && !result.startsWith('Error')) {
+            searchesSinceScreen++
+            forceScreenBacklog()
+          } else if (tc.name === 'screen_corpus' && !result.startsWith('Error')) {
+            searchesSinceScreen = 0
+          }
 
           // Data-gathering stall guard (mirror of native path).
           if (isSourceReadTool(tc.name)) {
@@ -3347,6 +3531,15 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       }
       lastToolSig = toolSig
 
+      // Cross-turn search dedup (the consecutive guard never catches a rotating batch).
+      const dupSearchMsg = duplicateSearchDirective(toolName, toolArgs)
+      if (dupSearchMsg) {
+        messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: dupSearchMsg })
+        doEmit({ type: 'tool_result', name: toolName, result: dupSearchMsg })
+        escalateSearchLoop()
+        continue
+      }
+
       // Detect pointless re-reads of files we JUST created
       if (toolName === 'read_file' && toolArgs.path && filesCreatedThisTurn.has(toolArgs.path)) {
         consecutiveReReads++
@@ -3415,6 +3608,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       }
 
       result = followUpQualityGates(toolName, toolArgs, result, session, workspace)
+      if (toolName === 'build_corpus' && !result.startsWith('Error')) corpusBuiltThisRun = true
 
       if (toolName === 'plan_research' && !result.startsWith('Error')) {
         const planOutputDir = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/') : activeResearchOutputDir ?? undefined
@@ -3486,6 +3680,15 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
       messages.push({ role: 'tool' as any, tool_call_id: tc.id, content: llmResult })
 
+      // Search-vs-screen backlog guard: count searches and, once a large unscreened
+      // backlog exists, force a build_corpus + screen_corpus instead of more searching.
+      if (SEARCH_LOOP_TOOLS.has(toolName) && !result.startsWith('Error')) {
+        searchesSinceScreen++
+        forceScreenBacklog()
+      } else if (toolName === 'screen_corpus' && !result.startsWith('Error')) {
+        searchesSinceScreen = 0
+      }
+
       // Data-gathering stall guard: consecutive failing source reads use different
       // IDs, so the identical-args loop guard never catches them. After a streak,
       // inject a one-time recovery directive so the agent stops hammering
@@ -3535,6 +3738,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     researchContextMode = 'off'
     activeResearchOutputDir = null
     activeWorkspace = null
+    activeSessionId = null
     currentBridge = null
   }
 }

@@ -196,7 +196,7 @@ function recommendNextSteps(
 }
 
 /** Structured snapshot from .research/ — injected into system prompt instead of LLM chat summary. */
-export function buildResearchWorkingSet(workspace: string, outputDir: string, maxChars = 6000): string {
+export function buildResearchWorkingSet(workspace: string, outputDir: string, maxChars = 6000, gatheredSources = 0): string {
   const abs = resolveResearchDir(workspace, outputDir)
   if (!fs.existsSync(abs)) return ''
   const spec = ensureResearchRunSpec(workspace, outputDir)
@@ -256,6 +256,18 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     `**Allowed next tools:** ${allowedForDisplay.join(', ') || 'none'}`,
     `**Plan:** ${progress.done}/${progress.total} complete (${progress.pct}%)`,
   ]
+
+  // Discovery → corpus handoff: search hits live in the session tracker, not on disk,
+  // so corpus.jsonl stays empty (and the state stays PLANNED) until build_corpus runs.
+  // Without this signal the model only sees "corpus: 0" and keeps re-searching the same
+  // queries forever. Make the next step explicit once sources have been gathered.
+  if (stats.total === 0 && gatheredSources > 0) {
+    lines.push(
+      '',
+      `⚠️ DISCOVERY DONE: ${gatheredSources} source(s) already gathered from searches, but the corpus is still empty (build_corpus has not run yet).`,
+      '→ Call `build_corpus` NOW to rank these gathered sources into corpus.jsonl, then `screen_corpus`. Do NOT keep searching: re-running the same queries returns cached, identical results and adds nothing. Search again only for a genuinely NEW, specific gap.',
+    )
+  }
 
   if (stall.stalled) {
     lines.push('', ...formatDataStallDirective(stall.reason, String(th.researchKind || 'academic')).split('\n'))
@@ -348,8 +360,9 @@ export function buildResearchTailMessage(
   workspace: string,
   outputDir: string,
   maxChars?: number,
+  gatheredSources = 0,
 ): ContextMessage | null {
-  const block = buildResearchWorkingSet(workspace, outputDir, maxChars)
+  const block = buildResearchWorkingSet(workspace, outputDir, maxChars, gatheredSources)
   if (!block) return null
   return { role: 'user', content: block }
 }

@@ -72,6 +72,13 @@ export interface CorpusScreenOptions {
   /** Soft floor: promote the best on-topic items to reach this many selected. */
   minSelected?: number
   strictDateRange?: boolean
+  /**
+   * Topical-relevance strategy. 'academic' (default) keeps the ML/RL-aware precision
+   * heuristic tuned for the science pipeline. 'general' (web research) judges relevance
+   * generically from how well the source title/snippet covers the query terms, so the
+   * gate actually filters off-topic pages for non-academic / non-ML topics.
+   */
+  researchKind?: 'general' | 'academic' | string
 }
 
 function researchDir(workspace: string, outputDir?: string): string {
@@ -371,8 +378,36 @@ export function isReviewLike(entry: Pick<CorpusEntry, 'publicationType' | 'title
     || /\b(survey|review|overview|systematic|meta[- ]analysis|state[- ]of[- ]the[- ]art)\b/i.test(`${entry.title} ${entry.snippet ?? ''}`)
 }
 
-function topicPrecisionFor(entry: CorpusEntry, queryText: string): { score: number; blockers: string[] } {
-  const text = `${entry.title} ${entry.snippet ?? ''} ${entry.tags?.join(' ') ?? ''}`.toLowerCase()
+/**
+ * Generic topical precision for general (web) research. The ML/RL heuristic below
+ * only understands LLM/RL vocabulary, so for any non-ML topic it returns a flat 50
+ * and stops filtering. Here we judge relevance from how much of the query vocabulary
+ * the source's own title/snippet actually covers — a source that shares none of the
+ * query terms is off-topic and must be rejected, regardless of recency or authority.
+ */
+function genericTopicPrecisionFor(entry: CorpusEntry, queryText: string): { score: number; blockers: string[] } {
+  const text = `${entry.title} ${entry.snippet ?? ''}`.toLowerCase()
+  const terms = [...new Set(tokenizeQuery(queryText))]
+  if (terms.length === 0) return { score: 60, blockers: [] }
+  const hits = terms.filter((t) => text.includes(t)).length
+  const coverage = hits / terms.length
+  if (hits === 0) {
+    return { score: 8, blockers: ['Off-topic: none of the query terms appear in the source title/snippet'] }
+  }
+  const score = Math.max(0, Math.min(100, Math.round(35 + coverage * 80)))
+  return { score, blockers: [] }
+}
+
+function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?: string): { score: number; blockers: string[] } {
+  // General (web) research is not RL/LLM-specific, so the academic heuristic would be a
+  // no-op (flat 50) and let junk through. Use the generic query-coverage relevance instead.
+  if (String(researchKind || 'academic') === 'general') return genericTopicPrecisionFor(entry, queryText)
+  // IMPORTANT: do NOT include entry.tags here. `build_corpus` applies the same
+  // query-level topic tags (e.g. "RL,LLM,RLHF,DPO,...") uniformly to every source,
+  // so trusting tags would make every item look on-topic (precision=100) and fully
+  // defeat this gate — letting astrophysics/quantum/math papers pass screening.
+  // Topical precision must be judged from the source's own title + snippet only.
+  const text = `${entry.title} ${entry.snippet ?? ''}`.toLowerCase()
   const query = queryText.toLowerCase()
   const wantsLlm = /\b(llm|large language model|language models?|chatgpt|reasoning model|post-training|post training)\b/i.test(query)
   const wantsRl = /\b(reinforcement learning|rlhf|rlvr|grpo|dpo|ppo|rloo|\brl\b|reward|policy optimization|preference optimization)\b/i.test(query)
@@ -390,7 +425,7 @@ function topicPrecisionFor(entry: CorpusEntry, queryText: string): { score: numb
   return { score: Math.max(0, Math.min(100, score)), blockers }
 }
 
-function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
+function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string, researchKind?: string): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
   const text = `${entry.title} ${entry.snippet ?? ''} ${entry.authors ?? ''}`.toLowerCase()
   const matched = [...new Set(terms.filter((t) => text.includes(t)))]
   const rlBoost = ['reinforcement', 'learning', 'rl', 'rlhf', 'dpo', 'ppo', 'reward', 'policy', 'q-learning', 'offline', 'safe', 'robot', 'marl', 'agent', 'verifiable'].filter((t) => text.includes(t))
@@ -400,7 +435,7 @@ function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[
     .sort((a, b) => b.hits - a.hits)
     .slice(0, 3)
     .map((x) => x.id)
-  const precision = topicPrecisionFor(entry, queryText)
+  const precision = topicPrecisionFor(entry, queryText, researchKind)
   return {
     score: Math.min(100, matched.length * 7 + rlBoost.length * 8 + subQs.length * 8 + Math.round(precision.score * 0.25)),
     matched,
@@ -440,7 +475,7 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
   // max_selected defaulted to 30, the cap would otherwise silently limit selection.
   const maxSelected = Math.max(Math.max(1, Math.min(200, Number(opts.maxSelected) || 30)), minSelected)
   const screened = entries.map((entry) => {
-    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText)
+    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText, opts.researchKind)
     const recency = recencyFor(entry, opts.yearFrom, opts.yearTo)
     const publicationType = classifyPublicationType(entry)
     const withType = { ...entry, publicationType }

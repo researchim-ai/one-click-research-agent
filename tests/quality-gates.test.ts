@@ -94,6 +94,21 @@ describe('runQualityGates', () => {
     expect(gBy.topical_precision.passed).toBe(true)
   })
 
+  it('selected_corpus_minimum blocker is raw-aware: directs to screen, not search, when unscreened items exist', () => {
+    // 5 selected, target 50, but 40 raw (unscreened) items already gathered. The blocker
+    // must tell the agent to screen_corpus first, not to keep searching for more sources.
+    const selected = Array.from({ length: 5 }, (_, i) => corpusEntry(i))
+    const raw = Array.from({ length: 40 }, (_, i) => corpusEntry(100 + i, { screeningStatus: 'raw', status: 'candidate', readStatus: 'not_read' }))
+    writeCorpus([...selected, ...raw])
+
+    const { results } = runQualityGates(ws, undefined, { minSources: 5, minSelected: 50, outputDir: OUT } as any)
+    const gate = results.find((r) => r.gate === 'selected_corpus_minimum')!
+    expect(gate.passed).toBe(false)
+    const blocker = gate.blockers.join('\n')
+    expect(blocker).toContain('UNSCREENED')
+    expect(blocker).toContain('screen_corpus')
+  })
+
   it('passes review coverage when a survey is present', () => {
     const entries = Array.from({ length: 6 }, (_, i) => corpusEntry(i))
     entries[0].publicationType = 'survey'

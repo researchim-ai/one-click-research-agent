@@ -506,7 +506,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'screen_corpus',
       description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage. max_selected caps how many are selected; min_selected sets a floor — pass the run\'s minimum-selected target so the best on-topic items are promoted to reach it (off-topic items are never promoted).',
-      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, min_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, output_dir: { type: 'string' } }, required: ['question'] },
+      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, min_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, research_kind: { type: 'string', enum: ['academic', 'general'], description: "Relevance strategy. 'academic' (default) keeps the ML/RL-aware precision; 'general' judges relevance generically from query-term coverage for non-academic web research. Pass the value given in the run parameters." }, output_dir: { type: 'string' } }, required: ['question'] },
     },
   },
   {
@@ -967,8 +967,29 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return queueFullText(workspace, String(args.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean), args.output_dir)
       case 'audit_research_run':
         return formatAuditResult(auditResearchRun(workspace, { outputDir: args.output_dir, yearFrom: args.year_from, yearTo: args.year_to, minSelected: args.min_selected, minRead: args.min_read, minEvidence: args.min_evidence }))
-      case 'screen_corpus':
-        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range }, args.output_dir)
+      case 'screen_corpus': {
+        const storedKind = args.output_dir ? (ensureResearchRunSpec(workspace, args.output_dir).thresholds?.researchKind as string | undefined) : undefined
+        const screenKind = (args.research_kind === 'general' || args.research_kind === 'academic') ? args.research_kind : (storedKind || 'academic')
+        // Capture the screening contract so build_corpus can re-apply it automatically and
+        // never leave a backlog of unscreened raw items (the root cause of search loops).
+        if (args.output_dir && args.question) {
+          try {
+            ensureResearchRunSpec(workspace, args.output_dir, {
+              screenParams: {
+                question: String(args.question),
+                subQuestions: Array.isArray(args.sub_questions) ? args.sub_questions.map(String) : undefined,
+                yearFrom: args.year_from,
+                yearTo: args.year_to,
+                maxSelected: args.max_selected,
+                minSelected: args.min_selected,
+                strictDateRange: args.strict_date_range,
+                researchKind: screenKind,
+              },
+            })
+          } catch {}
+        }
+        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range, researchKind: screenKind }, args.output_dir)
+      }
       case 'list_selected_corpus':
         return listSelectedCorpus(workspace, args.max_items, args.output_dir)
       case 'reject_corpus_items':
@@ -1147,14 +1168,45 @@ function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefi
   if (sources.length === 0) return 'No collected sources in this session yet. Run search tools first.'
   const tags = String(tagsRaw ?? '').split(',').map((s) => s.trim()).filter(Boolean)
   const merged = addSourcesToCorpus(workspace, sources, tags, outputDir)
+
+  // Root-cause guard against search loops: once the model has screened at least once, a
+  // screening contract is stored on the run spec. Re-apply it to the freshly merged corpus
+  // so newly gathered items are screened immediately and an unscreened `raw` backlog can
+  // never accumulate (that backlog is what made the agent search forever instead of
+  // screening). Before the first screen there is no contract yet → leave items raw so the
+  // model performs the first screen with its own tuned arguments (year bounds, etc.).
+  let autoScreenNote = ''
+  if (outputDir) {
+    try {
+      const sp = ensureResearchRunSpec(workspace, outputDir).screenParams
+      if (sp?.question) {
+        const rawCount = loadCorpus(workspace, outputDir).filter((e) => !e.screeningStatus || e.screeningStatus === 'raw').length
+        if (rawCount > 0) {
+          screenCorpus(workspace, {
+            question: sp.question,
+            subQuestions: sp.subQuestions,
+            yearFrom: sp.yearFrom,
+            yearTo: sp.yearTo,
+            maxSelected: sp.maxSelected,
+            minSelected: sp.minSelected,
+            strictDateRange: sp.strictDateRange,
+            researchKind: sp.researchKind,
+          }, outputDir)
+          autoScreenNote = `Auto-screened ${rawCount} newly added item(s) with the saved screening contract — no unscreened backlog remains. Do NOT keep searching to raise "selected"; read the selected items and extract evidence.`
+        }
+      }
+    } catch {}
+  }
+
   if (queue) queueFullText(workspace, undefined, outputDir)
   const stats = corpusStats(workspace, outputDir)
   return [
     `Corpus updated: ${merged.added} added, ${merged.updated} merged.`,
     `Stats: ${stats.total} total, ${stats.primary} primary, ${stats.withDoi} DOI, ${stats.withArxiv} arXiv, ${stats.queuedFullText} queued full text.`,
+    autoScreenNote,
     '',
     rankCorpus(workspace, outputDir),
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 function openAlexSnowballTool(work: string, maxResults: number | undefined, mode: 'references' | 'citations'): string {

@@ -125,9 +125,16 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   const selectedReviewLike = selected.filter(isReviewLike)
   const weakTopicSelected = selected.filter((e) => (e.topicalPrecisionScore ?? e.relevanceScore ?? 0) < 45)
   const failedHighPriority = highPriority.filter((e) => e.readStatus === 'failed')
+  const rawUnscreened = entries.filter((e) => !e.screeningStatus || e.screeningStatus === 'raw').length
   results.push(selected.length >= minSelected
     ? pass('selected_corpus_minimum', Math.min(100, Math.round(selected.length / minSelected * 100)))
-    : fail('selected_corpus_minimum', [`Only ${selected.length} selected corpus item(s); target is at least ${minSelected}.`], Math.round(selected.length / minSelected * 100)))
+    : fail('selected_corpus_minimum', [
+      rawUnscreened > 0
+        // The corpus already holds enough sources — they are just not screened yet. Tell
+        // the agent to screen (cheap, local) instead of interpreting this as "search more".
+        ? `Only ${selected.length} selected corpus item(s); target is at least ${minSelected}. ${rawUnscreened} corpus item(s) are still UNSCREENED — run screen_corpus (min_selected: ${minSelected}) to screen and promote on-topic items FIRST; do not search for more sources until the existing corpus has been screened.`
+        : `Only ${selected.length} selected corpus item(s); target is at least ${minSelected}.`,
+    ], Math.round(selected.length / minSelected * 100)))
 
   results.push(general || selected.length === 0 || selectedReviewLike.length >= minReviewLike
     ? pass('review_source_coverage', selected.length ? Math.min(100, Math.round(selectedReviewLike.length / minReviewLike * 100)) : 100, general && selected.length
@@ -214,13 +221,23 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
     ].filter((rx) => rx.test(report)).length
     const appendixMatch = report.search(/Evidence matrix|Selected Corpus Appendix|Приложение: selected corpus/i)
     const appendixHeavy = appendixMatch >= 0 && appendixMatch < Math.max(800, report.length * 0.35)
-    const interactiveEnough = markdownLinks >= 12 && localArtifactLinks >= 3 && sourceIdLinks >= 8
-    const narrativeEnough = report.length >= 7500 && headings >= 8 && analyticalSections >= 5 && qSections >= Math.min(4, plan.length || 4)
-    const structuredEnough = tables >= 8 && unavailableSection && metadataOnlyMentions >= 1
+    // General (web) reports are consumer-shaped: still a structured, link-rich narrative
+    // grounded in read sources, but without the academic survey skeleton (Q-sections,
+    // mandatory "unavailable high-priority sources" block, metadata-only caveats, local
+    // fulltext artifacts). Academic reports keep the full, stricter contract unchanged.
+    const interactiveEnough = general
+      ? markdownLinks >= 6 && sourceIdLinks >= 4
+      : markdownLinks >= 12 && localArtifactLinks >= 3 && sourceIdLinks >= 8
+    const narrativeEnough = general
+      ? report.length >= 2500 && headings >= 4 && analyticalSections >= 3
+      : report.length >= 7500 && headings >= 8 && analyticalSections >= 5 && qSections >= Math.min(4, plan.length || 4)
+    const structuredEnough = general
+      ? tables >= 2
+      : tables >= 8 && unavailableSection && metadataOnlyMentions >= 1
     results.push(narrativeEnough && structuredEnough && interactiveEnough && !appendixHeavy && !evidenceDumpTooEarly
       ? pass('final_report_structure', 100)
       : fail('final_report_structure', [
-        `report.md must be an interactive narrative synthesis: length=${report.length}, h2=${headings}, q_sections=${qSections}, analytical_sections=${analyticalSections}, table_rows=${tables}, markdown_links=${markdownLinks}, source_links=${sourceIdLinks}, local_artifact_links=${localArtifactLinks}, metadata_mentions=${metadataOnlyMentions}${appendixHeavy ? ', appendix appears too early' : ''}${evidenceDumpTooEarly ? ', evidence dump appears too early' : ''}${!unavailableSection ? ', missing unavailable-source section' : ''}.`,
+        `report.md must be an interactive narrative synthesis${general ? ' (general/web shape)' : ''}: length=${report.length}, h2=${headings}, q_sections=${qSections}, analytical_sections=${analyticalSections}, table_rows=${tables}, markdown_links=${markdownLinks}, source_links=${sourceIdLinks}, local_artifact_links=${localArtifactLinks}, metadata_mentions=${metadataOnlyMentions}${appendixHeavy ? ', appendix appears too early' : ''}${evidenceDumpTooEarly ? ', evidence dump appears too early' : ''}${!general && !unavailableSection ? ', missing unavailable-source section' : ''}.`,
       ], Math.min(100, Math.round(report.length / 60))))
   }
 
@@ -243,7 +260,29 @@ export function writeQualityGateSnapshot(workspace: string, outputDir: string | 
   } catch {}
 }
 
+function safeMtimeMs(p: string): number {
+  try { return fs.statSync(p).mtimeMs } catch { return 0 }
+}
+
+/**
+ * Quality-gate results are authoritative ONLY if they were computed AFTER the latest
+ * change to corpus/evidence. Otherwise the snapshot reflects an older, smaller run
+ * (e.g. gates run at 4 selected, then the corpus grew to 70) and must NOT drive state
+ * inference or be shown as current blockers — that is what made runs flap between
+ * EVIDENCE and GATES_FAILED and chase stale "Only 4 selected" blockers in circles.
+ */
+export function isQualityGateSnapshotFresh(workspace: string, outputDir?: string): boolean {
+  const dir = researchDir(workspace, outputDir)
+  const gatesMs = safeMtimeMs(path.join(dir, 'quality-gates.json'))
+  if (gatesMs === 0) return false
+  return gatesMs >= safeMtimeMs(path.join(dir, 'corpus.jsonl'))
+    && gatesMs >= safeMtimeMs(path.join(dir, 'evidence.jsonl'))
+}
+
 export function latestQualityGateFailure(workspace: string, outputDir?: string, opts?: { ignoreGates?: string[] }): string | null {
+  // Stale gate results (older than the current corpus/evidence) describe a run state
+  // that no longer exists — surfacing them just confuses the agent. Ignore until re-run.
+  if (!isQualityGateSnapshotFresh(workspace, outputDir)) return null
   const snap = readQualityGateSnapshot(workspace, outputDir)
   if (!snap || snap.allPassed) return null
   const ignored = new Set(opts?.ignoreGates ?? [])

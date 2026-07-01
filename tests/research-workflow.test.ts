@@ -28,6 +28,16 @@ describe('allowedActionsForState', () => {
   it('falls back to the full GATES_FAILED list when no failures provided', () => {
     expect(allowedActionsForState('GATES_FAILED', [])).toContain('run_quality_gates')
   })
+
+  it('CORPUS_READY allows screen_corpus so the model screens before reading raw noise', () => {
+    expect(allowedActionsForState('CORPUS_READY')).toContain('screen_corpus')
+  })
+
+  it('READING allows evidence extraction so the run can bootstrap into EVIDENCE', () => {
+    const reading = allowedActionsForState('READING')
+    expect(reading).toContain('extract_evidence_from_corpus_item')
+    expect(reading).toContain('record_evidence')
+  })
 })
 
 describe('repairToolsForGate', () => {
