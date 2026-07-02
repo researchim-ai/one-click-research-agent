@@ -34,7 +34,7 @@ import {
   updateResearchRunState,
   wantsCompactContext,
 } from './research-context'
-import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool, formatDataStallDirective } from './research-workflow'
+import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool, formatDataStallDirective, nextSearchBudgetNudge } from './research-workflow'
 import { extractTextToolCalls } from './tool-call-parser'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
@@ -2980,6 +2980,58 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     return true
   }
 
+  // Per-RUN soft budget on discovery. Recency-sorted feeds (arxiv/HF) increasingly return
+  // off-topic "latest submissions" once the obvious queries are exhausted, so an unbounded
+  // search habit both wastes context and pollutes the corpus (observed: 120 search_arxiv
+  // calls dragging in unrelated same-day papers, and ~86 spread across a run). The counter
+  // is PERSISTED in run.json because a managed run spans several runAgent invocations
+  // (plan checkpoint, auto-continue, gate-repair passes) — a per-invocation counter never
+  // accumulated enough to fire. The nudge is progress-aware: it never hard-stops legitimate
+  // discovery when few on-topic sources have been found — it redirects to targeted queries.
+  const SEARCH_BUDGET_SOFT_CAP = 45
+  const MAX_SEARCH_NUDGES = 4
+  const bumpSearchBudget = (): void => {
+    if (!activeResearchOutputDir) return
+    let total = 0
+    try {
+      const spec = ensureResearchRunSpec(workspace, activeResearchOutputDir)
+      total = (Number(spec.searchCallsTotal) || 0) + 1
+      const prevMilestone = Number(spec.searchNudgeMilestone) || 0
+      const { milestone, shouldNudge } = nextSearchBudgetNudge(total, prevMilestone, SEARCH_BUDGET_SOFT_CAP, MAX_SEARCH_NUDGES)
+      ensureResearchRunSpec(workspace, activeResearchOutputDir, {
+        searchCallsTotal: total,
+        searchNudgeMilestone: shouldNudge ? milestone : prevMilestone,
+      })
+      if (!shouldNudge) return
+    } catch { return }
+
+    let selectedNow = 0
+    let target = 0
+    try {
+      selectedNow = loadCorpus(workspace, activeResearchOutputDir).filter((e) => e.screeningStatus === 'selected').length
+      target = Number((ensureResearchRunSpec(workspace, activeResearchOutputDir).thresholds || {}).minSelected) || 0
+    } catch {}
+    const enough = target > 0 ? selectedNow >= target : selectedNow >= 10
+    doEmit({
+      type: 'status',
+      content: enough
+        ? `⚠️ Уже ${total} поисковых запросов и ${selectedNow} отобрано — перехожу от поиска к синтезу.`
+        : `⚠️ Уже ${total} поисковых запросов (${selectedNow}${target ? `/${target}` : ''} отобрано) — сужаю поиск до точечных подзапросов по тонким подтемам.`,
+    })
+    messages.push({
+      role: 'user',
+      content: enough
+        ? [
+          `[Runtime budget] You have run ${total} search calls this run and already have ${selectedNow} on-topic selected source(s)${target ? ` (target ${target})` : ''} — discovery is done.`,
+          'STOP searching. Read full text for the selected items, extract evidence, and run quality gates. Search again only for a single, precisely targeted gap.',
+        ].join('\n')
+        : [
+          `[Runtime budget] You have run ${total} search calls but only ${selectedNow}${target ? ` of ${target}` : ''} sources are on-topic. Broad, recency-sorted feeds are largely exhausted and now mostly return off-topic latest submissions — repeating them only adds noise the screener must reject.`,
+          'Do NOT run more broad queries. Instead: (1) screen/build what you already gathered, (2) then run at most ONE precise, well-scoped query per plan subtopic that is still thin (use specific method/benchmark names, not generic terms). Screen after each so off-topic items are pruned early.',
+        ].join('\n'),
+    })
+  }
+
   for (let i = 0; i < getMaxIterations(); i++) {
     if (doIsCancelRequested()) {
       doEmit( { type: 'status', content: '⏹ Запрос агента остановлен пользователем' })
@@ -3325,12 +3377,18 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           maybeEmitCorpusSelection(tc.name, result, workspace)
           if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name)) {
             const snap = readQualityGateSnapshot(workspace, activeResearchOutputDir)
+            // Maintain the authoritative FSM state (mirror of the native-tool path). This was
+            // previously missing here, so reasoning-embedded tool calls never advanced the
+            // workflow state via the FSM and relied on the lossy phase mapping instead.
+            const spec = updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, tc.name, {
+              gateResults: (tc.name === 'run_quality_gates' || tc.name === 'gate_report') ? (snap?.failed ?? []) : undefined,
+            })
             const gatePhase = tc.name === 'run_quality_gates' || tc.name === 'gate_report'
               ? (snap?.allPassed ? 'gates_passed' : 'gates_failed')
               : undefined
             updateResearchRunState(workspace, {
               outputDir: activeResearchOutputDir,
-              phase: gatePhase ?? phaseForResearchTool(tc.name),
+              phase: gatePhase ?? (spec.state === 'REPORT_READY' ? 'report_generated' : phaseForResearchTool(tc.name)),
               lastTool: tc.name,
               gatesPassed: snap?.passed,
               gatesTotal: snap?.total,
@@ -3350,6 +3408,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           if (SEARCH_LOOP_TOOLS.has(tc.name) && !result.startsWith('Error')) {
             searchesSinceScreen++
             forceScreenBacklog()
+            bumpSearchBudget()
           } else if (tc.name === 'screen_corpus' && !result.startsWith('Error')) {
             searchesSinceScreen = 0
           }
@@ -3685,6 +3744,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       if (SEARCH_LOOP_TOOLS.has(toolName) && !result.startsWith('Error')) {
         searchesSinceScreen++
         forceScreenBacklog()
+        bumpSearchBudget()
       } else if (toolName === 'screen_corpus' && !result.startsWith('Error')) {
         searchesSinceScreen = 0
       }

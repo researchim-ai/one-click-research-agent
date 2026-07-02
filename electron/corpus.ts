@@ -22,6 +22,14 @@ export interface CorpusEntry {
   publicationType?: 'survey' | 'review' | 'benchmark' | 'method' | 'tool' | 'safety' | 'background' | 'unknown'
   tier: 'primary' | 'secondary' | 'background'
   screeningStatus?: 'raw' | 'selected' | 'rejected' | 'needs_review'
+  /**
+   * A screening decision explicitly pinned by a human (review panel) or the agent
+   * (reject_corpus_items). screen_corpus/build_corpus MUST respect it and never resurrect
+   * a manually rejected source nor silently drop a manually kept one. This is the fix for
+   * the "reject → rebuild → screen → off-topic comes back" loop that forced the
+   * topical_precision gate to be downgraded and let off-topic papers into the report.
+   */
+  pinnedStatus?: 'selected' | 'rejected'
   screeningReason?: string
   relevanceScore?: number
   recencyScore?: number
@@ -80,6 +88,15 @@ export interface CorpusScreenOptions {
    */
   researchKind?: 'general' | 'academic' | string
 }
+
+/**
+ * Minimum topical-precision score for a source to be eligible for the `selected` set.
+ * The floor-promotion in screenCorpus and the `topical_precision` quality gate share this
+ * single threshold, so a source promoted to hit the minimum count can never afterwards be
+ * flagged (and force-downgraded) by the gate. Keeping them in sync is what makes the
+ * topical_precision gate genuinely passable by re-screening instead of only via downgrade.
+ */
+export const MIN_SELECTABLE_TOPICAL_PRECISION = 45
 
 function researchDir(workspace: string, outputDir?: string): string {
   return resolveResearchDir(workspace, outputDir)
@@ -505,6 +522,22 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
       readStatus: entry.readStatus ?? (entry.status === 'read' ? 'read' : 'not_read'),
       updatedAt: Date.now(),
     }
+    // Honor explicit human/agent decisions: a pinned rejection must NOT be resurrected by
+    // re-screening, and a pinned selection must NOT be dropped. Without this, the agent's
+    // own reject_corpus_items calls were undone by the next build_corpus/screen_corpus.
+    if (entry.pinnedStatus === 'rejected') {
+      updated.screeningStatus = 'rejected'
+      updated.status = 'rejected'
+      updated.readPriority = 'low'
+      if (!/pinned/i.test(updated.screeningReason ?? '')) {
+        updated.screeningReason = `Pinned as rejected (manual). ${updated.screeningReason ?? ''}`.trim()
+      }
+    } else if (entry.pinnedStatus === 'selected') {
+      updated.screeningStatus = 'selected'
+      if (!/pinned/i.test(updated.screeningReason ?? '')) {
+        updated.screeningReason = `Pinned as selected (manual). ${updated.screeningReason ?? ''}`.trim()
+      }
+    }
     updated.score = scoreEntry(updated)
     return updated
   }).sort((a, b) => (b.score - a.score) || ((b.year ?? 0) - (a.year ?? 0)))
@@ -512,7 +545,10 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
   let selectedCount = 0
   for (const entry of screened) {
     if (entry.screeningStatus === 'selected') {
-      if (selectedCount >= maxSelected) {
+      // Manually pinned selections always survive the cap.
+      if (entry.pinnedStatus === 'selected') {
+        selectedCount++
+      } else if (selectedCount >= maxSelected) {
         entry.screeningStatus = 'needs_review'
         entry.screeningReason = `Below top ${maxSelected} selected cutoff. ${entry.screeningReason ?? ''}`.trim()
         entry.readPriority = 'low'
@@ -530,7 +566,9 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
     for (const entry of screened) {
       if (selectedCount >= minSelected) break
       if (entry.screeningStatus !== 'needs_review') continue
-      const onTopic = (entry.topicalPrecisionScore ?? 0) >= 35 && (entry.relevanceScore ?? 0) >= 18
+      // Only promote items that will also satisfy the topical_precision gate — otherwise a
+      // promoted-to-hit-the-count item is flagged by the gate and the run loops/downgrades.
+      const onTopic = (entry.topicalPrecisionScore ?? 0) >= MIN_SELECTABLE_TOPICAL_PRECISION && (entry.relevanceScore ?? 0) >= 18
       if (!onTopic) continue
       entry.screeningStatus = 'selected'
       if (entry.readPriority === 'low') entry.readPriority = 'medium'
@@ -605,10 +643,12 @@ export function setCorpusItemIncluded(
   if (!entry) return { ok: false, selected: selectedCount() }
   if (included) {
     entry.screeningStatus = 'selected'
+    entry.pinnedStatus = 'selected'
     if (entry.status === 'rejected') entry.status = 'candidate'
     entry.screeningReason = 'Re-included by user'
   } else {
     entry.screeningStatus = 'rejected'
+    entry.pinnedStatus = 'rejected'
     entry.status = 'rejected'
     entry.screeningReason = 'Excluded by user'
   }
@@ -626,6 +666,7 @@ export function rejectCorpusItems(workspace: string, idsRaw: string, reason = 'R
   for (const e of entries) {
     if (ids.has(e.id)) {
       e.screeningStatus = 'rejected'
+      e.pinnedStatus = 'rejected'
       e.status = 'rejected'
       e.readStatus = 'failed'
       e.screeningReason = reason
@@ -635,7 +676,7 @@ export function rejectCorpusItems(workspace: string, idsRaw: string, reason = 'R
     }
   }
   saveCorpus(workspace, entries, outputDir)
-  return `Rejected ${changed} corpus item(s).`
+  return `Rejected ${changed} corpus item(s). They are pinned and will not be re-selected by future screening.`
 }
 
 export function assignCorpusToPlan(workspace: string, idsRaw: string, planItemId: string, outputDir?: string): string {
@@ -647,6 +688,9 @@ export function assignCorpusToPlan(workspace: string, idsRaw: string, planItemId
   for (const e of entries) {
     if (ids.has(e.id)) {
       e.subQuestions = [...new Set([...(e.subQuestions || []), planId])]
+      // Deliberately routing a source to a plan item is an explicit re-inclusion, so a
+      // prior rejection pin must be cleared (otherwise screening would revert it).
+      if (e.screeningStatus === 'rejected' || e.pinnedStatus === 'rejected') e.pinnedStatus = undefined
       e.screeningStatus = e.screeningStatus === 'rejected' ? 'needs_review' : 'selected'
       e.updatedAt = Date.now()
       e.score = scoreEntry(e)

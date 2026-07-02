@@ -128,6 +128,46 @@ describe('screen_corpus min_selected soft floor', () => {
     expect(corpus.filter((e) => e.id.startsWith('g') && e.screeningStatus === 'selected').length).toBeGreaterThanOrEqual(1)
   })
 
+  it('keeps manually rejected items rejected across a later re-screen (sticky reject)', () => {
+    // Root cause of off-topic leaking into reports: the agent rejected off-topic items,
+    // but a subsequent build_corpus/screen_corpus resurrected them. Rejection must stick.
+    writeCorpus([
+      raw('s1', 'Reinforcement Learning for LLM alignment with RLHF and DPO'),
+      raw('s2', 'Reinforcement Learning for LLM reasoning via GRPO and PPO'),
+      raw('x1', 'Reinforcement Learning for LLM reward modeling and preference optimization'),
+    ])
+    // First screen selects the on-topic items.
+    executeTool('screen_corpus', { question: 'reinforcement learning LLM', output_dir: OUT }, ws)
+    expect(loadCorpus(ws, OUT).find((e) => e.id === 'x1')?.screeningStatus).toBe('selected')
+
+    // Agent rejects x1 explicitly.
+    executeTool('reject_corpus_items', { ids: 'x1', reason: 'off-topic', output_dir: OUT }, ws)
+    const afterReject = loadCorpus(ws, OUT).find((e) => e.id === 'x1')
+    expect(afterReject?.screeningStatus).toBe('rejected')
+    expect(afterReject?.pinnedStatus).toBe('rejected')
+
+    // A later re-screen (e.g. via build_corpus auto-screen) must NOT bring it back.
+    executeTool('screen_corpus', { question: 'reinforcement learning LLM', output_dir: OUT }, ws)
+    const afterReScreen = loadCorpus(ws, OUT).find((e) => e.id === 'x1')
+    expect(afterReScreen?.screeningStatus).toBe('rejected')
+  })
+
+  it('never floor-promotes an item below the gate topical-precision threshold', () => {
+    // The floor promotion must share the topical_precision gate threshold (45): promoting a
+    // precision-40 item to hit the count is exactly what forced the gate to be downgraded.
+    writeCorpus([
+      raw('s1', 'Reinforcement Learning for LLM alignment with RLHF and DPO'),
+      // Off-topic-ish "LLM" paper with no RL content — low precision, must not be promoted.
+      raw('w1', 'When LLMs Read Tables Carelessly: Measuring Data Referencing Errors'),
+      raw('w2', 'Annif at SemEval: Traditional XMTC augmented by LLMs for subject indexing'),
+    ])
+    executeTool('screen_corpus', { question: 'reinforcement learning LLM', min_selected: 3, output_dir: OUT }, ws)
+    const corpus = loadCorpus(ws, OUT)
+    for (const e of corpus.filter((c) => c.id.startsWith('w') && c.screeningStatus === 'selected')) {
+      expect(e.topicalPrecisionScore ?? 0).toBeGreaterThanOrEqual(45)
+    }
+  })
+
   it('does not force selections when no minimum is requested', () => {
     writeCorpus([
       raw('b1', 'Reinforcement learning for robotics control policy'),

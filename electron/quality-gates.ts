@@ -1,6 +1,6 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import { isReviewLike, loadCorpus, corpusStats } from './corpus'
+import { isReviewLike, loadCorpus, corpusStats, MIN_SELECTABLE_TOPICAL_PRECISION } from './corpus'
 import { evidenceStats, loadEvidence, verifyClaims } from './evidence'
 import { getSourceTracker } from './sources'
 import { parsePlan, planProgress } from './planner'
@@ -123,7 +123,7 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   const highPriority = selected.filter((e) => e.readPriority === 'high')
   const highPriorityRead = highPriority.filter((e) => e.readStatus === 'read' || e.status === 'read')
   const selectedReviewLike = selected.filter(isReviewLike)
-  const weakTopicSelected = selected.filter((e) => (e.topicalPrecisionScore ?? e.relevanceScore ?? 0) < 45)
+  const weakTopicSelected = selected.filter((e) => (e.topicalPrecisionScore ?? e.relevanceScore ?? 0) < MIN_SELECTABLE_TOPICAL_PRECISION)
   const failedHighPriority = highPriority.filter((e) => e.readStatus === 'failed')
   const rawUnscreened = entries.filter((e) => !e.screeningStatus || e.screeningStatus === 'raw').length
   results.push(selected.length >= minSelected
@@ -144,7 +144,10 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
 
   results.push(weakTopicSelected.length === 0
     ? pass('topical_precision', 100)
-    : fail('topical_precision', weakTopicSelected.slice(0, 8).map((e) => `${e.id}: precision=${e.topicalPrecisionScore ?? e.relevanceScore ?? 0}; ${e.title}`), Math.max(0, 100 - weakTopicSelected.length * 10)))
+    : fail('topical_precision', [
+      `${weakTopicSelected.length} selected source(s) are off-topic (precision < ${MIN_SELECTABLE_TOPICAL_PRECISION}). Remove them with reject_corpus_items (ids: ${weakTopicSelected.slice(0, 12).map((e) => e.id).join(',')}) — rejection is sticky and will not be undone by later screening. Do NOT search for replacements just to keep the count.`,
+      ...weakTopicSelected.slice(0, 8).map((e) => `${e.id}: precision=${e.topicalPrecisionScore ?? e.relevanceScore ?? 0}; ${e.title}`),
+    ], Math.max(0, 100 - weakTopicSelected.length * 10)))
 
   const readTarget = Math.min(selected.length || minFullTextReads, minFullTextReads)
   results.push(readTarget === 0 || selectedRead.length >= readTarget

@@ -7,6 +7,7 @@ import {
   computeGateEscapeValve,
   detectDataGatheringStall,
   formatDataStallDirective,
+  nextSearchBudgetNudge,
   GATE_DOWNGRADE_AFTER_ATTEMPTS,
   type ResearchRunSpec,
 } from '../electron/research-workflow'
@@ -101,11 +102,42 @@ describe('computeGateEscapeValve', () => {
     expect(results[0].passed).toBe(false)
   })
 
+  it('never downgrades topical_precision — off-topic sources must be removed, not tolerated', () => {
+    const raw = [gate('topical_precision', false, ['3 off-topic selected sources'])]
+    const prior = { topical_precision: 99 }
+    const { results, downgraded } = computeGateEscapeValve(raw, prior)
+    expect(downgraded).toEqual([])
+    expect(results[0].passed).toBe(false)
+  })
+
   it('leaves passing gates untouched and does not count them', () => {
     const raw = [gate('recency', true)]
     const { attempts, downgraded } = computeGateEscapeValve(raw, {})
     expect(attempts.recency).toBeUndefined()
     expect(downgraded).toEqual([])
+  })
+})
+
+describe('nextSearchBudgetNudge', () => {
+  it('does not nudge below the first milestone', () => {
+    expect(nextSearchBudgetNudge(44, 0, 45).shouldNudge).toBe(false)
+  })
+
+  it('nudges exactly once when a new milestone is crossed', () => {
+    const r = nextSearchBudgetNudge(45, 0, 45)
+    expect(r.milestone).toBe(1)
+    expect(r.shouldNudge).toBe(true)
+    // Same milestone already recorded (e.g. next invocation) → no repeat nudge.
+    expect(nextSearchBudgetNudge(60, 1, 45).shouldNudge).toBe(false)
+  })
+
+  it('fires again at the next milestone (persisted across invocations)', () => {
+    expect(nextSearchBudgetNudge(90, 1, 45).shouldNudge).toBe(true)
+    expect(nextSearchBudgetNudge(90, 1, 45).milestone).toBe(2)
+  })
+
+  it('stops nudging past the max-nudges cap', () => {
+    expect(nextSearchBudgetNudge(45 * 5, 4, 45, 4).shouldNudge).toBe(false)
   })
 })
 

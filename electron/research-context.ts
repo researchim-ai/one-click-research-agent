@@ -106,14 +106,14 @@ export function readResearchRunState(workspace: string): ResearchRunState | null
 
 export function updateResearchRunState(workspace: string, patch: Partial<ResearchRunState> & { outputDir: string }): ResearchRunState {
   const prev = readResearchRunState(workspace)
+  // IMPORTANT: this function tracks only the coarse UI "phase" in run-state.json. It must
+  // NOT write the authoritative workflow `state` into the run spec. That state is owned
+  // exclusively by updateResearchWorkflowAfterTool (which infers it from disk). The old
+  // phase→state mapping here was lossy — e.g. every corpus-phase tool (screen_corpus,
+  // read_full_text_batch, assign_corpus_to_plan…) forced state back to CORPUS_READY,
+  // clobbering EVIDENCE/GATES_FAILED and making the "Research state" tail contradict its own
+  // blockers/hints (allowed tools without run_quality_gates while gates were failing).
   ensureResearchRunSpec(workspace, patch.outputDir, {
-    state: patch.phase === 'planning' ? 'PLANNED'
-      : patch.phase === 'corpus' ? 'CORPUS_READY'
-      : patch.phase === 'evidence' ? 'EVIDENCE'
-      : patch.phase === 'gates_failed' ? 'GATES_FAILED'
-      : patch.phase === 'gates_passed' ? 'GATES_PASSED'
-      : patch.phase === 'report_generated' ? 'REPORT_READY'
-      : undefined,
     topic: patch.topic,
     lastTool: patch.lastTool,
   })

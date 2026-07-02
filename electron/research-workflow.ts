@@ -45,6 +45,16 @@ export interface ResearchRunSpec {
   allowedActions: string[]
   /** How many quality-gate runs each gate has failed in (for the escape valve). */
   gateAttempts?: Record<string, number>
+  /**
+   * Cumulative number of successful search-tool calls across the WHOLE run (persisted so it
+   * survives the multiple runAgent invocations a managed run goes through: plan checkpoint,
+   * auto-continue, gate-repair passes). Used to redirect the model away from exhausted broad
+   * discovery toward targeted queries / synthesis once it has searched a lot.
+   */
+  searchCallsTotal?: number
+  /** Highest budget milestone (floor(searchCallsTotal / cap)) already nudged, so each
+   * milestone nudges exactly once even across invocations. */
+  searchNudgeMilestone?: number
   /** Structural gates downgraded from blocker to warning after exhausting honest repair attempts. */
   downgradedGates?: string[]
   createdAt: number
@@ -66,9 +76,14 @@ export const STRUCTURAL_GATES = new Set([
   'full_text_coverage',
   'high_priority_availability',
   'unread_top_sources',
-  'topical_precision',
   'noise_ratio',
 ])
+// NOTE: topical_precision is deliberately NOT structural. It measures whether the selected
+// sources are actually on-topic — a content-quality signal, not a limitation of what's
+// retrievable. Downgrading it let off-topic papers into the final report. It is instead
+// made genuinely passable: the floor-promotion shares the gate threshold
+// (MIN_SELECTABLE_TOPICAL_PRECISION) and manual rejections are now sticky, so re-screening
+// or rejecting the flagged items always clears it.
 
 /** A structural gate is downgraded once it has failed in this many quality-gate runs. */
 export const GATE_DOWNGRADE_AFTER_ATTEMPTS = 3
@@ -114,6 +129,9 @@ export function repairToolsForGate(gate: string): string[] {
       // screening the sources already gathered is far cheaper than searching for more.
       return ['screen_corpus', 'build_corpus', 'read_full_text_batch', 'search_openalex', 'search_arxiv', 'run_quality_gates']
     case 'topical_precision':
+      // The blocker lists the exact off-topic IDs. Reject them (sticky) or re-screen to
+      // demote them — both now permanently clear the gate.
+      return ['reject_corpus_items', 'screen_corpus', 'run_quality_gates']
     case 'noise_ratio':
     case 'date_range_compliance':
     case 'recency':
@@ -131,6 +149,24 @@ export function repairToolsForGate(gate: string): string[] {
     default:
       return ['gate_report', 'verify_claims', 'run_quality_gates']
   }
+}
+
+/**
+ * Pure budget-milestone decision for the per-run search cap. Given the new cumulative
+ * search count and the highest milestone already nudged, returns the current milestone and
+ * whether a fresh nudge should fire (each milestone fires at most once, up to maxNudges).
+ * Extracted so the crossing logic is unit-testable independently of runAgent.
+ */
+export function nextSearchBudgetNudge(
+  total: number,
+  prevMilestone: number,
+  cap = 45,
+  maxNudges = 4,
+): { milestone: number; shouldNudge: boolean } {
+  const safeCap = Math.max(1, cap)
+  const milestone = Math.floor(Math.max(0, total) / safeCap)
+  const shouldNudge = milestone > Math.max(0, prevMilestone) && milestone <= maxNudges
+  return { milestone, shouldNudge }
 }
 
 export function repairActionsForGateResults(results: GateResult[]): Array<{ gate: string; blockers: string[]; repairTools: string[] }> {
@@ -204,6 +240,8 @@ export function ensureResearchRunSpec(workspace: string, outputDir: string, patc
     allowedActions: allowedActionsForState(inferredState, lastGateFailures),
     gateAttempts: patch.gateAttempts ?? prev?.gateAttempts,
     downgradedGates: patch.downgradedGates ?? prev?.downgradedGates,
+    searchCallsTotal: patch.searchCallsTotal ?? prev?.searchCallsTotal,
+    searchNudgeMilestone: patch.searchNudgeMilestone ?? prev?.searchNudgeMilestone,
     createdAt: prev?.createdAt ?? Date.now(),
     updatedAt: Date.now(),
     transitions: patch.transitions ?? prev?.transitions ?? [],

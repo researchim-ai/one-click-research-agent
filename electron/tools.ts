@@ -2005,6 +2005,26 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
   const conclusionBlock = synthesis?.conclusion
     ? [ru ? '## Заключение' : '## Conclusion', '', synthesis.conclusion, '']
     : []
+  // Data-driven limitations computed from THIS run (not boilerplate): shortfall vs the
+  // requested target, unread/unavailable sources, and any quality gates that had to be
+  // downgraded. Surfacing these honestly is more useful to the reader than a clean 17/17.
+  const downgradedGates = Array.isArray(spec?.downgradedGates) ? spec!.downgradedGates : []
+  const targetSelected = Number(th.minSelected) > 0 ? Number(th.minSelected) : 0
+  const weakSelectedNow = selected.filter((e) => (e.topicalPrecisionScore ?? e.relevanceScore ?? 0) < 45).length
+  const dataLimitations: string[] = []
+  if (ru) {
+    if (targetSelected && selected.length < targetSelected) dataLimitations.push(`- Отобрано ${selected.length} источников из целевых ${targetSelected}: релевантных публикаций по теме в доступных базах оказалось меньше запрошенного, поэтому выводы опираются на меньшую доказательную базу.`)
+    if (selected.length && read.length < selected.length) dataLimitations.push(`- Полностью прочитано ${read.length} из ${selected.length} отобранных источников; остальные учтены по аннотациям/метаданным и трактуются слабее.`)
+    if (unavailable.length) dataLimitations.push(`- У ${unavailable.length} источник(ов) не удалось получить полный текст — они учтены слабее (см. раздел о недоступных источниках).`)
+    if (downgradedGates.length) dataLimitations.push(`- Проверки качества, понижённые до предупреждения из-за ограничений доступных источников: ${downgradedGates.join(', ')}.`)
+    if (weakSelectedNow) dataLimitations.push(`- ${weakSelectedNow} отобранных источник(ов) имеют пониженную тематическую точность; связанные с ними выводы стоит перепроверить.`)
+  } else {
+    if (targetSelected && selected.length < targetSelected) dataLimitations.push(`- Selected ${selected.length} of the ${targetSelected} target sources: fewer on-topic publications were available than requested, so conclusions rest on a smaller evidence base.`)
+    if (selected.length && read.length < selected.length) dataLimitations.push(`- Read full text for ${read.length} of ${selected.length} selected sources; the rest are used at the abstract/metadata level and weighted lower.`)
+    if (unavailable.length) dataLimitations.push(`- Full text could not be retrieved for ${unavailable.length} source(s); they are weighted lower (see the unavailable-sources section).`)
+    if (downgradedGates.length) dataLimitations.push(`- Quality gates downgraded to warnings due to limits of the available sources: ${downgradedGates.join(', ')}.`)
+    if (weakSelectedNow) dataLimitations.push(`- ${weakSelectedNow} selected source(s) have reduced topical precision; treat conclusions that rely on them with extra caution.`)
+  }
   const annotationLines = reportSources.length
     ? reportSources.map((e, i) => `${i + 1}. **${link(cleanTitle(e.title), e.url)}**${e.year ? ` (${e.year})` : ''} \`${e.id}\`\n   ${sourceSummary(e)}`)
     : [ru ? '- Нет прочитанных источников.' : '- No read sources.']
@@ -2137,6 +2157,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
       '',
       '## Limitations',
       '',
+      ...dataLimitations,
       '- This report should not treat unread, failed, or merely queued corpus items as evidence.',
       '- High-priority failed full-text reads require replacement sources or explicit caveats.',
       '- Citation counts and venue quality should be used as ranking signals, but recent 2025-2026 papers may be important despite low citations.',
@@ -2215,6 +2236,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     '',
     '## Ограничения и риски интерпретации',
     '',
+    ...dataLimitations,
     '- Нельзя считать доказательной базой источники, которые остались в очереди, не прочитались или были найдены только в сыром корпусе.',
     '- Источники высокого приоритета с недоступным полным текстом должны быть заменены аналогами или явно отмечены как пробел.',
     '- Число цитирований и качество площадки важны для ранжирования, но свежие статьи 2025–2026 годов могут быть значимыми даже при низком числе цитирований.',
