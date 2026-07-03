@@ -1,5 +1,13 @@
 appId: ai.researchim.one-click-research-agent
-productName: One-Click Research Agent
+# Keep this a single space-free slug: it drives the app name, the Linux install path
+# (/opt/<productName>/) AND — historically — spaces in that /opt path crash Electron at
+# startup (chrome-sandbox / resource resolution). executableName + a unified artifactName
+# below guarantee the SAME space-free name across every platform and package format.
+productName: one-click-research-agent
+executableName: one-click-research-agent
+# One consistent, space-free filename for every target (AppImage/deb/tar.gz/exe/dmg/zip)
+# instead of each installer inventing its own casing/separators.
+artifactName: ${name}-${version}-${arch}.${ext}
 copyright: Copyright © 2025-2026 researchim-ai
 
 directories:

@@ -19,7 +19,15 @@ if (process.platform === 'win32') {
   app.commandLine.appendSwitch('force-dark-mode')
 }
 
-if (process.env.ELECTRON_NO_SANDBOX || process.argv.includes('--no-sandbox')) {
+// Chromium's SUID sandbox needs the `chrome-sandbox` helper to be setuid-root. Inside an
+// AppImage that helper lives on a read-only FUSE mount and can never be setuid, so on
+// distros where unprivileged user namespaces are disabled Electron aborts at startup
+// ("The SUID sandbox helper binary ... is not configured correctly") — the app simply does
+// not launch unless the user manually passes --no-sandbox. Auto-disable the sandbox when we
+// are running from an AppImage (Electron sets $APPIMAGE), so the bundle launches out of the
+// box. Native installs (.deb/.rpm) ship a correctly-setuid helper and keep the sandbox.
+const runningFromAppImage = process.platform === 'linux' && !!process.env.APPIMAGE
+if (process.env.ELECTRON_NO_SANDBOX || process.argv.includes('--no-sandbox') || runningFromAppImage) {
   app.commandLine.appendSwitch('no-sandbox')
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   app.disableHardwareAcceleration()
