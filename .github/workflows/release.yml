@@ -33,7 +33,12 @@ jobs:
           retention-days: 5
 
   build-windows:
-    runs-on: windows-latest
+    # Pin to windows-2022: windows-latest now maps to windows-2025, where the
+    # node-gyp@9 bundled by @electron/rebuild fails to locate Visual Studio when
+    # compiling the node-pty native module ("Could not find any Visual Studio
+    # installation"). windows-2022 ships VS 2022 + the C++ toolset that node-gyp@9
+    # detects correctly.
+    runs-on: windows-2022
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
