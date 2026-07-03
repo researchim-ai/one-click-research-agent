@@ -1429,10 +1429,41 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
     return `Fetched ${entry.url} to ${rel} (${directBody} chars).\nUpdated corpus ${corpusId}: read.`
   }
 
-  // Direct fetch was blocked or empty. Publishers like MDPI/Frontiers serve a JS/anti-bot
-  // shell that Readability parses to ~0 chars — writing that as "read" fabricates evidence
-  // from nothing. Recover the open-access copy from Europe PMC (many such articles are OA
-  // in PMC) via DOI/PMID before giving up.
+  // Direct fetch was blocked or empty. Publishers (ACM/IEEE/MDPI/Frontiers/Cell) and
+  // landing pages (OpenReview/Semantic Scholar) serve a JS/anti-bot or metadata-only shell
+  // that Readability parses to ~0 chars — writing that as "read" fabricates evidence from
+  // nothing. This hits the highest-value items hardest (surveys with a DOI/landing URL).
+  //
+  // Recovery route 1 — scholarly OA (CS/ML/general): most such papers have an arXiv or
+  // open-access copy. Resolve it via identifiers / Semantic Scholar and download via the
+  // proven arXiv pipeline (readable HTML) so surveys become real full-text evidence instead
+  // of dragging down full_text_coverage / unread_top_sources.
+  const scholarly = resolveScholarlyOaLocation(entry)
+  if (scholarly?.arxivId) {
+    const htmlPath = path.join(fullTextDir, `${safeId}.html`)
+    const html = downloadArxivHtml(scholarly.arxivId, htmlPath, workspace)
+    if (!html.startsWith('Error:')) {
+      markCorpusItemRead(workspace, corpusId, path.relative(workspace, htmlPath), 'read', `full text recovered via arXiv (${scholarly.arxivId}); publisher landing page was not scrapeable`, outputDir)
+      return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv HTML (${scholarly.arxivId}).\n${html}\nUpdated corpus ${corpusId}: read.`
+    }
+    const pdfPath = path.join(fullTextDir, `${safeId}.pdf`)
+    const pdf = downloadArxivPdf(scholarly.arxivId, pdfPath, workspace)
+    if (!pdf.startsWith('Error:')) {
+      markCorpusItemRead(workspace, corpusId, path.relative(workspace, pdfPath), 'read', `arXiv PDF recovered (${scholarly.arxivId}); parse_document recommended`, outputDir)
+      return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv PDF (${scholarly.arxivId}).\n${pdf}\nUpdated corpus ${corpusId}: read via PDF fallback.`
+    }
+  }
+  if (scholarly?.pdfUrl) {
+    const fetchedOa = fetchUrlTool(scholarly.pdfUrl, 'markdown', workspace)
+    if (!fetchedOa.startsWith('Error:') && fetchedContentLength(fetchedOa) >= MIN_FULLTEXT_CHARS) {
+      fs.writeFileSync(target, fetchedOa, 'utf-8')
+      const rel = path.relative(workspace, target)
+      markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access copy recovered via Semantic Scholar/OpenReview (publisher page was not scrapeable)', outputDir)
+      return `Direct fetch of ${entry.url} returned no readable content; recovered open-access copy to ${rel} (${fetchedContentLength(fetchedOa)} chars).\nUpdated corpus ${corpusId}: read.`
+    }
+  }
+
+  // Recovery route 2 — Europe PMC: for biomedical articles that are OA in PubMed Central.
   const oa = fetchOpenAccessFullText(entry.url, workspace)
   if (oa && oa.content.length >= MIN_FULLTEXT_CHARS) {
     const doc = `Title: ${entry.title}\nURL: ${entry.url}\nSource: ${oa.source}\nFormat: markdown\nLength: ${oa.content.length} chars\n\n---\n\n${oa.content}`
@@ -1449,7 +1480,7 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   // above never promotes an empty/snippet file back to "read". Honest failure > fake read.
   const why = fetched.startsWith('Error:')
     ? fetched.slice(0, 300)
-    : 'publisher blocked scraping (e.g. MDPI/Frontiers anti-bot) and no open-access copy was found in Europe PMC'
+    : 'publisher blocked scraping (e.g. ACM/MDPI/Frontiers anti-bot) and no open-access copy was found on arXiv, via Semantic Scholar, or in Europe PMC'
   markCorpusItemRead(workspace, corpusId, undefined, 'failed', why, outputDir)
   return `Error: could not retrieve readable full text for ${entry.url} — ${why}. Treat this source as unavailable (do not retry the same id); its abstract/snippet is still in the corpus. Run full_text_status, then run_quality_gates so the limitation is recorded.\nUpdated corpus ${corpusId}: failed.`
 }
@@ -4078,6 +4109,89 @@ const searchUrl = process.argv[1]
     const title = String(data.title || '').trim()
     return { content: `${title ? `# ${title}\n\n` : ''}## Abstract\n\n${abstract}`, kind: 'abstract', source: 'Europe PMC (abstract)' }
   }
+  return null
+}
+
+function extractArxivDoi(doi?: string): string | null {
+  const m = String(doi || '').match(/10\.48550\/arxiv\.([a-z-]+\/\d{7}(?:v\d+)?|\d{4}\.\d{4,5}(?:v\d+)?)/i)
+  return m ? m[1] : null
+}
+
+function extractSemanticScholarId(url: string): string | null {
+  // semanticscholar.org/paper/<slug>/<40-hex> or /paper/<40-hex>
+  return String(url || '').match(/semanticscholar\.org\/paper\/(?:[^/]+\/)?([0-9a-f]{40})/i)?.[1] ?? null
+}
+
+function extractOpenReviewId(url: string): string | null {
+  return String(url || '').match(/openreview\.net\/(?:forum|pdf)\?[^#]*\bid=([^&\s#]+)/i)?.[1] ?? null
+}
+
+/**
+ * Look up one paper on Semantic Scholar to recover an open-access location. `idQuery` is an
+ * S2 paper-id spec ('DOI:10…', 'URL:…', a bare 40-hex S2 id) or 'search:<title>' to fall
+ * back to a title search. Returns the arXiv id and/or an open-access PDF url when present.
+ */
+function semanticScholarLookupOA(idQuery: string): { arxivId?: string; pdfUrl?: string } | null {
+  const q = String(idQuery || '').trim()
+  if (!q) return null
+  const config = (() => { try { return cfg.load() } catch { return null } })()
+  const apiKey = config?.semanticScholarApiKey ? String(config.semanticScholarApiKey).trim() : ''
+  const headerLiteral = apiKey ? `, 'x-api-key': '${apiKey.replace(/'/g, "\\'")}'` : ''
+  const fields = 'externalIds,openAccessPdf'
+  const isSearch = q.startsWith('search:')
+  const endpoint = isSearch
+    ? `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(q.slice(7))}&limit=1&fields=${fields}`
+    : `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(q)}?fields=${fields}`
+  const script = `
+${httpGetSnippet()}
+;(async () => {
+  const r = await __httpGet(process.argv[1], { headers: { 'User-Agent': 'one-click-research-agent/0.1'${headerLiteral} } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(r.text)
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  // Key-less Semantic Scholar shares a strict pool (~1 req/s) and 429s on bursts.
+  throttleHost('semantic-scholar', 1200)
+  let payload: any
+  try { payload = JSON.parse(runNodeScript(script, [endpoint], 30000)) } catch { return null }
+  const paper = isSearch ? (Array.isArray(payload?.data) ? payload.data[0] : null) : payload
+  if (!paper) return null
+  const arxivId = paper.externalIds?.ArXiv ? String(paper.externalIds.ArXiv) : undefined
+  const pdfUrl = paper.openAccessPdf?.url ? String(paper.openAccessPdf.url) : undefined
+  if (!arxivId && !pdfUrl) return null
+  return { arxivId, pdfUrl }
+}
+
+/**
+ * Recover an open-access location for scholarly (CS/ML/general academic) sources that the
+ * biomedical Europe PMC path misses. The corpus often stores a non-scrapeable landing URL
+ * (ACM/IEEE DOI, OpenReview forum, Semantic Scholar / Cell page) for exactly the highest-
+ * value items — surveys — which then fail to read and drag down full-text coverage. arXiv
+ * hosts an OA copy of most such papers, so resolve an arXiv id (or any OA PDF) from the
+ * paper's identifiers or Semantic Scholar and return it for the caller to download.
+ */
+function resolveScholarlyOaLocation(entry: { url: string; doi?: string; arxivId?: string; title?: string }): { arxivId?: string; pdfUrl?: string } | null {
+  // 1. arXiv id already derivable from the stored URL / DOI — no network needed.
+  const directArxiv = entry.arxivId || extractArxivId(entry.url) || extractArxivDoi(entry.doi)
+  if (directArxiv) return { arxivId: directArxiv }
+
+  // 2. Ask Semantic Scholar for an OA location using the most specific id available.
+  const s2Id = extractSemanticScholarId(entry.url)
+  const idQuery = s2Id
+    ? s2Id
+    : entry.doi
+      ? `DOI:${entry.doi}`
+      : /openreview\.net/i.test(entry.url)
+        ? `URL:${entry.url}`
+        : entry.title && entry.title.trim().length >= 12
+          ? `search:${entry.title.trim()}`
+          : ''
+  const s2 = idQuery ? semanticScholarLookupOA(idQuery) : null
+  if (s2) return s2
+
+  // 3. OpenReview forum → its PDF endpoint is a direct, scrapeable OA copy.
+  const orId = extractOpenReviewId(entry.url)
+  if (orId) return { pdfUrl: `https://openreview.net/pdf?id=${orId}` }
   return null
 }
 

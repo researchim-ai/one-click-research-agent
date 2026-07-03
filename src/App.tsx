@@ -15,6 +15,7 @@ import { SourcesPanel } from './components/SourcesPanel'
 import { ResearchArtifacts } from './components/ResearchArtifacts'
 import { ResearchDashboard } from './components/ResearchDashboard'
 import { NewResearchDialog, type NewResearchRequest } from './components/NewResearchDialog'
+import { ResearchLibrary } from './components/ResearchLibrary'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -44,6 +45,8 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined)
   const [newResearchOpen, setNewResearchOpen] = useState(false)
+  const [newResearchSeq, setNewResearchSeq] = useState(0)
+  const [libraryOpen, setLibraryOpen] = useState(false)
   const [diffView, setDiffView] = useState<{ filePath: string; original: string; modified: string } | null>(null)
   const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
   const [appLanguage, setAppLanguage] = useState<'ru' | 'en'>('ru')
@@ -223,13 +226,25 @@ export function App() {
     return profile.presetIds[0]
   }, [])
 
+  // Always open the New Research dialog in a clean state: bump the key so the dialog
+  // remounts (fresh topic/draft/intake chat), and close the library if it was open.
+  const openNewResearch = useCallback(() => {
+    setLibraryOpen(false)
+    setNewResearchSeq((n) => n + 1)
+    setNewResearchOpen(true)
+  }, [])
+
   const handleStartResearch = useCallback(async (request: NewResearchRequest) => {
     const preset = presetForResearch(request)
     await window.api?.saveConfig?.({ selectedPreset: preset }).catch(() => {})
     setNewResearchOpen(false)
+    // Clean slate: close any editor tabs (old reports) and drop attached code refs so a
+    // new run starts against a fresh dashboard, not the previous run's leftovers.
+    closeAll()
+    setCodeRefs([])
     const title = `Research: ${request.topic}`
     await startResearchRun(buildResearchPrompt(request), title)
-  }, [buildResearchPrompt, presetForResearch, startResearchRun])
+  }, [buildResearchPrompt, presetForResearch, startResearchRun, closeAll])
 
   const addCodeRef = useCallback((ref: CodeReference) => {
     setCodeRefs((prev) => {
@@ -373,7 +388,7 @@ export function App() {
           newSession()
           break
         case 'new-research':
-          setNewResearchOpen(true)
+          openNewResearch()
           break
         case 'reset-context':
           resetChat()
@@ -464,13 +479,22 @@ export function App() {
             )}
           </div>
           <button
-            onClick={() => setNewResearchOpen(true)}
+            onClick={openNewResearch}
             disabled={!workspace || busy}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
             style={{ WebkitAppRegion: 'no-drag' } as any}
             title={appLanguage === 'ru' ? 'Начать управляемое исследование' : 'Start managed research'}
           >
             {appLanguage === 'ru' ? 'New Research' : 'New Research'}
+          </button>
+          <button
+            onClick={() => setLibraryOpen(true)}
+            disabled={!workspace}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-400 hover:text-zinc-100 bg-zinc-800/60 hover:bg-zinc-700/70 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+            style={{ WebkitAppRegion: 'no-drag' } as any}
+            title={appLanguage === 'ru' ? 'Библиотека проведённых исследований' : 'Library of past research runs'}
+          >
+            {appLanguage === 'ru' ? 'Мои исследования' : 'Library'}
           </button>
           <button
             onClick={() => { setSettingsTab('model'); setSettingsOpen(true) }}
@@ -489,11 +513,20 @@ export function App() {
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} initialTab={settingsTab} />
       <NewResearchDialog
+        key={newResearchSeq}
         open={newResearchOpen}
         busy={busy}
         appLanguage={appLanguage}
         onClose={() => setNewResearchOpen(false)}
         onStart={handleStartResearch}
+      />
+      <ResearchLibrary
+        open={libraryOpen}
+        workspace={workspace}
+        appLanguage={appLanguage}
+        onClose={() => setLibraryOpen(false)}
+        onOpenReport={openFile}
+        onNewResearch={openNewResearch}
       />
       {pendingExternalUrl && (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
@@ -625,7 +658,7 @@ export function App() {
                       <ResearchDashboard
                         workspace={workspace}
                         appLanguage={appLanguage}
-                        onNewResearch={() => setNewResearchOpen(true)}
+                        onNewResearch={openNewResearch}
                         onOpenSettings={() => {
                           setSettingsTab('agent')
                           setSettingsOpen(true)
@@ -684,7 +717,7 @@ export function App() {
                   activeSessionId={activeSessionId}
                   busy={busy}
                   onNew={newSession}
-                  onNewResearch={() => setNewResearchOpen(true)}
+                  onNewResearch={openNewResearch}
                   onSwitch={switchToSession}
                   onDelete={removeSession}
                   appLanguage={appLanguage}

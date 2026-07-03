@@ -281,11 +281,22 @@ describe('runQualityGates', () => {
 })
 
 describe('escape valve end-to-end on disk', () => {
-  it('downgrades review_source_coverage after repeated runs and persists it', () => {
+  it('downgrades review_source_coverage after repeated runs WITH genuine extra searching, and persists it', () => {
     writeCorpus(Array.from({ length: 6 }, (_, i) => corpusEntry(i)))
+
+    const bumpSearchCalls = (n: number) => {
+      const p = path.join(ws, OUT, 'run.json')
+      const spec = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf-8')) : {}
+      spec.searchCallsTotal = (Number(spec.searchCallsTotal) || 0) + n
+      fs.mkdirSync(path.join(ws, OUT), { recursive: true })
+      fs.writeFileSync(p, JSON.stringify(spec))
+    }
 
     let downgradedFinal: string[] = []
     for (let attempt = 0; attempt < GATE_DOWNGRADE_AFTER_ATTEMPTS; attempt++) {
+      // review_source_coverage is search-recoverable: the escape valve only gives up once the
+      // agent has actually gone and searched for more (survey/review) sources between runs.
+      bumpSearchCalls(2)
       const { results: raw } = runQualityGates(ws, undefined, { minSources: 5, outputDir: OUT } as any)
       const { results, downgraded } = applyGateEscapeValve(ws, OUT, raw)
       if (downgraded.length) writeQualityGateSnapshot(ws, OUT, results)

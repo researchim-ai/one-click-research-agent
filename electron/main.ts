@@ -810,6 +810,87 @@ function registerIpcHandlers() {
     return out
   })
 
+  // Research Library: list every past run directory under {workspace}/.research with
+  // lightweight metadata so the UI can browse, open the report, and delete runs.
+  ipcMain.handle('list-research-runs', (_e, workspace: string) => {
+    if (!workspace) return []
+    const root = path.join(workspace, '.research')
+    if (!fs.existsSync(root)) return []
+    const RUN_RE = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_/
+    let names: string[]
+    try { names = fs.readdirSync(root) } catch { return [] }
+    const countLines = (dir: string, file: string, filter?: (line: string) => boolean): number => {
+      try {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf-8').split('\n').filter((l) => l.trim())
+        return filter ? lines.filter(filter).length : lines.length
+      } catch { return 0 }
+    }
+    const runs: Array<Record<string, any>> = []
+    for (const name of names) {
+      const m = name.match(RUN_RE)
+      if (!m) continue
+      const dir = path.join(root, name)
+      let stat: fs.Stats
+      try { stat = fs.statSync(dir); if (!stat.isDirectory()) continue } catch { continue }
+      const outputDir = `.research/${name}`
+      const createdAt = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime()
+
+      let topic: string | null = null
+      try { topic = planner.planQuestion(workspace, outputDir) } catch {}
+
+      const reportPath = path.join(dir, 'report.md')
+      let hasReport = false, reportSize = 0, reportMtime = 0
+      try { const rs = fs.statSync(reportPath); hasReport = rs.isFile() && rs.size > 0; reportSize = rs.size; reportMtime = rs.mtimeMs } catch {}
+
+      let planTotal = 0, planDone = 0
+      try { const pr = planner.planProgress(planner.parsePlan(workspace, outputDir)); planTotal = pr.total; planDone = pr.done } catch {}
+
+      let blockers = 0
+      try {
+        const q = JSON.parse(fs.readFileSync(path.join(dir, 'quality-gates.json'), 'utf-8'))
+        blockers = (q.results || []).filter((r: any) => !r.passed).length
+      } catch {}
+
+      runs.push({
+        outputDir,
+        dirName: name,
+        topic: (topic && topic.trim()) || name.replace(RUN_RE, '').replace(/[-_]+/g, ' ').trim() || name,
+        createdAt,
+        mtime: stat.mtimeMs,
+        hasReport,
+        reportPath,
+        reportSize,
+        reportMtime,
+        corpusTotal: countLines(dir, 'corpus.jsonl'),
+        corpusSelected: countLines(dir, 'corpus.jsonl', (l) => l.includes('"screeningStatus":"selected"')),
+        evidenceTotal: countLines(dir, 'evidence.jsonl'),
+        planTotal,
+        planDone,
+        blockers,
+      })
+    }
+    runs.sort((a, b) => b.createdAt - a.createdAt || b.mtime - a.mtime)
+    return runs
+  })
+
+  // Delete a research run directory (and all its artifacts) from disk. Hardened: only a
+  // well-formed run dir strictly inside {workspace}/.research can be removed.
+  ipcMain.handle('delete-research-run', (_e, workspace: string, outputDir: string) => {
+    if (!workspace || !outputDir) return { ok: false, error: 'missing args' }
+    const root = path.resolve(workspace, '.research')
+    const dirName = String(outputDir).replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+    if (!/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_/.test(dirName)) return { ok: false, error: 'not a research run dir' }
+    const target = path.resolve(root, dirName)
+    const rel = path.relative(root, target)
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, error: 'path escapes research root' }
+    try {
+      fs.rmSync(target, { recursive: true, force: true })
+      return { ok: true }
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e) }
+    }
+  })
+
   ipcMain.handle('embed-status', () => ({
     isRunning: embed.isRunning(),
     modelDownloaded: embed.isDefaultModelDownloaded(),

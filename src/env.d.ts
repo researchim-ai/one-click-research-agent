@@ -106,6 +106,12 @@ interface ElectronAPI {
   setResearchSourceIncluded(workspace: string, outputDir: string, id: string, included: boolean): Promise<{ ok: boolean; selected: number }>
   getResearchSourceSelection(workspace: string, outputDir: string): Promise<import('../electron/types').CorpusSelectionItem[]>
   listResearchArtifacts(workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>>
+  listResearchRuns(workspace: string): Promise<Array<{
+    outputDir: string; dirName: string; topic: string; createdAt: number; mtime: number;
+    hasReport: boolean; reportPath: string; reportSize: number; reportMtime: number;
+    corpusTotal: number; corpusSelected: number; evidenceTotal: number; planTotal: number; planDone: number; blockers: number;
+  }>>
+  deleteResearchRun(workspace: string, outputDir: string): Promise<{ ok: boolean; error?: string }>
   embedStatus(): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }>
   embedDownloadModel(): Promise<{ ok: boolean; path?: string; error?: string }>
   embedStart(modelPath?: string): Promise<{ ok: boolean; error?: string; log?: string }>

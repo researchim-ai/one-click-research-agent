@@ -43,8 +43,13 @@ export interface ResearchRunSpec {
   lastTool?: string
   lastGateFailures?: Array<{ gate: string; blockers: string[]; repairTools: string[] }>
   allowedActions: string[]
-  /** How many quality-gate runs each gate has failed in (for the escape valve). */
+  /** How many consecutive quality-gate runs each gate has stalled in (no score gain). */
   gateAttempts?: Record<string, number>
+  /** Last score per gate, so the escape valve can tell stagnation from forward progress. */
+  gateScores?: Record<string, number>
+  /** searchCallsTotal captured when a search-recoverable gate started failing, so the escape
+   * valve can require genuine extra searching (not just re-screening) before downgrading. */
+  gateSearchBaseline?: Record<string, number>
   /**
    * Cumulative number of successful search-tool calls across the WHOLE run (persisted so it
    * survives the multiple runAgent invocations a managed run goes through: plan checkpoint,
@@ -77,7 +82,15 @@ export const STRUCTURAL_GATES = new Set([
   'high_priority_availability',
   'unread_top_sources',
   'noise_ratio',
+  // Coverage/quantity gates that depend on how many on-topic sources actually exist.
+  // When screening a fully-searched corpus keeps yielding the same count (e.g. 49/50),
+  // more screening cannot conjure a 50th relevant paper — it is a source-availability
+  // limitation, not a lack of model effort. Without this, an unreachable minimum makes
+  // screen_corpus → run_quality_gates loop forever (the root cause of stalled runs).
+  'selected_corpus_minimum',
+  'plan_section_coverage',
 ])
+
 // NOTE: topical_precision is deliberately NOT structural. It measures whether the selected
 // sources are actually on-topic — a content-quality signal, not a limitation of what's
 // retrievable. Downgrading it let off-topic papers into the final report. It is instead
@@ -85,8 +98,49 @@ export const STRUCTURAL_GATES = new Set([
 // (MIN_SELECTABLE_TOPICAL_PRECISION) and manual rejections are now sticky, so re-screening
 // or rejecting the flagged items always clears it.
 
-/** A structural gate is downgraded once it has failed in this many quality-gate runs. */
+/**
+ * Integrity gates must NEVER be auto-downgraded: silently passing them would produce a
+ * dishonest report (off-topic sources, unsupported/uncited claims, fabricated links, or
+ * out-of-period sources presented as in-period). These loops are instead broken by making
+ * the gate genuinely satisfiable, not by waving it through. Everything NOT in this set is a
+ * coverage/quantity signal that is honest to downgrade into a documented limitation.
+ */
+export const INTEGRITY_GATES = new Set([
+  'topical_precision',
+  'claim_support',
+  'evidence_to_corpus_linkage',
+  'report_citation_coverage',
+  'date_range_compliance',
+])
+
+/**
+ * Coverage gates whose shortfall is fixable by gathering MORE sources — i.e. the agent
+ * should go search again with different queries / a shifted date window before the run
+ * gives up. These are NOT downgraded on stall alone: the escape valve additionally requires
+ * that the agent has actually run more searches since the gate started failing (see
+ * REQUIRED_DIVERSIFY_SEARCHES). This is what forces "iди добери ещё статей" instead of
+ * settling for 49/50 after only re-screening the same corpus in place.
+ */
+export const SEARCH_RECOVERABLE_GATES = new Set([
+  'selected_corpus_minimum',
+  'review_source_coverage',
+  'recency',
+])
+
+/** New search calls required since a search-recoverable gate started failing before it may
+ * be downgraded via the structural path (the hard-stop net still guarantees termination). */
+export const REQUIRED_DIVERSIFY_SEARCHES = 2
+
+/** A structural gate is downgraded once it has stalled (no score gain) in this many runs. */
 export const GATE_DOWNGRADE_AFTER_ATTEMPTS = 3
+
+/**
+ * Universal termination safety net: ANY non-integrity gate that has stalled (no score gain)
+ * for this many consecutive quality-gate runs is downgraded, even if it was never explicitly
+ * classified as structural. This guarantees the run always terminates instead of looping,
+ * regardless of which coverage gate gets stuck, without relying on a hand-maintained allowlist.
+ */
+export const GATE_HARD_STOP_AFTER_ATTEMPTS = 6
 
 const ALLOWED_ACTIONS: Record<ResearchWorkflowState, string[]> = {
   INIT: ['plan_research'],
@@ -125,9 +179,11 @@ export function repairToolsForGate(gate: string): string[] {
       return ['full_text_status', 'read_full_text_batch', 'read_corpus_item', 'run_quality_gates']
     case 'selected_corpus_minimum':
     case 'review_source_coverage':
-      // screen_corpus / build_corpus first: an unscreened corpus is the usual cause, and
-      // screening the sources already gathered is far cheaper than searching for more.
-      return ['screen_corpus', 'build_corpus', 'read_full_text_batch', 'search_openalex', 'search_arxiv', 'run_quality_gates']
+      // screen_corpus first when there is still an unscreened backlog (cheap, local); but
+      // keep the full search/gather toolset available so that once screening is exhausted the
+      // agent can go find MORE with different queries and a shifted date window. The
+      // context-aware blocker message decides which of these to lead with.
+      return ['screen_corpus', 'build_corpus', 'search_openalex', 'search_arxiv', 'search_web', 'read_full_text_batch', 'run_quality_gates']
     case 'topical_precision':
       // The blocker lists the exact off-topic IDs. Reject them (sticky) or re-screen to
       // demote them — both now permanently clear the gate.
@@ -239,6 +295,8 @@ export function ensureResearchRunSpec(workspace: string, outputDir: string, patc
     lastGateFailures,
     allowedActions: allowedActionsForState(inferredState, lastGateFailures),
     gateAttempts: patch.gateAttempts ?? prev?.gateAttempts,
+    gateScores: patch.gateScores ?? prev?.gateScores,
+    gateSearchBaseline: patch.gateSearchBaseline ?? prev?.gateSearchBaseline,
     downgradedGates: patch.downgradedGates ?? prev?.downgradedGates,
     searchCallsTotal: patch.searchCallsTotal ?? prev?.searchCallsTotal,
     searchNudgeMilestone: patch.searchNudgeMilestone ?? prev?.searchNudgeMilestone,
@@ -294,40 +352,96 @@ export function updateResearchWorkflowAfterTool(
 }
 
 /**
- * Pure escape-valve computation. Given the raw gate results and the prior
- * per-gate failure counts, returns updated attempt counts, the set of gates to
- * downgrade, and a new results array where downgraded structural gates are
- * flipped from blocker to passing-with-warning (documented limitation).
+ * Pure escape-valve computation. This is the run's termination guarantee: it turns a gate
+ * that can no longer be improved into a documented limitation so the run finishes with an
+ * honest report instead of looping `screen_corpus → run_quality_gates` forever.
+ *
+ * It is PROGRESS-AWARE, not just attempt-counting: a failing gate's stall counter only
+ * advances when its score did NOT improve since the previous run. If the agent is still
+ * making headway (e.g. selected 45 → 47 → 49) the counter resets and it keeps working
+ * toward the real target. Because gate scores are bounded (0–100), once no further progress
+ * is possible the counter necessarily climbs to the threshold and the gate is released.
+ *
+ * A gate is downgraded when it has stalled for enough runs AND it is not an integrity gate:
+ *   - structural (source-availability) gates: after GATE_DOWNGRADE_AFTER_ATTEMPTS stalls
+ *   - any other non-integrity gate: after GATE_HARD_STOP_AFTER_ATTEMPTS stalls (safety net)
+ * Integrity gates are never auto-downgraded — those loops are broken by making them
+ * genuinely satisfiable, never by waving through a dishonest report.
  */
 export function computeGateEscapeValve(
   rawResults: GateResult[],
   priorAttempts: Record<string, number> = {},
-): { results: GateResult[]; attempts: Record<string, number>; downgraded: string[] } {
+  priorScores: Record<string, number> = {},
+  opts: { searchCalls?: number; priorSearchBaseline?: Record<string, number> } = {},
+): {
+  results: GateResult[]
+  attempts: Record<string, number>
+  downgraded: string[]
+  scores: Record<string, number>
+  searchBaseline: Record<string, number>
+} {
+  const searchCalls = Math.max(0, Number(opts.searchCalls) || 0)
   const attempts: Record<string, number> = { ...priorAttempts }
+  const scores: Record<string, number> = {}
+  const searchBaseline: Record<string, number> = { ...(opts.priorSearchBaseline ?? {}) }
   for (const r of rawResults) {
-    if (!r.passed && STRUCTURAL_GATES.has(r.gate)) {
+    const score = typeof r.score === 'number' ? r.score : 0
+    scores[r.gate] = score
+    if (r.passed) {
+      // A passing gate is no longer stalling; clear its counters so a later regression
+      // gets the full budget again rather than tripping the escape valve immediately.
+      delete attempts[r.gate]
+      delete searchBaseline[r.gate]
+      continue
+    }
+    const prevScore = priorScores[r.gate]
+    const improved = typeof prevScore === 'number' && score > prevScore
+    if (improved) {
+      // Forward progress → reset the stall and re-baseline search effort.
+      attempts[r.gate] = 0
+      delete searchBaseline[r.gate]
+    } else {
       attempts[r.gate] = (attempts[r.gate] ?? 0) + 1
+      // Remember how much searching had been done when this gate first started stalling,
+      // so we can require genuine additional discovery before giving up on it.
+      if (SEARCH_RECOVERABLE_GATES.has(r.gate) && searchBaseline[r.gate] === undefined) {
+        searchBaseline[r.gate] = searchCalls
+      }
     }
   }
 
   const downgraded = rawResults
-    .filter((r) => !r.passed && STRUCTURAL_GATES.has(r.gate) && (attempts[r.gate] ?? 0) >= GATE_DOWNGRADE_AFTER_ATTEMPTS)
+    .filter((r) => {
+      if (r.passed || INTEGRITY_GATES.has(r.gate)) return false
+      const stalls = attempts[r.gate] ?? 0
+      // Universal termination net: unconditional once a gate has stalled long enough.
+      if (stalls >= GATE_HARD_STOP_AFTER_ATTEMPTS) return true
+      if (!STRUCTURAL_GATES.has(r.gate) || stalls < GATE_DOWNGRADE_AFTER_ATTEMPTS) return false
+      // A shortfall that could be closed by finding MORE sources must not be waved through
+      // until the agent has actually gone and searched again (different queries / shifted
+      // date window), not merely re-screened the same corpus in place.
+      if (SEARCH_RECOVERABLE_GATES.has(r.gate)) {
+        const searchedSince = searchCalls - (searchBaseline[r.gate] ?? searchCalls)
+        return searchedSince >= REQUIRED_DIVERSIFY_SEARCHES
+      }
+      return true
+    })
     .map((r) => r.gate)
   const downgradeSet = new Set(downgraded)
 
   const results = rawResults.map((r) => {
     if (!downgradeSet.has(r.gate)) return r
-    const limitation = `Downgraded to warning after ${attempts[r.gate]} unsuccessful repair attempts — treated as a structural limitation of the available sources. ${r.blockers.join(' ')}`.trim()
+    const limitation = `Downgraded to warning after ${attempts[r.gate]} repair attempts with no further progress — treated as a limitation of the available sources. ${r.blockers.join(' ')}`.trim()
     return { ...r, passed: true, blockers: [], warnings: [...r.warnings, limitation] }
   })
 
-  return { results, attempts, downgraded }
+  return { results, attempts, downgraded, scores, searchBaseline }
 }
 
 /**
- * Apply the escape valve to the latest gate run, persisting attempt counts and
- * downgraded gates into run.json. Returns the (possibly downgraded) results so
- * the caller can rewrite quality-gates.json and let the run proceed to report.
+ * Apply the escape valve to the latest gate run, persisting attempt counts, per-gate scores
+ * and downgraded gates into run.json. Returns the (possibly downgraded) results so the caller
+ * can rewrite quality-gates.json and let the run proceed to report.
  */
 export function applyGateEscapeValve(
   workspace: string,
@@ -335,8 +449,18 @@ export function applyGateEscapeValve(
   rawResults: GateResult[],
 ): { results: GateResult[]; downgraded: string[] } {
   const prev = ensureResearchRunSpec(workspace, outputDir)
-  const { results, attempts, downgraded } = computeGateEscapeValve(rawResults, prev.gateAttempts ?? {})
-  ensureResearchRunSpec(workspace, outputDir, { gateAttempts: attempts, downgradedGates: downgraded })
+  const { results, attempts, downgraded, scores, searchBaseline } = computeGateEscapeValve(
+    rawResults,
+    prev.gateAttempts ?? {},
+    prev.gateScores ?? {},
+    { searchCalls: Number(prev.searchCallsTotal) || 0, priorSearchBaseline: prev.gateSearchBaseline ?? {} },
+  )
+  ensureResearchRunSpec(workspace, outputDir, {
+    gateAttempts: attempts,
+    gateScores: scores,
+    gateSearchBaseline: searchBaseline,
+    downgradedGates: downgraded,
+  })
   return { results, downgraded }
 }
 

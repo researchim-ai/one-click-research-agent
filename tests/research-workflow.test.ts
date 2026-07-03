@@ -9,11 +9,12 @@ import {
   formatDataStallDirective,
   nextSearchBudgetNudge,
   GATE_DOWNGRADE_AFTER_ATTEMPTS,
+  GATE_HARD_STOP_AFTER_ATTEMPTS,
   type ResearchRunSpec,
 } from '../electron/research-workflow'
 import type { GateResult } from '../electron/quality-gates'
 
-const gate = (g: string, passed: boolean, blockers: string[] = []): GateResult => ({ gate: g, passed, blockers, warnings: [] })
+const gate = (g: string, passed: boolean, blockers: string[] = [], score = 0): GateResult => ({ gate: g, passed, blockers, warnings: [], score })
 
 describe('allowedActionsForState', () => {
   it('returns the static allowed list for non-gate states', () => {
@@ -83,36 +84,86 @@ describe('computeGateEscapeValve', () => {
     expect(results.find((r) => r.gate === 'review_source_coverage')!.passed).toBe(false)
   })
 
-  it('downgrades a structural gate to a warning once attempts reach the threshold', () => {
-    const raw = [gate('review_source_coverage', false, ['only 1 survey'])]
-    const prior = { review_source_coverage: GATE_DOWNGRADE_AFTER_ATTEMPTS - 1 }
+  it('downgrades a non-search structural gate to a warning once attempts reach the threshold', () => {
+    // plan_section_coverage is structural but not "gather more sources" recoverable, so it
+    // downgrades on stall alone (no search-effort requirement).
+    const raw = [gate('plan_section_coverage', false, ['section 3 has no evidence'])]
+    const prior = { plan_section_coverage: GATE_DOWNGRADE_AFTER_ATTEMPTS - 1 }
     const { results, downgraded } = computeGateEscapeValve(raw, prior)
-    expect(downgraded).toEqual(['review_source_coverage'])
-    const r = results.find((x) => x.gate === 'review_source_coverage')!
+    expect(downgraded).toEqual(['plan_section_coverage'])
+    const r = results.find((x) => x.gate === 'plan_section_coverage')!
     expect(r.passed).toBe(true)
     expect(r.blockers).toEqual([])
-    expect(r.warnings.join(' ')).toMatch(/structural limitation/i)
+    expect(r.warnings.join(' ')).toMatch(/limitation of the available sources/i)
   })
 
-  it('never downgrades a non-structural gate (model can still fix it)', () => {
-    const raw = [gate('evidence_coverage', false, ['too few claims'])]
-    const prior = { evidence_coverage: 99 }
-    const { results, downgraded } = computeGateEscapeValve(raw, prior)
+  it('downgrades selected_corpus_minimum after stalling AND genuinely searching more (49/50 is then a real limitation)', () => {
+    const raw = [gate('selected_corpus_minimum', false, ['Only 49 selected corpus item(s); target is at least 50.'], 98)]
+    const prior = { selected_corpus_minimum: GATE_DOWNGRADE_AFTER_ATTEMPTS - 1 }
+    const priorScores = { selected_corpus_minimum: 98 }
+    // Gate started stalling at 10 search calls; the agent has since run 3 more (13) → genuine effort.
+    const { downgraded, results } = computeGateEscapeValve(raw, prior, priorScores, {
+      searchCalls: 13,
+      priorSearchBaseline: { selected_corpus_minimum: 10 },
+    })
+    expect(downgraded).toEqual(['selected_corpus_minimum'])
+    expect(results[0].passed).toBe(true)
+  })
+
+  it('does NOT downgrade selected_corpus_minimum on stall alone — it must go search more first', () => {
+    const raw = [gate('selected_corpus_minimum', false, ['Only 49 selected'], 98)]
+    const prior = { selected_corpus_minimum: GATE_DOWNGRADE_AFTER_ATTEMPTS + 1 }
+    const priorScores = { selected_corpus_minimum: 98 }
+    // No new searches since the gate started failing (baseline == current) → keep insisting on search.
+    const { downgraded } = computeGateEscapeValve(raw, prior, priorScores, {
+      searchCalls: 10,
+      priorSearchBaseline: { selected_corpus_minimum: 10 },
+    })
     expect(downgraded).toEqual([])
-    expect(results[0].passed).toBe(false)
   })
 
-  it('never downgrades topical_precision — off-topic sources must be removed, not tolerated', () => {
-    const raw = [gate('topical_precision', false, ['3 off-topic selected sources'])]
-    const prior = { topical_precision: 99 }
-    const { results, downgraded } = computeGateEscapeValve(raw, prior)
+  it('hard-stop still terminates a search-recoverable gate even if the agent never searched', () => {
+    const raw = [gate('selected_corpus_minimum', false, ['Only 49 selected'], 98)]
+    const prior = { selected_corpus_minimum: GATE_HARD_STOP_AFTER_ATTEMPTS - 1 }
+    const priorScores = { selected_corpus_minimum: 98 }
+    const { downgraded } = computeGateEscapeValve(raw, prior, priorScores, {
+      searchCalls: 10,
+      priorSearchBaseline: { selected_corpus_minimum: 10 },
+    })
+    expect(downgraded).toEqual(['selected_corpus_minimum'])
+  })
+
+  it('does NOT downgrade while the gate score is still improving (forward progress resets the stall)', () => {
+    const raw = [gate('selected_corpus_minimum', false, ['Only 49 selected'], 98)]
+    const prior = { selected_corpus_minimum: GATE_DOWNGRADE_AFTER_ATTEMPTS + 5 }
+    const priorScores = { selected_corpus_minimum: 90 } // improved 90 -> 98
+    const { downgraded, attempts } = computeGateEscapeValve(raw, prior, priorScores)
     expect(downgraded).toEqual([])
-    expect(results[0].passed).toBe(false)
+    expect(attempts.selected_corpus_minimum).toBe(0)
   })
 
-  it('leaves passing gates untouched and does not count them', () => {
-    const raw = [gate('recency', true)]
-    const { attempts, downgraded } = computeGateEscapeValve(raw, {})
+  it('hard-stop net downgrades any stalled non-integrity gate to guarantee termination', () => {
+    const raw = [gate('evidence_coverage', false, ['too few claims'], 40)]
+    const prior = { evidence_coverage: GATE_HARD_STOP_AFTER_ATTEMPTS - 1 }
+    const priorScores = { evidence_coverage: 40 } // stalled at 40
+    const { downgraded } = computeGateEscapeValve(raw, prior, priorScores)
+    expect(downgraded).toEqual(['evidence_coverage'])
+  })
+
+  it('never downgrades an integrity gate even past the hard stop — a dishonest report is worse than a loop', () => {
+    for (const g of ['topical_precision', 'claim_support', 'report_citation_coverage', 'evidence_to_corpus_linkage']) {
+      const raw = [gate(g, false, ['integrity violation'], 10)]
+      const prior = { [g]: GATE_HARD_STOP_AFTER_ATTEMPTS + 20 }
+      const priorScores = { [g]: 10 }
+      const { downgraded, results } = computeGateEscapeValve(raw, prior, priorScores)
+      expect(downgraded).toEqual([])
+      expect(results[0].passed).toBe(false)
+    }
+  })
+
+  it('leaves passing gates untouched and clears their stall counter', () => {
+    const raw = [gate('recency', true, [], 100)]
+    const { attempts, downgraded } = computeGateEscapeValve(raw, { recency: 2 })
     expect(attempts.recency).toBeUndefined()
     expect(downgraded).toEqual([])
   })

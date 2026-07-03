@@ -133,7 +133,10 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
         // The corpus already holds enough sources — they are just not screened yet. Tell
         // the agent to screen (cheap, local) instead of interpreting this as "search more".
         ? `Only ${selected.length} selected corpus item(s); target is at least ${minSelected}. ${rawUnscreened} corpus item(s) are still UNSCREENED — run screen_corpus (min_selected: ${minSelected}) to screen and promote on-topic items FIRST; do not search for more sources until the existing corpus has been screened.`
-        : `Only ${selected.length} selected corpus item(s); target is at least ${minSelected}.`,
+        // Corpus is fully screened and still short → screening is EXHAUSTED. Re-running it is a
+        // no-op. The only way to reach the target is to GATHER MORE: search again with NEW,
+        // different queries and a shifted/widened date window, then build_corpus (auto-screens).
+        : `Only ${selected.length} selected corpus item(s); target is at least ${minSelected}. The corpus is fully screened — re-screening will NOT add more. To reach the target you must GATHER MORE sources: (1) run NEW search queries you have not used yet — one specific query per thin plan subtopic (precise method/benchmark/author names, synonyms, related subfields), across multiple indexes (search_openalex, search_arxiv, search_web${general ? '' : ', search_pubmed'}); (2) WIDEN or SHIFT the date window — extend year_from a few years earlier, raise year_to, or drop strict_date_range if a narrow recent period is over-filtering out relevant work; then call build_corpus (it auto-screens). Do NOT repeat identical queries and do NOT re-run screen_corpus on the same set. Only stop searching once selected reaches ${minSelected} or genuinely new, on-topic sources can no longer be found.`,
     ], Math.round(selected.length / minSelected * 100)))
 
   results.push(general || selected.length === 0 || selectedReviewLike.length >= minReviewLike

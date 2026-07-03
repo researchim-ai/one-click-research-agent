@@ -130,6 +130,13 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('research-get-source-selection', workspace, outputDir),
   listResearchArtifacts: (workspace: string): Promise<Array<{ relPath: string; size: number; mtime: number; kind: string }>> =>
     ipcRenderer.invoke('list-research-artifacts', workspace),
+  listResearchRuns: (workspace: string): Promise<Array<{
+    outputDir: string; dirName: string; topic: string; createdAt: number; mtime: number;
+    hasReport: boolean; reportPath: string; reportSize: number; reportMtime: number;
+    corpusTotal: number; corpusSelected: number; evidenceTotal: number; planTotal: number; planDone: number; blockers: number;
+  }>> => ipcRenderer.invoke('list-research-runs', workspace),
+  deleteResearchRun: (workspace: string, outputDir: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('delete-research-run', workspace, outputDir),
   embedStatus: (): Promise<{ isRunning: boolean; modelDownloaded: boolean; modelPath: string | null; defaultModelPath: string; apiUrl: string }> =>
     ipcRenderer.invoke('embed-status'),
   embedDownloadModel: (): Promise<{ ok: boolean; path?: string; error?: string }> =>
