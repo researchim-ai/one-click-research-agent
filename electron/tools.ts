@@ -447,6 +447,25 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'search_biorxiv',
+      description:
+        'Search bioRxiv and medRxiv life-science / clinical preprints (via Europe PMC). Returns title, authors, preprint server, date, DOI and abstract. Use for the newest, often open-access, biomedical preprints (complements search_pubmed).',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Biomedical query, e.g. "micronized purified flavonoid fraction chronic venous disease".' },
+          max_results: { type: 'number', description: 'Maximum number of preprints to return (default: 5, max: 10).' },
+          server: { type: 'string', enum: ['biorxiv', 'medrxiv', 'both'], description: 'Which preprint server to search: bioRxiv (life sciences), medRxiv (clinical/medical), or both (default).' },
+          year_from: { type: 'number', description: 'Optional lower bound for publication year.' },
+          year_to: { type: 'number', description: 'Optional upper bound for publication year.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'smart_search',
       description:
         'Route a query to the most relevant sources automatically (academic / web / biomed / code). Fans out to 2–3 search engines in parallel, deduplicates by URL, and returns a merged result set. Prefer this when you are unsure which specific search tool to call.',
@@ -957,6 +976,8 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return searchSemanticScholar(args.query, args.max_results, args.year_from, args.year_to)
       case 'search_pubmed':
         return searchPubMed(args.query, args.max_results, args.year_from, args.year_to)
+      case 'search_biorxiv':
+        return searchBiorxiv(args.query, args.max_results, args.server, args.year_from, args.year_to)
       case 'smart_search':
         return smartSearch(args.query, args.max_per_source, workspace)
       case 'build_corpus':
@@ -1393,18 +1414,44 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
     return `${html}\n${pdf}\nUpdated corpus ${corpusId}: failed.`
   }
 
-  const fetched = fetchUrlTool(entry.url, 'markdown', workspace)
-  if (fetched.startsWith('Error:')) {
-    markCorpusItemRead(workspace, corpusId, undefined, 'failed', fetched.slice(0, 500), outputDir)
-    return `${fetched}\nUpdated corpus ${corpusId}: failed.`
-  }
   const target = resolvePath(path.join(fullTextDir, `${safeId}.md`), workspace)
   assertInWorkspace(target, workspace)
   fs.mkdirSync(path.dirname(target), { recursive: true })
-  fs.writeFileSync(target, fetched, 'utf-8')
-  const rel = path.relative(workspace, target)
-  markCorpusItemRead(workspace, corpusId, rel, 'read', 'URL fetched as markdown', outputDir)
-  return `Fetched ${entry.url} to ${rel} (${fetched.length} chars).\nUpdated corpus ${corpusId}: read.`
+
+  const fetched = fetchUrlTool(entry.url, 'markdown', workspace)
+  const directBody = fetched.startsWith('Error:') ? 0 : fetchedContentLength(fetched)
+
+  // Direct fetch returned real content → store it and we're done.
+  if (directBody >= MIN_FULLTEXT_CHARS) {
+    fs.writeFileSync(target, fetched, 'utf-8')
+    const rel = path.relative(workspace, target)
+    markCorpusItemRead(workspace, corpusId, rel, 'read', 'URL fetched as markdown', outputDir)
+    return `Fetched ${entry.url} to ${rel} (${directBody} chars).\nUpdated corpus ${corpusId}: read.`
+  }
+
+  // Direct fetch was blocked or empty. Publishers like MDPI/Frontiers serve a JS/anti-bot
+  // shell that Readability parses to ~0 chars — writing that as "read" fabricates evidence
+  // from nothing. Recover the open-access copy from Europe PMC (many such articles are OA
+  // in PMC) via DOI/PMID before giving up.
+  const oa = fetchOpenAccessFullText(entry.url, workspace)
+  if (oa && oa.content.length >= MIN_FULLTEXT_CHARS) {
+    const doc = `Title: ${entry.title}\nURL: ${entry.url}\nSource: ${oa.source}\nFormat: markdown\nLength: ${oa.content.length} chars\n\n---\n\n${oa.content}`
+    fs.writeFileSync(target, doc, 'utf-8')
+    const rel = path.relative(workspace, target)
+    const reason = oa.kind === 'fulltext'
+      ? `full text recovered via ${oa.source} (publisher page was not scrapeable)`
+      : `abstract only via ${oa.source} (full text unavailable)`
+    markCorpusItemRead(workspace, corpusId, rel, 'read', reason, outputDir)
+    return `Direct fetch of ${entry.url} returned no readable content; recovered ${oa.kind === 'fulltext' ? 'full text' : 'abstract'} via ${oa.source} to ${rel} (${oa.content.length} chars).\nUpdated corpus ${corpusId}: read.`
+  }
+
+  // Nothing usable. Mark failed WITHOUT a localPath so the post-rebuild reconcile logic
+  // above never promotes an empty/snippet file back to "read". Honest failure > fake read.
+  const why = fetched.startsWith('Error:')
+    ? fetched.slice(0, 300)
+    : 'publisher blocked scraping (e.g. MDPI/Frontiers anti-bot) and no open-access copy was found in Europe PMC'
+  markCorpusItemRead(workspace, corpusId, undefined, 'failed', why, outputDir)
+  return `Error: could not retrieve readable full text for ${entry.url} — ${why}. Treat this source as unavailable (do not retry the same id); its abstract/snippet is still in the corpus. Run full_text_status, then run_quality_gates so the limitation is recorded.\nUpdated corpus ${corpusId}: failed.`
 }
 
 function readFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
@@ -3774,6 +3821,80 @@ ${httpGetSnippet()}
   return out
 }
 
+function searchBiorxiv(query: string, maxResults?: number, server?: string, yearFrom?: number, yearTo?: number): string {
+  const q = String(query ?? '').trim()
+  if (!q) return 'Error: query is required.'
+  const limit = clampSearchLimit(maxResults)
+  const srv = ['biorxiv', 'medrxiv', 'both'].includes(String(server || '').toLowerCase())
+    ? String(server).toLowerCase()
+    : 'both'
+  const cacheParams = { q: q.toLowerCase(), limit, srv, yearFrom: yearFrom ?? null, yearTo: yearTo ?? null }
+  const cached = searchCache.get('search_biorxiv', cacheParams)
+  if (cached) return `[cached]\n${cached}`
+
+  // bioRxiv/medRxiv preprints are indexed by Europe PMC as SRC:PPR with a
+  // publisher of "bioRxiv" / "medRxiv" (the DOI prefix is no longer a reliable
+  // discriminator), so we filter by publisher at query time.
+  const publisherFilter = srv === 'biorxiv'
+    ? 'PUBLISHER:"bioRxiv"'
+    : srv === 'medrxiv'
+      ? 'PUBLISHER:"medRxiv"'
+      : '(PUBLISHER:"bioRxiv" OR PUBLISHER:"medRxiv")'
+  const filters = [`(${q})`, 'SRC:PPR', publisherFilter]
+  if (Number.isFinite(Number(yearFrom))) filters.push(`PUB_YEAR:[${Math.trunc(Number(yearFrom))} TO *]`)
+  if (Number.isFinite(Number(yearTo))) filters.push(`PUB_YEAR:[* TO ${Math.trunc(Number(yearTo))}]`)
+  const effectiveQuery = filters.join(' AND ')
+
+  const params = new URLSearchParams()
+  params.set('query', effectiveQuery)
+  params.set('format', 'json')
+  params.set('pageSize', String(limit))
+  params.set('resultType', 'core')
+  params.set('sort', 'P_PDATE_D desc')
+
+  const script = `
+${httpGetSnippet()}
+(async () => {
+  const url = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?' + process.argv[1]
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(r.text)
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  let payload: any
+  try { payload = JSON.parse(runNodeScript(script, [params.toString()], 30000)) } catch (e: any) {
+    const stderr = String(e?.stderr || e?.message || e).trim()
+    const hint = /HTTP 5\d\d|HTTP 429|timed out/i.test(stderr)
+      ? ' Europe PMC was slow or rate-limited even after retries. Try again shortly or use search_pubmed / search_openalex.'
+      : ''
+    return `Error: bioRxiv/medRxiv (Europe PMC) search failed. ${stderr}${hint}`
+  }
+  const items: any[] = Array.isArray(payload?.resultList?.result) ? payload.resultList.result : []
+  const label = srv === 'both' ? 'bioRxiv/medRxiv' : srv === 'biorxiv' ? 'bioRxiv' : 'medRxiv'
+  if (items.length === 0) return `No ${label} preprints found for "${q}".`
+  const lines = items.slice(0, limit).map((it: any, idx: number) => {
+    const title = String(it.title || 'Untitled').trim().replace(/\.$/, '')
+    const pubDate = String(it.firstPublicationDate || it.pubYear || '').trim()
+    const doi = it.doi ? `https://doi.org/${it.doi}` : ''
+    const url = doi || (it.pmid ? `https://europepmc.org/article/PPR/${it.pmid}` : '')
+    const preprintServer = String(it.publisher || '').trim() || label
+    const authors = String(it.authorString || '').trim()
+    const abstract = String(it.abstractText || '').replace(/\s+/g, ' ').slice(0, 400)
+    return [
+      `${idx + 1}. ${title}`,
+      pubDate ? `   Published: ${pubDate}` : null,
+      `   Server: ${preprintServer} (preprint — not peer-reviewed)`,
+      authors ? `   Authors: ${authors}` : null,
+      url ? `   URL: ${url}` : null,
+      doi ? `   DOI: ${doi}` : null,
+      abstract ? `   Abstract: ${abstract}` : null,
+    ].filter(Boolean).join('\n')
+  })
+  const out = `Found ${Math.min(items.length, limit)} ${label} preprint(s) for "${q}":\n\n${lines.join('\n\n')}`
+  searchCache.set('search_biorxiv', cacheParams, out)
+  return out
+}
+
 function smartSearch(query: string, maxPerSource: number | undefined, workspace: string): string {
   const q = String(query ?? '').trim()
   if (!q) return 'Error: query is required.'
@@ -3810,6 +3931,8 @@ function smartSearch(query: string, maxPerSource: number | undefined, workspace:
         out = searchSemanticScholar(q, perSource)
       } else if (tool === 'search_pubmed') {
         out = searchPubMed(q, perSource)
+      } else if (tool === 'search_biorxiv') {
+        out = searchBiorxiv(q, perSource)
       }
     } catch (e: any) { out = `Error: ${e?.message || e}` }
     if (!out) continue
@@ -3875,6 +3998,87 @@ function fetchUrlTool(url: string, format: string | undefined, workspace: string
   const out = `${header}\n\n---\n\n${excerpt}`
   searchCache.set('fetch_url', cacheKey, out)
   return out
+}
+
+/**
+ * Minimum body length (chars) below which a fetched page is treated as "blocked/empty".
+ * Real scientific full text is thousands of chars; anti-bot shells parse to ~0.
+ */
+const MIN_FULLTEXT_CHARS = 400
+
+/** Length of the actual body of a fetchUrlTool result (after the `---` header divider). */
+function fetchedContentLength(fetched: string): number {
+  const idx = fetched.indexOf('\n\n---\n\n')
+  const body = idx >= 0 ? fetched.slice(idx + '\n\n---\n\n'.length) : fetched
+  return body.trim().length
+}
+
+function extractDoiFromUrl(url: string): string | null {
+  const m = String(url || '').match(/(?:doi\.org\/|\/doi\/(?:abs\/|full\/|pdf\/)?)(10\.\d{4,9}\/[^\s"?#]+)/i)
+  if (!m) return null
+  return decodeURIComponent(m[1]).replace(/[).,;]+$/, '')
+}
+
+function extractPmidFromUrl(url: string): string | null {
+  return String(url || '').match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)/i)?.[1] ?? null
+}
+
+/**
+ * Recover an open-access copy from PubMed Central when the publisher page cannot be
+ * scraped directly (MDPI/Frontiers/etc. serve anti-bot shells that parse to ~0 chars).
+ *
+ * Strategy: resolve the article in Europe PMC by DOI or PMID to obtain its PMCID, then
+ * fetch the PubMed Central HTML article (`ncbi.nlm.nih.gov/pmc/articles/<pmcid>/`) through
+ * the same Readability pipeline used for normal pages — PMC serves the full article as
+ * static, scrapeable HTML. Falls back to the abstract when no PMCID / OA copy exists.
+ * Returns null when nothing usable is available.
+ */
+function fetchOpenAccessFullText(url: string, workspace: string): { content: string; kind: 'fulltext' | 'abstract'; source: string } | null {
+  const doi = extractDoiFromUrl(url)
+  const pmid = !doi ? extractPmidFromUrl(url) : null
+  if (!doi && !pmid) return null
+
+  const query = doi ? `DOI:"${doi}"` : `EXT_ID:${pmid} AND SRC:MED`
+  const params = new URLSearchParams()
+  params.set('query', query)
+  params.set('format', 'json')
+  params.set('resultType', 'core')
+  params.set('pageSize', '1')
+  const searchUrl = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?' + params.toString()
+
+  const script = `
+${httpGetSnippet()}
+const searchUrl = process.argv[1]
+;(async () => {
+  const r = await __httpGet(searchUrl, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  let payload
+  try { payload = JSON.parse(r.text) } catch { console.error('bad json'); process.exit(1) }
+  const it = payload && payload.resultList && payload.resultList.result && payload.resultList.result[0]
+  if (!it) { process.stdout.write(JSON.stringify({ found: false })); return }
+  process.stdout.write(JSON.stringify({ found: true, pmcid: it.pmcid || '', abstract: it.abstractText || '', title: it.title || '' }))
+})().catch((err) => { console.error(String(err && err.message || err)); process.exit(1) })
+`
+  let data: any
+  try { data = JSON.parse(runNodeScript(script, [searchUrl], 40000)) } catch { return null }
+  if (!data || !data.found) return null
+
+  const pmcid = String(data.pmcid || '').trim()
+  if (pmcid) {
+    try {
+      const page = fetchUrlImpl(`https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/`, 'markdown')
+      if (!('error' in page) && page.content && page.content.trim().length >= MIN_FULLTEXT_CHARS) {
+        return { content: page.content, kind: 'fulltext', source: `PubMed Central (${pmcid})` }
+      }
+    } catch { /* fall through to abstract */ }
+  }
+
+  const abstract = String(data.abstract || '').trim()
+  if (abstract.length >= 200) {
+    const title = String(data.title || '').trim()
+    return { content: `${title ? `# ${title}\n\n` : ''}## Abstract\n\n${abstract}`, kind: 'abstract', source: 'Europe PMC (abstract)' }
+  }
+  return null
 }
 
 async function screenshotPageTool(url: string, outputPath: string | undefined, fullPage: boolean | undefined, workspace: string): Promise<string> {

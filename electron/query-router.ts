@@ -30,6 +30,7 @@ export function classifyQuery(query: string): RouterDecision {
   }
   if (classes.includes('biology')) {
     sources.add('search_pubmed')
+    sources.add('search_biorxiv')
     sources.add('search_openalex')
   }
   if (classes.includes('code') || classes.includes('general') || classes.includes('news')) {

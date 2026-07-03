@@ -68,6 +68,27 @@ describe('extractTextToolCalls (reasoning-channel recovery payloads)', () => {
     const last = calls[calls.length - 1]
     expect(last.name).toBe('run_quality_gates')
   })
+
+  it('parses a full BATCH of committed evidence calls the model emits in one reasoning turn', () => {
+    // Regression for the "all tool calls left in reasoning" stall: the model routinely
+    // commits 4–5 fully-formed extract_evidence_from_corpus_item calls in a single
+    // reasoning turn. The runtime must recover ALL of them (not just the last), otherwise
+    // 80% of the committed evidence extractions are silently dropped and the run stalls.
+    const ids = ['e899905960', 'd0b360bfec', 'db234858c1', '8fe7c75aa9', 'e53be6c80f']
+    const reasoning = 'Let me extract evidence from multiple items now.' + ids.map((id) =>
+      `<tool_call><function=extract_evidence_from_corpus_item>` +
+      `<parameter=claim>claim for ${id}</parameter>` +
+      `<parameter=corpus_id>${id}</parameter>` +
+      `<parameter=plan_item_id>Q1</parameter>` +
+      `<parameter=evidence_type>survey_statement</parameter>` +
+      `<parameter=confidence>high</parameter>` +
+      `<parameter=output_dir>.research/x</parameter>` +
+      `</function></tool_call>`).join('')
+    const calls = extractTextToolCalls(reasoning)
+    expect(calls).toHaveLength(5)
+    expect(calls.every((c) => c.name === 'extract_evidence_from_corpus_item')).toBe(true)
+    expect(calls.map((c) => c.args.corpus_id)).toEqual(ids)
+  })
 })
 
 describe('extractTextToolCalls (empty)', () => {

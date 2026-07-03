@@ -193,6 +193,18 @@ function getGeneratedReportPath(result: string, workspace: string): string | nul
   return resolved
 }
 
+/**
+ * A managed research run directory always has the exact shape
+ * `.research/<YYYY-MM-DD_HH-MM-SS>_<slug>` — a single path segment under
+ * `.research/`. The model sometimes hallucinates an output_dir that is actually
+ * a file path or a nested path (e.g. `.research/<run>/plan.md]`). Feeding that to
+ * the research tools spins up a junk nested run (its own run.json / plan-md dir)
+ * and fragments the real run's state. This recognizes only the legitimate shape.
+ */
+function isWellFormedRunDir(dir: string): boolean {
+  return /^\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[^/]*$/.test(dir.replace(/\/+$/, ''))
+}
+
 function researchTitleFromOutputDir(outputDir: string): string {
   const slug = outputDir.replace(/^\.research\//, '').replace(/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_/, '').replace(/-/g, ' ')
   return slug.slice(0, 120) || 'Research Report'
@@ -1260,6 +1272,18 @@ async function streamLlmResponse(
     }
   }
 
+  // Close a dangling reasoning block. When the model streams its whole turn via
+  // `reasoning_content` (Qwen thinking mode) and never emits any visible `content`,
+  // the `</think>` close tag is never appended (that only happens when a content
+  // delta arrives). Leaving it open makes stripThinking() a no-op downstream, so the
+  // ENTIRE reasoning — including any `<tool_call>` XML the model wrote inside it —
+  // leaks into the stored assistant history. That bloats context and few-shot-teaches
+  // the model to keep emitting tool calls inside reasoning. Closing it here keeps the
+  // history clean (native tool_calls still carry the committed action).
+  if (accContent.includes('<think>') && !accContent.includes('</think>')) {
+    accContent += '</think>'
+  }
+
   // Final visible emission to ensure nothing is lost
   const { visible: finalVisible } = parseAccumulatedThinking(accContent)
   if (finalVisible.length > 0) {
@@ -1385,9 +1409,19 @@ function getUsableBudget(): number {
 
 function getMaxResponseTokens(): number {
   const budget = getUsableBudget()
-  // Scale minimum with context: small contexts get smaller min to leave room for messages
-  const minTokens = Math.max(1024, Math.min(4096, Math.floor(budget * 0.25)))
-  return Math.min(16384, Math.max(minTokens, Math.floor(budget * 0.30)))
+  // Reserve a response budget that SCALES with the real context available on this run.
+  // A reasoning model (Qwen thinking) must be able to finish its <think> block AND emit
+  // the tool call(s) in one turn — if it is truncated by max_tokens mid-reasoning, the
+  // `</think>` never closes and the committed <tool_call> XML leaks into history instead
+  // of coming back as native tool_calls. So on a 256k run we give it far more room than
+  // on a 32k run. Kept proportional so a small context still leaves space for messages.
+  const target = Math.floor(budget * 0.12)
+  const minTokens = Math.max(2048, Math.min(6144, Math.floor(budget * 0.20)))
+  const maxCap = budget >= 200000 ? 32768
+    : budget >= 96000 ? 24576
+    : budget >= 48000 ? 16384
+    : 8192
+  return Math.min(maxCap, Math.max(minTokens, target))
 }
 
 function getMessageBudget(): number {
@@ -1397,10 +1431,14 @@ function getMessageBudget(): number {
 function dynamicToolResultLimit(): number {
   const budget = getMessageBudget()
   const charBudget = Math.floor(budget * calibratedRatio)
-  // On small contexts, limit tool results much harder to prevent context bloat
+  // Scale how much of each tool result we keep with the real context available: tiny
+  // contexts truncate hard to avoid bloat, large contexts (128k/256k) can afford to
+  // retain much more source/evidence text per result.
   if (budget < 8000) return Math.min(Math.max(800, Math.floor(charBudget * 0.08)), 3000)
   if (budget < 15000) return Math.min(Math.max(1200, Math.floor(charBudget * 0.10)), 5000)
-  return Math.min(Math.max(1500, Math.floor(charBudget * 0.15)), 40000)
+  if (budget < 60000) return Math.min(Math.max(1500, Math.floor(charBudget * 0.15)), 40000)
+  if (budget < 150000) return Math.min(Math.max(1500, Math.floor(charBudget * 0.15)), 80000)
+  return Math.min(Math.max(1500, Math.floor(charBudget * 0.15)), 120000)
 }
 
 function smartTruncateToolResult(toolName: string, result: string, maxChars: number): string {
@@ -1701,7 +1739,13 @@ function tryRepairTruncatedToolCall(tc: any): { name: string; args: Record<strin
 // ---------------------------------------------------------------------------
 
 function stripThinking(content: string): string {
-  return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+  return content
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    // Defense-in-depth: strip a dangling, never-closed reasoning block too. Without
+    // this an unclosed <think> (reasoning-only turn) would pass through verbatim and
+    // pollute the stored history with the full reasoning + any <tool_call> XML.
+    .replace(/<think>[\s\S]*$/g, '')
+    .trim()
 }
 
 /**
@@ -2607,6 +2651,33 @@ function duplicateToolThreshold(toolName: string): number {
  * terminal path is run_quality_gates (which auto-generates report.md once gates
  * pass), so we point the model there instead of letting it re-inspect forever.
  */
+/**
+ * generate_evidence_report is special: a duplicate call is triggered exactly
+ * when the FIRST call was BLOCKED by failing gates (report.md never written)
+ * and the model retries. We must never blindly claim "report already exists" —
+ * that ends the run with no report on disk. Inspect the live run state and
+ * return an honest directive: if report.md is truly present, tell the model to
+ * stop; otherwise surface the real blocking gate(s) and the repair path.
+ */
+function generateReportLoopDirective(): string {
+  if (activeWorkspace && activeResearchOutputDir) {
+    const dir = resolveResearchDir(activeWorkspace, activeResearchOutputDir)
+    const reportExists = fs.existsSync(path.join(dir, 'report.md'))
+    if (!reportExists) {
+      const snap = readQualityGateSnapshot(activeWorkspace, activeResearchOutputDir)
+      const blocking = (snap?.failed ?? []).filter((f) => f.gate !== 'final_report_structure')
+      if (blocking.length > 0) {
+        const detail = blocking
+          .map((f) => `${f.gate}: ${(f.blockers && f.blockers[0]) || 'failing'}`)
+          .join('; ')
+        return `report.md was NOT written — generate_evidence_report is BLOCKED because these quality gates are still FAILING: ${detail}. Re-calling it with identical inputs will keep failing. Do NOT tell the user the report is ready and do NOT stop — report.md does not exist yet. Fix the blocker(s) with the recommended repair tools, call run_quality_gates exactly once, and only then call generate_evidence_report.`
+      }
+      return `report.md does not exist on disk yet, so the run is NOT finished. Call run_quality_gates once with the same output_dir — if gates pass it auto-generates report.md, otherwise fix the reported blockers first. Do not tell the user the report is ready until report.md actually exists.`
+    }
+  }
+  return `report.md has already been generated on disk and regenerating with the same inputs produces an identical file. Any remaining gate is a non-blocking structural/cosmetic check that does NOT prevent the report from being final. Stop calling generate_evidence_report. Give the user a short final summary and point them to the report.md you produced.`
+}
+
 function loopBreakDirective(toolName: string): string {
   const INSPECTION_TOOLS = new Set([
     'evidence_coverage_by_plan', 'evidence_matrix', 'list_evidence', 'list_selected_corpus',
@@ -2622,7 +2693,7 @@ function loopBreakDirective(toolName: string): string {
     return `Quality gates were just run with the same output_dir. Read the blockers, fix corpus/evidence/full-text issues, then rerun once — not in a loop.`
   }
   if (toolName === 'generate_evidence_report') {
-    return `report.md has already been generated on disk and regenerating with the same inputs produces an identical file. The only outstanding gate is final_report_structure, which is a non-blocking structural/cosmetic check — it does NOT prevent the report from being final. Stop calling generate_evidence_report. Give the user a short final summary and point them to the report.md you produced.`
+    return generateReportLoopDirective()
   }
   if (INSPECTION_TOOLS.has(toolName)) {
     return `You already called ${toolName}; this is a read-only inspection tool and its result will not change. Stop inspecting. Per-section coverage is whatever it is — if a section is genuinely short, record one more grounded claim with record_evidence/extract_evidence_from_corpus_item; otherwise call run_quality_gates now (it auto-generates report.md once gates pass). Do not call any inspection tool again.`
@@ -2762,8 +2833,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   // Calibrate token ratio from server (non-blocking, happens once)
   calibrateTokenRatio().catch(() => {})
 
-  // Verify actual server ctx size (catches mismatches from server auto-reducing ctx)
-  doQueryActualCtxSize().catch(() => {})
+  // Verify actual server ctx size (catches mismatches from server auto-reducing ctx).
+  // AWAIT it: every budget/clamp below (max_tokens, message budget, tool-result limits,
+  // pruning) is derived from the real n_ctx, so we must know it BEFORE assembling the
+  // first request. Fire-and-forget here meant the first turn could size itself against a
+  // stale/fallback ctx (e.g. 32k) even though the server was launched with 128k/256k.
+  await doQueryActualCtxSize().catch(() => {})
 
   // Summarize/prune context if approaching limit
   messages = await manageContext(messages, apiUrl)
@@ -3240,14 +3315,22 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     // --- Recover text-based tool calls (native API is primary; this is the fallback) ---
     // Primary recovery target is the VISIBLE content (after stripping <think>).
     //
-    // Reasoning models (Qwen3, etc.) frequently emit their committed tool call inside
-    // the reasoning channel and leave the visible content empty. Nagging them to move
-    // the call to the native channel just burns turns and eventually aborts the run, so
-    // when the model produced NOTHING but reasoning that ends in a tool call, we recover
-    // the LAST tool call it decided on and execute it as a real action. This is bounded:
-    // the loop guard below short-circuits repeated identical inspection calls and points
-    // the model forward, and we only ever take the single final call (not speculative
-    // intermediate ones), so it cannot run away.
+    // Reasoning models (Qwen3, etc.) frequently emit their committed tool calls inside
+    // the reasoning channel and leave the visible content empty. Nagging them to move the
+    // call to the native channel just burns turns and eventually aborts the run, so when
+    // the model produced NOTHING but reasoning that contains tool calls, we recover them
+    // and execute them as real actions.
+    //
+    // We recover the FULL BATCH the model committed (not just the last call): these models
+    // routinely emit 4–5 fully-formed `<tool_call>…</tool_call>` blocks per turn (e.g. a
+    // batch of extract_evidence_from_corpus_item calls, each with every required param).
+    // Taking only the last silently DROPS the rest, so the model re-emits the same batch
+    // next turn, only the last runs again, and the run stalls (evidence/plan gates never
+    // fill). A fully-formed XML tool_call block is a committed action, not speculative prose,
+    // so executing the batch matches what the native tool_calls channel would have done.
+    // This stays bounded: identical calls are de-duplicated just below, the per-turn count is
+    // capped, and the loop guard short-circuits cross-turn repeats.
+    const MAX_REASONING_RECOVERED_CALLS = 12
     if (!toolCalls && content) {
       const [thinking, visibleForTools] = extractThinking(content)
       let textCalls = extractTextToolCalls(visibleForTools)
@@ -3255,7 +3338,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       if (textCalls.length === 0 && !visibleForTools.trim() && thinking) {
         const hiddenCalls = extractTextToolCalls(thinking)
         if (hiddenCalls.length > 0) {
-          textCalls = [hiddenCalls[hiddenCalls.length - 1]]
+          textCalls = hiddenCalls.slice(0, MAX_REASONING_RECOVERED_CALLS)
           recoveredFromReasoning = true
         }
       }
@@ -3292,8 +3375,13 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           const isCustom = recoveredCustomTools.some((ct: any) => ct.name === tc.name)
           const SESSION_AWARE_RECOVERED = new Set(['generate_report', 'verify_sources', 'reflect', 'plan_research', 'save_finding', 'spawn_sub_researcher', 'export_report', 'build_corpus', 'assign_corpus_to_plan', 'record_evidence', 'extract_evidence_from_corpus_item', 'repair_evidence_quotes', 'verify_claims', 'run_quality_gates', 'gate_report', 'generate_evidence_report'])
           let toolArgs = SESSION_AWARE_RECOVERED.has(tc.name) ? { ...tc.args, session_id: session.id } : tc.args
-          if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name) && !toolArgs.output_dir) {
-            toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+          if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name)) {
+            const candidate = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/').trim() : ''
+            // Fill a missing output_dir, and coerce a malformed one (file/nested path) back
+            // to the real active run so the model can't spawn junk nested runs.
+            if (!candidate || !isWellFormedRunDir(candidate)) {
+              toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+            }
           }
 
           // Single loop-breaker: identical tool+args repeated past threshold.
@@ -3360,6 +3448,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
 
           const uiResult = result.length > 5000 ? result.slice(0, 5000) + '\n… [truncated]' : result
           doEmit( { type: 'tool_result', name: tc.name, result: uiResult })
+
+          // Mirror of the native path: a directly-called generate_evidence_report that
+          // actually wrote report.md must open it. Without this, a reasoning-embedded
+          // successful generate would leave the final report undisplayed.
+          const textReportPath = getGeneratedReportPath(result, workspace)
+          if (textReportPath) doEmit({ type: 'open_file', filePath: textReportPath })
 
           try {
             const sources = extractSourcesFromToolResult(tc.name, result)
@@ -3560,8 +3654,13 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         toolArgs = {}
       }
 
-      if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(toolName) && !toolArgs.output_dir) {
-        toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+      if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(toolName)) {
+        const candidate = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/').trim() : ''
+        // Fill a missing output_dir, and coerce a malformed one (file/nested path) back to
+        // the real active run so the model can't spawn junk nested runs.
+        if (!candidate || !isWellFormedRunDir(candidate)) {
+          toolArgs = { ...toolArgs, output_dir: activeResearchOutputDir }
+        }
       }
 
       doEmit( { type: 'tool_call', name: toolName, args: toolArgs })

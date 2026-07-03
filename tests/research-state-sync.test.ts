@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { ensureResearchRunSpec } from '../electron/research-workflow'
+import { ensureResearchRunSpec, updateResearchWorkflowAfterTool } from '../electron/research-workflow'
 import { updateResearchRunState } from '../electron/research-context'
 
 let ws: string
@@ -38,5 +38,23 @@ describe('updateResearchRunState does not clobber the authoritative FSM state', 
     const runState = updateResearchRunState(ws, { outputDir: OUT, phase: 'corpus', lastTool: 'screen_corpus' })
     expect(runState.phase).toBe('corpus')
     expect(runState.lastTool).toBe('screen_corpus')
+  })
+})
+
+describe('generate_evidence_report never fakes REPORT_READY without a report on disk', () => {
+  // Regression: a generate_evidence_report call BLOCKED by failing gates returns an error
+  // and writes nothing, yet the FSM used to jump to REPORT_READY unconditionally — the run
+  // then terminated believing it had produced a report that never existed.
+  it('stays in GATES_FAILED when report.md is absent', () => {
+    ensureResearchRunSpec(ws, OUT, { state: 'GATES_FAILED' })
+    const spec = updateResearchWorkflowAfterTool(ws, OUT, 'generate_evidence_report')
+    expect(spec.state).not.toBe('REPORT_READY')
+  })
+
+  it('advances to REPORT_READY only once report.md is written', () => {
+    ensureResearchRunSpec(ws, OUT, { state: 'GATES_FAILED' })
+    fs.writeFileSync(path.join(ws, OUT, 'report.md'), '# Report\n')
+    const spec = updateResearchWorkflowAfterTool(ws, OUT, 'generate_evidence_report')
+    expect(spec.state).toBe('REPORT_READY')
   })
 })

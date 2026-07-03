@@ -221,6 +221,20 @@ export function parsePubMedResults(text: string): Omit<Source, 'idx'>[] {
   return items
 }
 
+export function parseBiorxivResults(text: string): Omit<Source, 'idx'>[] {
+  const items: Omit<Source, 'idx'>[] = []
+  for (const block of splitBlocks(text)) {
+    const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
+    const url = block.match(/URL:\s+(https?:\/\/\S+)/)?.[1]?.trim()
+      || block.match(/DOI:\s+(https?:\/\/\S+)/)?.[1]?.trim()
+    const authors = block.match(/Authors:\s+(.+)/)?.[1]?.trim()
+    const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
+    const snippet = block.match(/Abstract:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
+    if (title && url) items.push({ title, url, authors, date, sourceTool: 'search_biorxiv', snippet })
+  }
+  return items
+}
+
 export function parseFetchUrlResult(text: string): Omit<Source, 'idx'>[] {
   const title = text.match(/^Title:\s+(.+)$/m)?.[1]?.trim()
   const url = text.match(/^URL:\s+(https?:\/\/\S+)$/m)?.[1]?.trim()
@@ -240,6 +254,7 @@ const PARSERS: Record<string, (text: string) => Omit<Source, 'idx'>[]> = {
   search_crossref: parseCrossrefResults,
   search_semantic_scholar: parseSemanticScholarResults,
   search_pubmed: parsePubMedResults,
+  search_biorxiv: parseBiorxivResults,
   get_references: parseOpenAlexResults,
   get_citations: parseOpenAlexResults,
   fetch_url: parseFetchUrlResult,
@@ -253,6 +268,7 @@ const PARSERS: Record<string, (text: string) => Omit<Source, 'idx'>[]> = {
     all.push(...parseCrossrefResults(text))
     all.push(...parseSemanticScholarResults(text))
     all.push(...parsePubMedResults(text))
+    all.push(...parseBiorxivResults(text))
     return all
   },
 }

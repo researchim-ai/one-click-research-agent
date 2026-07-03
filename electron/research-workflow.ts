@@ -270,8 +270,14 @@ export function updateResearchWorkflowAfterTool(
     else if (lastGateFailures.every((failure) => failure.gate === 'final_report_structure')) nextState = 'GATES_PASSED'
     else nextState = 'GATES_FAILED'
   } else if (toolName === 'generate_evidence_report') {
-    nextState = 'REPORT_READY'
-    lastGateFailures = []
+    // Only advance to REPORT_READY if report.md was actually written. A blocked
+    // generate call (gates failing) returns an error and writes nothing — it must
+    // NOT fake completion, otherwise the run terminates with no report on disk.
+    if (fs.existsSync(path.join(resolveResearchDir(workspace, outputDir), 'report.md'))) {
+      nextState = 'REPORT_READY'
+      lastGateFailures = []
+    }
+    // else: keep the inferred state + existing failures so the run keeps repairing.
   }
 
   const transitions = prev.transitions ?? []
