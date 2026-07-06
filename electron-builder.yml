@@ -4,7 +4,6 @@ appId: ai.researchim.one-click-research-agent
 # startup (chrome-sandbox / resource resolution). executableName + a unified artifactName
 # below guarantee the SAME space-free name across every platform and package format.
 productName: one-click-research-agent
-executableName: one-click-research-agent
 # One consistent, space-free filename for every target (AppImage/deb/tar.gz/exe/dmg/zip)
 # instead of each installer inventing its own casing/separators.
 artifactName: ${name}-${version}-${arch}.${ext}
@@ -22,7 +21,13 @@ asar: true
 asarUnpack:
   - "node_modules/node-pty/**"
 
+# Wrap the Linux executable so AppImage launches with --no-sandbox from process
+# start (Chromium's setuid sandbox cannot be root:4755 inside the FUSE mount, and
+# aborts before the JS entrypoint can append switches). deb/tar/dev are untouched.
+afterPack: build/afterPack.cjs
+
 linux:
+  executableName: one-click-research-agent
   target:
     - target: AppImage
       arch: [x64, arm64]
@@ -39,7 +44,13 @@ linux:
     Downloads and serves open-source models via llama.cpp.
     Investigates files, documents, repos, and reproducible workflows.
   desktop:
+    Name: One-Click Research Agent
     StartupWMClass: one-click-research-agent
+
+deb:
+  # Restore the SUID bit on chrome-sandbox for .deb installs so the full Chromium
+  # sandbox works (the /opt install path allows setuid, unlike the AppImage mount).
+  afterInstall: build/deb-after-install.sh
 
 mac:
   target:
