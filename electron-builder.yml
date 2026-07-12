@@ -20,6 +20,11 @@ files:
 asar: true
 asarUnpack:
   - "node_modules/node-pty/**"
+  # worker_threads runs in vanilla Node without Electron's ASAR-aware module
+  # loader. Keep the worker entry on the real filesystem and resolve it from
+  # app.asar.unpacked in production; otherwise packaged builds silently lose
+  # the agent worker before the first request.
+  - "dist-electron/agent-worker.js"
 
 # Wrap the Linux executable so AppImage launches with --no-sandbox from process
 # start (Chromium's setuid sandbox cannot be root:4755 inside the FUSE mount, and

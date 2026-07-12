@@ -1,8 +1,11 @@
-import { BrowserWindow } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
 
 export async function screenshotPage(url: string, outPath: string, fullPage = false): Promise<{ bytes: number; title: string }> {
+  // Keep Electron out of the agent worker's startup dependency graph. Packaged
+  // worker_threads run in plain Node and cannot resolve Electron's special API.
+  // This module is also used by the main process, where the lazy import works.
+  const { BrowserWindow } = await import('electron')
   const win = new BrowserWindow({
     show: false,
     width: 1280,
@@ -43,6 +46,7 @@ export async function screenshotPage(url: string, outPath: string, fullPage = fa
 
 /** Fetch rendered HTML after JS executes (useful for SPAs). */
 export async function fetchRenderedHtml(url: string, timeoutMs = 12000): Promise<{ html: string; finalUrl: string; title: string }> {
+  const { BrowserWindow } = await import('electron')
   const win = new BrowserWindow({
     show: false,
     width: 1280,

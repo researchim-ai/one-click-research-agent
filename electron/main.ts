@@ -157,11 +157,32 @@ function scheduleWorkspaceChangedNotify(): void {
   }, WORKSPACE_CHANGED_DEBOUNCE_MS)
 }
 
+function packagedAgentWorkerPath(): string {
+  if (!app.isPackaged) return path.join(__dirname, 'agent-worker.js')
+  return path.join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', 'agent-worker.js')
+}
+
+function rejectPendingAgentRun(message: string): void {
+  agentRunInFlight = false
+  clearAgentWatchdog()
+  if (pendingSendResolve) {
+    pendingSendResolve(`Error: ${message}`)
+    pendingSendResolve = null
+  }
+}
+
 function getAgentWorker(): Worker {
   if (!agentWorker) {
-    const workerPath = path.join(__dirname, 'agent-worker.js')
-    agentWorker = new Worker(workerPath, { stdout: true, stderr: true })
-    agentWorker.on('message', (msg: any) => {
+    const workerPath = packagedAgentWorkerPath()
+    const worker = new Worker(workerPath, { stdout: true, stderr: true })
+    agentWorker = worker
+    worker.stdout?.on('data', (chunk) => {
+      console.log(`[agent-worker] ${String(chunk).trimEnd()}`)
+    })
+    worker.stderr?.on('data', (chunk) => {
+      console.error(`[agent-worker] ${String(chunk).trimEnd()}`)
+    })
+    worker.on('message', (msg: any) => {
       // Any message from the worker is proof of progress — re-arm the inactivity watchdog.
       if (pendingSendResolve) armAgentWatchdog()
       if (msg.type === 'emit' && mainWindow) {
@@ -195,12 +216,14 @@ function getAgentWorker(): Worker {
         }
       }
     })
-    agentWorker.on('error', (err) => {
-      agentRunInFlight = false
-      clearAgentWatchdog()
-      if (pendingSendResolve) {
-        pendingSendResolve(`Error: ${err.message}`)
-        pendingSendResolve = null
+    worker.on('error', (err) => {
+      if (agentWorker === worker) agentWorker = null
+      rejectPendingAgentRun(`Agent worker failed: ${err.message}`)
+    })
+    worker.on('exit', (code) => {
+      if (agentWorker === worker) agentWorker = null
+      if (code !== 0) {
+        rejectPendingAgentRun(`Agent worker exited unexpectedly (code ${code}).`)
       }
     })
   }
@@ -644,57 +667,61 @@ function registerIpcHandlers() {
       })
 
       setImmediate(async () => {
-        const sessionRaw = getActiveSession(workspace)
-        const session = resume ? compactSessionForWorkerResume(sessionRaw) : sessionRaw
-        const msgCount = session.messages.length
-        emitAgentActivity({
-          phase: 'session_save',
-          label: resume ? 'Подготавливаю продолжение (артефакты на диске)' : 'Сохраняю сессию для worker…',
-          detail: resume ? undefined : `${msgCount} сообщений`,
-        })
-        const configVal = config.load()
-        const apiUrl = serverManager.llamaApiUrl()
-        const ctxSize = serverManager.getCtxSize() || 32768
-        const sessionPath = getSessionPathForWorker(workspace, session.id)
-        fs.mkdirSync(path.dirname(sessionPath), { recursive: true })
-        const stream = fs.createWriteStream(sessionPath, { encoding: 'utf-8' })
-        const write = (s: string) => stream.write(s)
-        write('{"id":')
-        write(JSON.stringify(session.id))
-        write(',"title":')
-        write(JSON.stringify(session.title))
-        write(',"messages":[')
-        for (let i = 0; i < session.messages.length; i++) {
-          write((i ? ',' : '') + JSON.stringify(session.messages[i]))
-          if (i > 0 && i % SESSION_WRITE_YIELD_EVERY === 0) {
-            await new Promise<void>(r => setImmediate(r))
-            if (!resume && msgCount > SESSION_WRITE_YIELD_EVERY) {
-              emitAgentActivity({
-                phase: 'session_save',
-                label: 'Сохраняю сессию для worker…',
-                detail: `${Math.min(i, msgCount)}/${msgCount} сообщений`,
-              })
+        try {
+          const sessionRaw = getActiveSession(workspace)
+          const session = resume ? compactSessionForWorkerResume(sessionRaw) : sessionRaw
+          const msgCount = session.messages.length
+          emitAgentActivity({
+            phase: 'session_save',
+            label: resume ? 'Подготавливаю продолжение (артефакты на диске)' : 'Сохраняю сессию для worker…',
+            detail: resume ? undefined : `${msgCount} сообщений`,
+          })
+          const configVal = config.load()
+          const apiUrl = serverManager.llamaApiUrl()
+          const ctxSize = serverManager.getCtxSize() || 32768
+          const sessionPath = getSessionPathForWorker(workspace, session.id)
+          fs.mkdirSync(path.dirname(sessionPath), { recursive: true })
+          const stream = fs.createWriteStream(sessionPath, { encoding: 'utf-8' })
+          const write = (s: string) => stream.write(s)
+          write('{"id":')
+          write(JSON.stringify(session.id))
+          write(',"title":')
+          write(JSON.stringify(session.title))
+          write(',"messages":[')
+          for (let i = 0; i < session.messages.length; i++) {
+            write((i ? ',' : '') + JSON.stringify(session.messages[i]))
+            if (i > 0 && i % SESSION_WRITE_YIELD_EVERY === 0) {
+              await new Promise<void>(r => setImmediate(r))
+              if (!resume && msgCount > SESSION_WRITE_YIELD_EVERY) {
+                emitAgentActivity({
+                  phase: 'session_save',
+                  label: 'Сохраняю сессию для worker…',
+                  detail: `${Math.min(i, msgCount)}/${msgCount} сообщений`,
+                })
+              }
             }
           }
+          write('],"uiMessages":')
+          write(JSON.stringify(session.uiMessages || []))
+          write(',"projectContextAdded":')
+          write(String(session.projectContextAdded))
+          write(',"createdAt":')
+          write(String(session.createdAt))
+          write(',"updatedAt":')
+          write(String(session.updatedAt))
+          write(',"workspaceKey":')
+          write(JSON.stringify(session.workspaceKey ?? ''))
+          write('}')
+          await new Promise<void>((res, rej) => { stream.once('finish', res); stream.once('error', rej); stream.end() })
+          emitAgentActivity({ phase: 'starting', label: 'Worker запущен — передаю управление агенту…' })
+          agentRunInFlight = true
+          getAgentWorker().postMessage({
+            type: 'run',
+            payload: { message: msg, workspace, config: configVal, apiUrl, ctxSize, sessionPath },
+          })
+        } catch (error: any) {
+          rejectPendingAgentRun(`Не удалось запустить agent worker: ${error?.message ?? error}`)
         }
-        write('],"uiMessages":')
-        write(JSON.stringify(session.uiMessages || []))
-        write(',"projectContextAdded":')
-        write(String(session.projectContextAdded))
-        write(',"createdAt":')
-        write(String(session.createdAt))
-        write(',"updatedAt":')
-        write(String(session.updatedAt))
-        write(',"workspaceKey":')
-        write(JSON.stringify(session.workspaceKey ?? ''))
-        write('}')
-        await new Promise<void>((res, rej) => { stream.once('finish', res); stream.once('error', rej); stream.end() })
-        emitAgentActivity({ phase: 'starting', label: 'Worker запущен — передаю управление агенту…' })
-        agentRunInFlight = true
-        getAgentWorker().postMessage({
-          type: 'run',
-          payload: { message: msg, workspace, config: configVal, apiUrl, ctxSize, sessionPath },
-        })
       })
     })
   })

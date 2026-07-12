@@ -1,6 +1,5 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import { BrowserWindow } from 'electron'
 import { SourceTracker } from './sources'
 
 /**
@@ -76,6 +75,9 @@ ${body}
 }
 
 export async function exportPdf(markdownContent: string, title: string, outPath: string): Promise<void> {
+  // Loaded only when PDF export is actually requested. A top-level Electron
+  // import makes the packaged agent worker crash before any research tool runs.
+  const { BrowserWindow } = await import('electron')
   const html = wrapHtml(title, markdownToHtml(markdownContent))
   const win = new BrowserWindow({
     show: false,

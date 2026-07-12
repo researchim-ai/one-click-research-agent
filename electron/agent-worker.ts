@@ -6,7 +6,7 @@
 
 import { parentPort } from 'worker_threads'
 import fs from 'fs'
-import { runAgent, type AgentBridge, type Session } from './agent'
+import { cancelAgent, runAgent, type AgentBridge, type Session } from './agent'
 import type { AgentEvent } from './types'
 import type { AppConfig } from './config'
 
@@ -85,6 +85,9 @@ parentPort.on('message', async (msg: any) => {
   }
   if (msg.type === 'cancel') {
     workerCancelRequested = true
+    // Abort the currently pending fetch/stream immediately. Merely flipping the
+    // bridge flag is insufficient while runAgent is blocked awaiting network I/O.
+    cancelAgent()
     return
   }
   if (msg.type === 'query-ctx-result') {
