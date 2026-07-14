@@ -72,4 +72,12 @@ describe('applyResearchIntakePatch — validation of a model-produced patch', ()
     const ready = applyResearchIntakePatch(base, { topic: 'RL в LLM' })
     expect(missingResearchFields(ready)).not.toContain('topic')
   })
+
+  it('accepts short acronym topics like "RL" (no 3-char minimum)', () => {
+    // Regression: the model correctly extracts topic "RL" from "RL за последний месяц",
+    // but a 3-char minimum treated it as missing and re-asked "what should we research?".
+    const base = defaultResearchRequest('ru')
+    const ready = applyResearchIntakePatch(base, { topic: 'RL' })
+    expect(missingResearchFields(ready)).not.toContain('topic')
+  })
 })

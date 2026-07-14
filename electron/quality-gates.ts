@@ -1,7 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { isReviewLike, loadCorpus, corpusStats, MIN_SELECTABLE_TOPICAL_PRECISION } from './corpus'
-import { evidenceStats, loadEvidence, verifyClaims } from './evidence'
+import { evidenceStats, loadEvidence, verifyClaims, reconcileSelectedFromEvidence } from './evidence'
 import { getSourceTracker } from './sources'
 import { parsePlan, planProgress } from './planner'
 import { resolveResearchDir } from '../research-paths'
@@ -76,6 +76,12 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   const evidencePerSection = Math.max(1, Number((opts as any)?.evidencePerSection) || 2)
   const minReviewLike = Math.max(1, Math.min(3, Number((opts as any)?.minReviewLike) || Math.ceil(minSelected * 0.12)))
   const results: GateResult[] = []
+
+  // Invariant: any read source cited by supported evidence counts as selected. Run this
+  // BEFORE reading corpus stats so selected_corpus_minimum / full_text_coverage reflect the
+  // sources the pipeline actually used (fixes general/web runs where cross-language screening
+  // under-selected everything and the gates saw selected = 0 despite real evidence).
+  reconcileSelectedFromEvidence(workspace, opts?.outputDir)
 
   const tracker = sessionId ? getSourceTracker(sessionId) : null
   const sourceCount = tracker?.count() ?? 0

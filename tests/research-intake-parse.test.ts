@@ -4,7 +4,34 @@ import {
   extractJsonObject,
   sanitizeResearchPatch,
   parseInferredResearchPatch,
+  buildResearchIntakeRequestBody,
 } from '../electron/research-intake-parse'
+
+describe('buildResearchIntakeRequestBody — current-date anchoring', () => {
+  const systemOf = (body: any) => body.messages.find((m: any) => m.role === 'system').content as string
+  const userOf = (body: any) => JSON.parse(body.messages.find((m: any) => m.role === 'user').content)
+
+  it('injects the provided current date into the system prompt and user payload', () => {
+    const body = buildResearchIntakeRequestBody({ message: 'RL за последнюю неделю', currentDate: '2026-07-13' })
+    expect(systemOf(body)).toContain("Today's date is 2026-07-13")
+    expect(userOf(body).currentDate).toBe('2026-07-13')
+  })
+
+  it('guides relative windows to a day-precise custom range instead of a guessed year', () => {
+    const system = systemOf(buildResearchIntakeRequestBody({ message: 'last week', currentDate: '2026-07-13' }))
+    expect(system).toContain('YYYY-MM-DD..YYYY-MM-DD')
+    expect(system).toMatch(/NEVER emit a stale\/guessed year/i)
+  })
+
+  it('falls back to today (YYYY-MM-DD) when currentDate is missing or malformed', () => {
+    const today = new Date().toISOString().slice(0, 10)
+    for (const currentDate of [undefined, '13-07-2026', 'garbage']) {
+      const body = buildResearchIntakeRequestBody({ message: 'x', currentDate: currentDate as any })
+      expect(userOf(body).currentDate).toBe(today)
+      expect(systemOf(body)).toContain(`Today's date is ${today}`)
+    }
+  })
+})
 
 describe('lastBalancedJsonObject', () => {
   it('returns the last top-level balanced object, ignoring braces inside reasoning', () => {

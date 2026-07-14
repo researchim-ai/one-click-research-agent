@@ -8,6 +8,8 @@ import {
   detectDataGatheringStall,
   formatDataStallDirective,
   nextSearchBudgetNudge,
+  registerResearchSearch,
+  researchSearchSignature,
   GATE_DOWNGRADE_AFTER_ATTEMPTS,
   GATE_HARD_STOP_AFTER_ATTEMPTS,
   type ResearchRunSpec,
@@ -15,6 +17,38 @@ import {
 import type { GateResult } from '../electron/quality-gates'
 
 const gate = (g: string, passed: boolean, blockers: string[] = [], score = 0): GateResult => ({ gate: g, passed, blockers, warnings: [], score })
+
+describe('persistent research search dedup', () => {
+  it('normalizes insignificant query whitespace and case', () => {
+    const a = researchSearchSignature('search_openalex', { query: '  RLHF   DPO ', year_from: 2024, year_to: 2026 })
+    const b = researchSearchSignature('search_openalex', { query: 'rlhf dpo', year_from: 2024, year_to: 2026 })
+    expect(a).toBe(b)
+  })
+
+  it('recognizes the same query after state is restored by a later runAgent invocation', () => {
+    const first = registerResearchSearch([], 0, 'search_openalex', {
+      query: 'RLHF DPO preference alignment',
+      year_from: 2024,
+      year_to: 2026,
+    })
+    expect(first.duplicate).toBe(false)
+
+    // Simulate persisted run.json fields loaded by a new invocation.
+    const resumed = registerResearchSearch(first.signatures, first.duplicateHits, 'search_openalex', {
+      query: 'rlhf   dpo preference alignment',
+      year_from: 2024,
+      year_to: 2026,
+    })
+    expect(resumed.duplicate).toBe(true)
+    expect(resumed.duplicateHits).toBe(1)
+  })
+
+  it('resets the duplicate streak when a genuinely new query is issued', () => {
+    const resumed = registerResearchSearch(['search_openalex|old|||||'], 5, 'search_openalex', { query: 'new' })
+    expect(resumed.duplicate).toBe(false)
+    expect(resumed.duplicateHits).toBe(0)
+  })
+})
 
 describe('allowedActionsForState', () => {
   it('returns the static allowed list for non-gate states', () => {

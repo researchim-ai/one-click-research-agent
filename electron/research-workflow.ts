@@ -60,6 +60,16 @@ export interface ResearchRunSpec {
   /** Highest budget milestone (floor(searchCallsTotal / cap)) already nudged, so each
    * milestone nudges exactly once even across invocations. */
   searchNudgeMilestone?: number
+  /**
+   * Normalized search tool+query signatures already executed in this managed run.
+   * Persisted because one run spans multiple runAgent invocations; an in-memory Set
+   * resets at every checkpoint/auto-continue and otherwise lets the same batch run again.
+   */
+  searchSignatures?: string[]
+  /** Consecutive duplicate searches since the last genuinely new query. */
+  duplicateSearchHits?: number
+  /** searchCallsTotal captured after the latest successful corpus build. */
+  searchCallsAtLastBuild?: number
   /** Structural gates downgraded from blocker to warning after exhausting honest repair attempts. */
   downgradedGates?: string[]
   createdAt: number
@@ -142,12 +152,53 @@ export const GATE_DOWNGRADE_AFTER_ATTEMPTS = 3
  */
 export const GATE_HARD_STOP_AFTER_ATTEMPTS = 6
 
+export function researchSearchSignature(name: string, args: Record<string, any> = {}): string {
+  const q = String(args.query ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+  return [
+    name,
+    q,
+    args.year_from ?? '',
+    args.year_to ?? '',
+    args.from_date ?? '',
+    args.to_date ?? '',
+    args.sort_by ?? '',
+  ].join('|')
+}
+
+export function registerResearchSearch(
+  priorSignatures: string[] = [],
+  priorDuplicateHits = 0,
+  name: string,
+  args: Record<string, any> = {},
+): { duplicate: boolean; signatures: string[]; duplicateHits: number; signature: string } {
+  const signature = researchSearchSignature(name, args)
+  const seen = new Set(priorSignatures)
+  if (seen.has(signature)) {
+    return {
+      duplicate: true,
+      signatures: [...seen].slice(-512),
+      duplicateHits: Math.max(0, priorDuplicateHits) + 1,
+      signature,
+    }
+  }
+  seen.add(signature)
+  return {
+    duplicate: false,
+    signatures: [...seen].slice(-512),
+    duplicateHits: 0,
+    signature,
+  }
+}
+
 const ALLOWED_ACTIONS: Record<ResearchWorkflowState, string[]> = {
   INIT: ['plan_research'],
   PLANNED: ['search_arxiv', 'search_openalex', 'search_huggingface_papers', 'search_web', 'build_corpus', 'screen_corpus', 'assign_corpus_to_plan'],
   // screen_corpus FIRST: right after build_corpus the corpus may hold unscreened raw
   // items; screening (not reading raw noise) is the correct next step.
-  CORPUS_READY: ['screen_corpus', 'read_full_text_batch', 'read_corpus_item', 'full_text_status', 'queue_full_text', 'assign_corpus_to_plan'],
+  // Search remains available here because screening can legitimately collapse the selected
+  // set to zero. Persistent search-signature dedup prevents re-running exhausted batches,
+  // while fresh targeted queries are the only valid recovery in that case.
+  CORPUS_READY: ['screen_corpus', 'search_arxiv', 'search_openalex', 'search_huggingface_papers', 'search_web', 'build_corpus', 'read_full_text_batch', 'read_corpus_item', 'full_text_status', 'queue_full_text', 'assign_corpus_to_plan'],
   // READING must allow evidence extraction: otherwise the run cannot bootstrap from
   // READING to EVIDENCE (EVIDENCE is only inferred once evidence exists, but the tools
   // that create evidence were not listed here — a deadlock that made the model deliberate
@@ -300,6 +351,9 @@ export function ensureResearchRunSpec(workspace: string, outputDir: string, patc
     downgradedGates: patch.downgradedGates ?? prev?.downgradedGates,
     searchCallsTotal: patch.searchCallsTotal ?? prev?.searchCallsTotal,
     searchNudgeMilestone: patch.searchNudgeMilestone ?? prev?.searchNudgeMilestone,
+    searchSignatures: patch.searchSignatures ?? prev?.searchSignatures,
+    duplicateSearchHits: patch.duplicateSearchHits ?? prev?.duplicateSearchHits,
+    searchCallsAtLastBuild: patch.searchCallsAtLastBuild ?? prev?.searchCallsAtLastBuild,
     createdAt: prev?.createdAt ?? Date.now(),
     updatedAt: Date.now(),
     transitions: patch.transitions ?? prev?.transitions ?? [],

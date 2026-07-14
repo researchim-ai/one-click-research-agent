@@ -21,9 +21,10 @@ import { screenshotPage } from './screenshot'
 import {
   addSourcesToCorpus, assignCorpusToPlan, fullTextStatus, listCorpus, listSelectedCorpus, loadCorpus, markCorpusItemRead,
   queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats, saveCorpus,
+  semanticQueryKey,
   type CorpusEntry,
 } from './corpus'
-import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
+import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, reconcileSelectedFromEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
 import { formatGateReport, formatGateResults, latestQualityGateFailure, readQualityGateSnapshot, runQualityGates, writeQualityGateSnapshot } from './quality-gates'
 import { applyGateEscapeValve, ensureResearchRunSpec } from './research-workflow'
 import { auditResearchRun, formatAuditResult } from './research-audit'
@@ -989,8 +990,17 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
       case 'audit_research_run':
         return formatAuditResult(auditResearchRun(workspace, { outputDir: args.output_dir, yearFrom: args.year_from, yearTo: args.year_to, minSelected: args.min_selected, minRead: args.min_read, minEvidence: args.min_evidence }))
       case 'screen_corpus': {
-        const storedKind = args.output_dir ? (ensureResearchRunSpec(workspace, args.output_dir).thresholds?.researchKind as string | undefined) : undefined
+        const storedSpec = args.output_dir ? ensureResearchRunSpec(workspace, args.output_dir) : undefined
+        const storedKind = storedSpec?.thresholds?.researchKind as string | undefined
         const screenKind = (args.research_kind === 'general' || args.research_kind === 'academic') ? args.research_kind : (storedKind || 'academic')
+        // For general/web research, feed the actual (typically English) search queries the
+        // agent ran into screening so cross-language sources are judged against the same
+        // vocabulary used to find them. Signatures are stored as `tool|query|...`.
+        const queryAugment = screenKind === 'general'
+          ? [...new Set((storedSpec?.searchSignatures || [])
+              .map((sig) => String(sig).split('|')[1] || '')
+              .filter((q) => q.trim()))]
+          : undefined
         // Capture the screening contract so build_corpus can re-apply it automatically and
         // never leave a backlog of unscreened raw items (the root cause of search loops).
         if (args.output_dir && args.question) {
@@ -1009,7 +1019,7 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
             })
           } catch {}
         }
-        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range, researchKind: screenKind }, args.output_dir)
+        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range, researchKind: screenKind, queryAugment }, args.output_dir)
       }
       case 'list_selected_corpus':
         return listSelectedCorpus(workspace, args.max_items, args.output_dir)
@@ -1115,8 +1125,13 @@ const ASYNC_ONLY_TOOLS = new Set([
   'recall_findings',
 ])
 
+// screen_corpus has BOTH a sync path (executeTool: pure lexical fallback, used by tests and
+// offline) and an async path (executeToolAsync: runs the language-agnostic LLM relevance pass
+// first, then the sync screening). Routing it as async lets the agent get semantic screening.
+const ASYNC_CAPABLE_TOOLS = new Set(['screen_corpus'])
+
 export function isAsyncTool(name: string): boolean {
-  return ASYNC_ONLY_TOOLS.has(name)
+  return ASYNC_ONLY_TOOLS.has(name) || ASYNC_CAPABLE_TOOLS.has(name)
 }
 
 export async function executeToolAsync(name: string, args: Record<string, any>, workspace: string, ctx?: { apiUrl?: string; temperature?: number }): Promise<string> {
@@ -1133,6 +1148,22 @@ export async function executeToolAsync(name: string, args: Record<string, any>, 
         return await exportReportTool(args.markdown_path, args.format, args.output_path, args.session_id, workspace)
       case 'recall_findings':
         return await recallFindingsAsync(workspace, args.query, args.max_results)
+      case 'screen_corpus': {
+        // Language-agnostic relevance: let the LLM score sources against the query (any
+        // language) and cache it on the corpus BEFORE the deterministic screening consumes it.
+        // Best-effort — if it scores nothing (no server / error) screening falls back to lexical.
+        if (args.output_dir && args.question) {
+          try {
+            await annotateSemanticRelevance(
+              workspace,
+              String(args.output_dir),
+              { question: String(args.question), subQuestions: Array.isArray(args.sub_questions) ? args.sub_questions.map(String) : undefined },
+              ctx?.apiUrl,
+            )
+          } catch {}
+        }
+        return executeTool(name, args, workspace)
+      }
       default:
         // Fallback to synchronous executor
         return executeTool(name, args, workspace)
@@ -1199,10 +1230,16 @@ function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefi
   let autoScreenNote = ''
   if (outputDir) {
     try {
-      const sp = ensureResearchRunSpec(workspace, outputDir).screenParams
+      const spec = ensureResearchRunSpec(workspace, outputDir)
+      const sp = spec.screenParams
       if (sp?.question) {
         const rawCount = loadCorpus(workspace, outputDir).filter((e) => !e.screeningStatus || e.screeningStatus === 'raw').length
         if (rawCount > 0) {
+          const queryAugment = sp.researchKind === 'general'
+            ? [...new Set((spec.searchSignatures || [])
+                .map((sig) => String(sig).split('|')[1] || '')
+                .filter((q) => q.trim()))]
+            : undefined
           screenCorpus(workspace, {
             question: sp.question,
             subQuestions: sp.subQuestions,
@@ -1212,6 +1249,7 @@ function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefi
             minSelected: sp.minSelected,
             strictDateRange: sp.strictDateRange,
             researchKind: sp.researchKind,
+            queryAugment,
           }, outputDir)
           autoScreenNote = `Auto-screened ${rawCount} newly added item(s) with the saved screening contract — no unscreened backlog remains. Do NOT keep searching to raise "selected"; read the selected items and extract evidence.`
         }
@@ -1390,7 +1428,11 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
     markCorpusItemRead(workspace, corpusId, entry.localPath, 'read', entry.readReason ?? 'reconciled from existing full-text file after rebuild', outputDir)
     return `Reconciled corpus ${corpusId}: existing full text at ${entry.localPath} re-marked as read (read state was out of sync after a corpus rebuild). Do not read it again; continue with full_text_status or run_quality_gates.`
   }
-  if (entry.readStatus === 'failed' && /\bHTTP\s*(?:403|404|410|451)\b/i.test(entry.readReason ?? '')) {
+  const hasStableOaLookupKey = Boolean(entry.doi || entry.openAccessUrl || entry.arxivId || extractArxivId(entry.url) || extractSemanticScholarId(entry.url) || extractOpenReviewId(entry.url))
+  const preResolvedScholarly = entry.readStatus === 'failed' && hasStableOaLookupKey
+    ? resolveScholarlyOaLocation(entry)
+    : null
+  if (entry.readStatus === 'failed' && /\bHTTP\s*(?:403|404|410|451)\b/i.test(entry.readReason ?? '') && !preResolvedScholarly) {
     return `Error: corpus item ${corpusId} already failed with a non-retriable fetch error (${entry.readReason}). Do not retry this id again; treat it as unavailable, run full_text_status, then run_quality_gates so the limitation is recorded.`
   }
   const baseDir = canonicalResearchOutputDir(outputDir)
@@ -1438,7 +1480,7 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   // open-access copy. Resolve it via identifiers / Semantic Scholar and download via the
   // proven arXiv pipeline (readable HTML) so surveys become real full-text evidence instead
   // of dragging down full_text_coverage / unread_top_sources.
-  const scholarly = resolveScholarlyOaLocation(entry)
+  const scholarly = preResolvedScholarly ?? resolveScholarlyOaLocation(entry)
   if (scholarly?.arxivId) {
     const htmlPath = path.join(fullTextDir, `${safeId}.html`)
     const html = downloadArxivHtml(scholarly.arxivId, htmlPath, workspace)
@@ -1453,13 +1495,23 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
       return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv PDF (${scholarly.arxivId}).\n${pdf}\nUpdated corpus ${corpusId}: read via PDF fallback.`
     }
   }
-  if (scholarly?.pdfUrl) {
-    const fetchedOa = fetchUrlTool(scholarly.pdfUrl, 'markdown', workspace)
+  if (scholarly?.textUrl) {
+    const fetchedOa = fetchUrlTool(scholarly.textUrl, 'markdown', workspace)
     if (!fetchedOa.startsWith('Error:') && fetchedContentLength(fetchedOa) >= MIN_FULLTEXT_CHARS) {
       fs.writeFileSync(target, fetchedOa, 'utf-8')
       const rel = path.relative(workspace, target)
-      markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access copy recovered via Semantic Scholar/OpenReview (publisher page was not scrapeable)', outputDir)
+      markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access full text recovered via OpenAlex (publisher page was not scrapeable)', outputDir)
       return `Direct fetch of ${entry.url} returned no readable content; recovered open-access copy to ${rel} (${fetchedContentLength(fetchedOa)} chars).\nUpdated corpus ${corpusId}: read.`
+    }
+  }
+  const oaPdfUrls = [...new Set([scholarly?.pdfUrl, ...(scholarly?.pdfUrls ?? [])].filter(Boolean) as string[])]
+  for (const [index, pdfUrl] of oaPdfUrls.entries()) {
+    const pdfPath = resolvePath(path.join(fullTextDir, `${safeId}${index ? `-${index + 1}` : ''}.pdf`), workspace)
+    const parsed = downloadAndParseOaPdf(pdfUrl, pdfPath, target, entry.title, entry.url, workspace)
+    if (!parsed.startsWith('Error:')) {
+      const rel = path.relative(workspace, target)
+      markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access PDF recovered and parsed via OpenAlex/Semantic Scholar/OpenReview', outputDir)
+      return `Direct fetch of ${entry.url} returned no readable content; ${parsed}\nUpdated corpus ${corpusId}: read.`
     }
   }
 
@@ -1795,6 +1847,118 @@ function callLocalChat(system: string, user: string, opts: { maxTokens?: number;
   }
 }
 
+/**
+ * Async, fetch-based chat call (no subprocess). Used by the semantic screening pass which
+ * runs inside an already-async tool handler and issues several calls per screen.
+ */
+async function callLocalChatAsync(apiUrl: string, system: string, user: string, opts: { maxTokens?: number; timeoutMs?: number } = {}): Promise<string> {
+  if (process.env.VITEST) return ''
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60000)
+  try {
+    const res = await fetch(`${apiUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'local',
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        temperature: 0,
+        max_tokens: opts.maxTokens ?? 800,
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+      signal: controller.signal,
+    })
+    if (!res.ok) return ''
+    const json: any = await res.json()
+    return String(json?.choices?.[0]?.message?.content || '')
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/```[a-z]*\n?|```/gi, '')
+      .trim()
+  } catch {
+    return ''
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const SEMANTIC_SCREEN_SYSTEM = [
+  'You are a strict, multilingual research-screening assistant.',
+  'You understand every language equally well. Judge each source purely by MEANING, never by whether it shares literal words with the query — the query and the sources may be written in different languages, and that must not lower the score.',
+  'For each candidate, rate how relevant it is to the research question and sub-questions based on its title and snippet.',
+  'Scoring rubric (0–100): 80–100 = directly about the research subject and clearly useful; 45–79 = related or partially relevant; 15–44 = only tangentially related; 0–14 = off-topic / unrelated.',
+  'Return ONLY compact JSON: {"scores":[{"id":"<id>","score":<int 0-100>,"on_topic":<true|false>}]}. Include every id exactly once. No prose.',
+].join('\n')
+
+/**
+ * Language-agnostic relevance annotation. Asks the local LLM to score each not-yet-scored
+ * corpus source against the research query, in ANY language, and caches the score on the
+ * corpus entry (bound to the query via semanticQueryKey). Best-effort: on any failure it
+ * leaves entries unscored so screen_corpus falls back to the lexical heuristic. Returns the
+ * number of entries scored.
+ */
+async function annotateSemanticRelevance(
+  workspace: string,
+  outputDir: string,
+  opts: { question: string; subQuestions?: string[] },
+  apiUrl?: string,
+): Promise<number> {
+  if (process.env.VITEST) return 0
+  const question = String(opts.question || '').trim()
+  if (!question) return 0
+  const base = (apiUrl && apiUrl.trim()) || 'http://127.0.0.1:7863'
+  const queryKey = semanticQueryKey(question, opts.subQuestions)
+  const corpus = loadCorpus(workspace, outputDir)
+  // Score everything not already scored for this exact query, skipping manual rejections.
+  const todo = corpus.filter((e) => e.pinnedStatus !== 'rejected' && e.semanticQueryKey !== queryKey)
+  if (todo.length === 0) return 0
+
+  const subQ = (opts.subQuestions || []).filter((s) => String(s).trim()).slice(0, 8)
+  const header = [
+    `Research question: ${question}`,
+    subQ.length ? `Sub-questions:\n${subQ.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n')
+
+  const BATCH = 20
+  const DEADLINE = Date.now() + 240000
+  const byId = new Map(corpus.map((e) => [e.id, e]))
+  let scored = 0
+
+  for (let i = 0; i < todo.length; i += BATCH) {
+    if (Date.now() > DEADLINE) break
+    const batch = todo.slice(i, i + BATCH)
+    const lines = batch.map((e) => {
+      const title = cleanReportTitle(e.title).replace(/\s+/g, ' ').slice(0, 220)
+      const snip = String(e.snippet || '').replace(/\s+/g, ' ').slice(0, 300)
+      return `id=${e.id} | title: ${title}${snip ? ` | snippet: ${snip}` : ''}`
+    }).join('\n')
+    const user = `${header}\n\nCandidates:\n${lines}`
+    const out = await callLocalChatAsync(base, SEMANTIC_SCREEN_SYSTEM, user, {
+      maxTokens: Math.min(2000, 120 + batch.length * 40),
+      timeoutMs: 60000,
+    })
+    if (!out) continue
+    const start = out.indexOf('{')
+    const end = out.lastIndexOf('}')
+    if (start < 0 || end <= start) continue
+    let parsed: any
+    try { parsed = JSON.parse(out.slice(start, end + 1)) } catch { continue }
+    const rows = Array.isArray(parsed?.scores) ? parsed.scores : []
+    for (const row of rows) {
+      const entry = byId.get(String(row?.id))
+      if (!entry) continue
+      const raw = Number(row?.score)
+      if (!Number.isFinite(raw)) continue
+      entry.semanticRelevanceScore = Math.max(0, Math.min(100, Math.round(raw)))
+      entry.semanticOnTopic = typeof row?.on_topic === 'boolean' ? row.on_topic : entry.semanticRelevanceScore >= 45
+      entry.semanticQueryKey = queryKey
+      entry.updatedAt = Date.now()
+      scored++
+    }
+  }
+  if (scored > 0) saveCorpus(workspace, [...byId.values()], outputDir)
+  return scored
+}
+
 function parseJsonStringMap(text: string): Record<string, string> {
   const raw = String(text || '')
   const start = raw.indexOf('{')
@@ -1949,6 +2113,11 @@ ${evidence}`
 }
 
 export function composeSynthesisReport(workspace: string, title: string, outputDir: string | undefined, ru: boolean): string {
+  // Guarantee the report presents every source that was read and grounded a supported
+  // claim, even if heuristic screening under-selected it (e.g. cross-language general/web
+  // runs). Without this the report could show "0 read sources" while displaying evidence
+  // extracted from them.
+  reconcileSelectedFromEvidence(workspace, outputDir)
   const corpus = loadCorpus(workspace, outputDir)
   const selected = corpus.filter((e) => e.screeningStatus === 'selected')
   const read = selected.filter((e) => e.readStatus === 'read' || e.status === 'read')
@@ -3404,6 +3573,56 @@ fetch(url, {
   return `Downloaded arXiv PDF ${normalizedId} to ${path.relative(workspace, targetPath) || targetPath} (${byteCount} bytes)`
 }
 
+function downloadAndParseOaPdf(
+  pdfUrl: string,
+  pdfPath: string,
+  markdownPath: string,
+  title: string,
+  sourceUrl: string,
+  workspace: string,
+): string {
+  if (!/^https?:\/\//i.test(pdfUrl)) return 'Error: invalid open-access PDF URL.'
+  assertInWorkspace(pdfPath, workspace)
+  assertInWorkspace(markdownPath, workspace)
+  fs.mkdirSync(path.dirname(pdfPath), { recursive: true })
+  const script = `
+${fetchWithTimeoutSnippet(60000)}
+;(async () => {
+  const r = await fetch(process.argv[1], {
+    headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/pdf' },
+    signal: __abortSignal,
+  })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  const bytes = Buffer.from(await r.arrayBuffer())
+  if (bytes.length < 1000 || bytes.subarray(0, 5).toString() !== '%PDF-') throw new Error('response is not a readable PDF')
+  require('fs').writeFileSync(process.argv[2], bytes)
+  process.stdout.write(String(bytes.length))
+})().catch((err) => { console.error(__fetchErr(err)); process.exit(1) }).finally(() => clearTimeout(__timer))
+`
+  let byteCount = 0
+  try {
+    byteCount = Number(runNodeScript(script, [pdfUrl, pdfPath], 70000).trim()) || fs.statSync(pdfPath).size
+    const parsed = parseDocument(pdfPath)
+    if (parsed.text.trim().length < MIN_FULLTEXT_CHARS) throw new Error(`PDF text extraction returned only ${parsed.text.trim().length} chars`)
+    const document = [
+      `# ${title}`,
+      '',
+      `Source: ${sourceUrl}`,
+      `Open-access PDF: ${pdfUrl}`,
+      `Pages: ${parsed.pages ?? 'unknown'}`,
+      '',
+      '---',
+      '',
+      parsed.text,
+    ].join('\n')
+    fs.writeFileSync(markdownPath, document, 'utf-8')
+    return `downloaded and parsed open-access PDF to ${path.relative(workspace, markdownPath)} (${byteCount} bytes, ${parsed.text.length} text chars).`
+  } catch (e: any) {
+    try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath) } catch {}
+    return `Error: open-access PDF recovery failed. ${String(e?.stderr || e?.message || e).trim()}`
+  }
+}
+
 function editFile(filePath: string, oldStr: string, newStr: string, workspace: string): string {
   const p = resolvePath(filePath, workspace)
   assertInWorkspace(p, workspace)
@@ -4162,6 +4381,29 @@ ${httpGetSnippet()}
   return { arxivId, pdfUrl }
 }
 
+function openAlexLookupOA(doi?: string): { pdfUrls?: string[]; textUrl?: string } | null {
+  const clean = String(doi || '').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '').trim()
+  if (!clean) return null
+  const endpoint = `https://api.openalex.org/works/https://doi.org/${encodeURIComponent(clean)}`
+  const script = `
+${httpGetSnippet()}
+;(async () => {
+  const r = await __httpGet(process.argv[1], { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
+  if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
+  process.stdout.write(r.text)
+})().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
+`
+  let work: any
+  try { work = JSON.parse(runNodeScript(script, [endpoint], 30000)) } catch { return null }
+  const textUrl = work?.content_urls?.grobid_xml ? String(work.content_urls.grobid_xml) : undefined
+  const pdfUrls = [...new Set([
+    work?.best_oa_location?.pdf_url,
+    work?.primary_location?.pdf_url,
+    work?.content_urls?.pdf,
+  ].filter(Boolean).map(String))]
+  return textUrl || pdfUrls.length ? { textUrl, pdfUrls } : null
+}
+
 /**
  * Recover an open-access location for scholarly (CS/ML/general academic) sources that the
  * biomedical Europe PMC path misses. The corpus often stores a non-scrapeable landing URL
@@ -4170,12 +4412,22 @@ ${httpGetSnippet()}
  * hosts an OA copy of most such papers, so resolve an arXiv id (or any OA PDF) from the
  * paper's identifiers or Semantic Scholar and return it for the caller to download.
  */
-function resolveScholarlyOaLocation(entry: { url: string; doi?: string; arxivId?: string; title?: string }): { arxivId?: string; pdfUrl?: string } | null {
+function resolveScholarlyOaLocation(entry: { url: string; doi?: string; arxivId?: string; title?: string; openAccessUrl?: string }): { arxivId?: string; pdfUrl?: string; pdfUrls?: string[]; textUrl?: string } | null {
   // 1. arXiv id already derivable from the stored URL / DOI — no network needed.
   const directArxiv = entry.arxivId || extractArxivId(entry.url) || extractArxivDoi(entry.doi)
   if (directArxiv) return { arxivId: directArxiv }
 
-  // 2. Ask Semantic Scholar for an OA location using the most specific id available.
+  // 2. Keep the direct OA URL emitted by OpenAlex discovery, or recover OpenAlex's
+  // content mirror by DOI. The latter remains available when publisher anti-bot pages do not.
+  const openAlex = openAlexLookupOA(entry.doi)
+  if (entry.openAccessUrl || openAlex) {
+    return {
+      textUrl: openAlex?.textUrl,
+      pdfUrls: [...new Set([entry.openAccessUrl, ...(openAlex?.pdfUrls ?? [])].filter(Boolean) as string[])],
+    }
+  }
+
+  // 3. Ask Semantic Scholar for an OA location using the most specific id available.
   const s2Id = extractSemanticScholarId(entry.url)
   const idQuery = s2Id
     ? s2Id
@@ -4189,7 +4441,7 @@ function resolveScholarlyOaLocation(entry: { url: string; doi?: string; arxivId?
   const s2 = idQuery ? semanticScholarLookupOA(idQuery) : null
   if (s2) return s2
 
-  // 3. OpenReview forum → its PDF endpoint is a direct, scrapeable OA copy.
+  // 4. OpenReview forum → its PDF endpoint is a direct, scrapeable OA copy.
   const orId = extractOpenReviewId(entry.url)
   if (orId) return { pdfUrl: `https://openreview.net/pdf?id=${orId}` }
   return null

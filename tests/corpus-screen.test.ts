@@ -3,7 +3,7 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import { executeTool } from '../electron/tools'
-import { loadCorpus } from '../electron/corpus'
+import { loadCorpus, screenCorpus, semanticQueryKey } from '../electron/corpus'
 
 let ws: string
 const OUT = '.research/run'
@@ -126,6 +126,79 @@ describe('screen_corpus min_selected soft floor', () => {
       expect(off.screeningStatus).toBe('rejected')
     }
     expect(corpus.filter((e) => e.id.startsWith('g') && e.screeningStatus === 'selected').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('selects cross-language general sources using the executed English search queries', () => {
+    // Real failure: a Russian question over English web pages drove topical precision to
+    // ~40 for genuinely on-topic sources, so screen_corpus selected almost nothing and the
+    // agent looped re-screening. Folding the English search queries the agent actually ran
+    // into the vocabulary must let those English pages be selected, while off-topic pages
+    // (a flat in a different city) stay out.
+    const en = (id: string, title: string) => ({ ...raw(id, title), url: `https://example.com/${id}`, arxivId: undefined })
+    writeCorpus([
+      en('e1', 'Singapore Private Property Market: 2025 Review and 2026 Outlook'),
+      en('e2', 'Singapore HDB resale flat prices 2024 2025 median by town'),
+      en('e3', 'Singapore condo price per square foot 2024 2025 residential market'),
+      { ...raw('off1', 'Купить квартиру на улице Кочетова (Чайковский)'), url: 'https://example.com/off1', arxivId: undefined },
+    ])
+
+    const augment = [
+      'singapore housing prices 2024 2025 hdb condo average cost',
+      'singapore property market trends price growth regional differences',
+      'singapore hdb resale flat prices median by town district',
+    ]
+    // Without the English augment the on-topic English pages are under-selected.
+    screenCorpus(ws, {
+      question: 'Какова стоимость квартир в Сингапуре в 2024–2026 годах?',
+      researchKind: 'general',
+      minSelected: 3,
+    }, OUT)
+    const before = loadCorpus(ws, OUT).filter((e) => e.id.startsWith('e') && e.screeningStatus === 'selected').length
+
+    screenCorpus(ws, {
+      question: 'Какова стоимость квартир в Сингапуре в 2024–2026 годах?',
+      researchKind: 'general',
+      minSelected: 3,
+      queryAugment: augment,
+    }, OUT)
+    const corpus = loadCorpus(ws, OUT)
+    const selectedEn = corpus.filter((e) => e.id.startsWith('e') && e.screeningStatus === 'selected').length
+
+    expect(selectedEn).toBeGreaterThan(before)
+    expect(selectedEn).toBeGreaterThanOrEqual(3)
+    expect(corpus.find((e) => e.id === 'off1')?.screeningStatus).not.toBe('selected')
+  })
+
+  it('uses the cached LLM semantic score as topical relevance regardless of language', () => {
+    // The whole point of language-agnosticism: an English source under a Russian question is
+    // selected purely on the LLM-judged semantic score, with ZERO shared tokens. And a source
+    // the LLM marked off-topic is rejected even if it happens to share query words.
+    const question = 'Какова стоимость квартир в Сингапуре в 2024–2026 годах?'
+    const key = semanticQueryKey(question, [])
+    writeCorpus([
+      // English, no token overlap with the Russian question, but LLM says highly on-topic.
+      { ...raw('e1', 'Singapore Private Property Market: 2025 Review and 2026 Outlook'), arxivId: undefined, url: 'https://x/e1', semanticRelevanceScore: 88, semanticOnTopic: true, semanticQueryKey: key },
+      { ...raw('e2', 'Singapore HDB resale flat prices 2024 2025 median by town'), arxivId: undefined, url: 'https://x/e2', semanticRelevanceScore: 82, semanticOnTopic: true, semanticQueryKey: key },
+      // Shares the Russian word "квартир" but the LLM judged it off-topic (different city).
+      { ...raw('o1', 'Купить квартиру на улице Кочетова в Чайковском'), arxivId: undefined, url: 'https://x/o1', semanticRelevanceScore: 8, semanticOnTopic: false, semanticQueryKey: key },
+    ])
+
+    screenCorpus(ws, { question, researchKind: 'general', minSelected: 2 }, OUT)
+    const corpus = loadCorpus(ws, OUT)
+
+    expect(corpus.find((e) => e.id === 'e1')?.screeningStatus).toBe('selected')
+    expect(corpus.find((e) => e.id === 'e2')?.screeningStatus).toBe('selected')
+    expect(corpus.find((e) => e.id === 'o1')?.screeningStatus).toBe('rejected')
+  })
+
+  it('ignores a stale semantic score cached for a DIFFERENT query (falls back to lexical)', () => {
+    // A cached score bound to another question must not leak into an unrelated screen.
+    writeCorpus([
+      { ...raw('g1', 'Reinforcement learning for LLM alignment with RLHF and DPO'), semanticRelevanceScore: 5, semanticOnTopic: false, semanticQueryKey: 'some-other-query-key' },
+    ])
+    executeTool('screen_corpus', { question: 'reinforcement learning LLM', output_dir: OUT }, ws)
+    // The stale 5 must be ignored; lexical relevance selects the clearly on-topic paper.
+    expect(loadCorpus(ws, OUT).find((e) => e.id === 'g1')?.screeningStatus).toBe('selected')
   })
 
   it('keeps manually rejected items rejected across a later re-screen (sticky reject)', () => {

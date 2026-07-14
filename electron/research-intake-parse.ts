@@ -70,9 +70,19 @@ export interface ResearchIntakeInferInput {
   draft?: Record<string, any>
   appLanguage?: 'ru' | 'en'
   profiles?: Array<{ id: string; label?: string; domain?: string }>
+  /** Today's date (YYYY-MM-DD). Injected so the model can resolve RELATIVE windows
+   * ("last week", "за последний месяц") instead of guessing a stale year. */
+  currentDate?: string
 }
 
-const INTAKE_SYSTEM_PROMPT = [
+/** Today's date as YYYY-MM-DD (UTC), used as the default anchor for relative ranges. */
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function buildIntakeSystemPrompt(currentDate: string): string {
+  return [
+  `Today's date is ${currentDate} (YYYY-MM-DD). Treat this as "now" for every relative time expression; NEVER assume a different or past year.`,
   'You are the parameter planner for a research-run UI. You are the ONLY component that fills these parameters — there is no fallback keyword/regex parser, so analyze the user request carefully and return complete, sensible values.',
   'Return ONLY compact JSON with a top-level "patch" object. No prose, no markdown, no code fences.',
   'Allowed patch keys: topic, profileId, researchKind, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
@@ -82,7 +92,12 @@ const INTAKE_SYSTEM_PROMPT = [
   ' Use "general" for everyday / consumer / how-to / product / shopping / pricing / market-price / local-info / news topics that just need web sources, even if the topic brushes a domain like finance or biology. General examples: "сколько стоят квартиры в Магадане" → general; "какой ноутбук купить" → general; "как настроить роутер" → general; "цены на недвижимость" → general. The "general" kind relaxes academic-only gates and prioritizes web sources.',
   ' Decide academic vs general from the user INTENT (do they want scientific literature, or practical/consumer web info?), not from a single keyword. researchKind and profileId must be consistent: academic ↔ a domain profile; general ↔ universal.',
   'Allowed modes: quick, deep, systematic, reproduction, idea-scout. Pick the mode that matches the requested depth/rigor; default to deep, use systematic for "обзор/review/строго", quick for "быстро/кратко".',
-  'Allowed dateRange: any, last-year, last-2-years, since-2024, custom. Use custom + customDateRange "YYYY-01-01..YYYY-12-31" when the user gives explicit years. Set strictDateRange true unless the user allows any period.',
+  'Allowed dateRange: any, last-year, last-2-years, since-2024, custom.',
+  ` DATE HANDLING (compute everything from today = ${currentDate}):`,
+  '  • Sub-year / recent windows — "last week / за последнюю неделю / свежее за неделю", "last month / за месяц", "last N days", "last quarter", "за последние полгода", or any span shorter than a full year — MUST use dateRange "custom" with customDateRange as an EXACT day range "YYYY-MM-DD..YYYY-MM-DD" computed relative to today. Examples given today: "последняя неделя" → the 7 days ending today; "последний месяц" → the ~30 days ending today; "за 3 дня" → the 3 days ending today. The end date is today unless the user says otherwise.',
+  '  • Explicit whole years ("за 2024", "2023-2025") → dateRange "custom" with "YYYY-01-01..YYYY-12-31" spanning those years.',
+  '  • Coarse relative year windows map to the enum: "за последний год" → last-year; "за 2 года / последние пару лет" → last-2-years; "с 2024" → since-2024. "любой период / без ограничений" → any.',
+  '  • NEVER emit a stale/guessed year (e.g. 2024) for a request that is relative to now — always anchor to today\'s date above. Set strictDateRange true unless the user allows any period.',
   'Allowed reportLanguage: ru, en. Infer from the user request; otherwise use appLanguage.',
   'Meaning of numeric keys: maxSources = how many papers/sources to discover and build the corpus from (the raw cap). minSelectedSources = minimum papers kept after screening. minFullTextReads = minimum papers read in full.',
   'ALWAYS include researchKind, maxSources, minSelectedSources, minFullTextReads in the patch. If the user gives no count, pick reasonable values for the chosen profile/mode (e.g. ML/AI systematic ≈ maxSources 40). An explicit user number ALWAYS overrides profile defaults. Do NOT confuse a count with a year ("2024") or a time span ("2 года").',
@@ -94,11 +109,15 @@ const INTAKE_SYSTEM_PROMPT = [
   'Always set a topic from the user request unless they truly gave none; strip meta words like counts/dates/language from the topic itself.',
   'Checkpoints control where the run PAUSES for the user. This is auto-research: default checkpoints to ["plan"] (approve the plan, then run autonomously to report.md). Only add "corpus", "evidence" or "report" if the user explicitly asks to review that phase. If the user asks for fully autonomous / no pauses, use [].',
   'Preserve currentDraft values the user did not change.',
-].join('\n')
+  ].join('\n')
+}
 
 // Builds the exact /v1/chat/completions request body used for LLM-driven intake.
 // Shared by the runtime (main.ts) and the live integration test so they cannot drift.
 export function buildResearchIntakeRequestBody(input: ResearchIntakeInferInput): Record<string, any> {
+  const currentDate = input.currentDate && /^\d{4}-\d{2}-\d{2}$/.test(input.currentDate)
+    ? input.currentDate
+    : todayIso()
   return {
     model: 'local',
     temperature: 0.1,
@@ -108,13 +127,14 @@ export function buildResearchIntakeRequestBody(input: ResearchIntakeInferInput):
     response_format: { type: 'json_object' },
     chat_template_kwargs: { enable_thinking: false },
     messages: [
-      { role: 'system', content: INTAKE_SYSTEM_PROMPT },
+      { role: 'system', content: buildIntakeSystemPrompt(currentDate) },
       {
         role: 'user',
         content: JSON.stringify({
           message: input.message,
           currentDraft: input.draft ?? {},
           appLanguage: input.appLanguage ?? 'ru',
+          currentDate,
           profiles: input.profiles ?? [],
         }),
       },

@@ -108,7 +108,9 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     setter(items.includes(value) ? items.filter((x) => x !== value) : [...items, value])
   }
 
-  const canStart = topic.trim().length > 2 && !busy
+  // The only requirement is that the user actually typed a topic — take it verbatim,
+  // short or long. No length rules, no parsing.
+  const canStart = topic.trim() !== '' && !busy
   const draftReady = missingResearchFields(draft).length === 0 && !busy
 
   const submit = () => {
@@ -227,6 +229,12 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
       assistantOverride = appLanguage === 'ru'
         ? `Не удалось разобрать запрос моделью${llmError ? ` (${llmError})` : ''}. Записал текст как тему — уточни остальные параметры в диалоге или открой ручной режим.`
         : `The model could not analyze the request${llmError ? ` (${llmError})` : ''}. I saved the text as the topic — refine the rest in the dialog or open manual mode.`
+    }
+    // Safety net: the FIRST substantive message always establishes a topic. If the model
+    // returned a patch (e.g. only a date range) but no topic and we don't have one yet,
+    // capture the raw message as the topic instead of re-asking "what should we research?".
+    if (!draft.topic.trim() && !patch.topic) {
+      patch = { ...patch, topic: text }
     }
     mergeDraft(patch, text, assistantOverride)
     setIntakeBusy(false)

@@ -55,7 +55,10 @@ export function applyResearchIntakePatch(base: NewResearchRequest, patch: Resear
 
 export function missingResearchFields(request: NewResearchRequest): string[] {
   const missing: string[] = []
-  if (!request.topic.trim() || request.topic.trim().length < 3) missing.push('topic')
+  // A topic just needs to be non-empty. Valid research topics are often 2-char acronyms
+  // ("RL", "AI", "ML"), so requiring 3+ chars wrongly re-asked for a topic the user already
+  // gave (e.g. "RL за последний месяц" → the model correctly extracts topic "RL").
+  if (!request.topic.trim()) missing.push('topic')
   if (!request.reportLanguage) missing.push('reportLanguage')
   if (request.dateRange === 'custom' && !request.customDateRange.trim()) missing.push('customDateRange')
   return missing

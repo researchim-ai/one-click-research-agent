@@ -130,6 +130,7 @@ async function inferResearchRequest(payload: any): Promise<{ patch?: Record<stri
         draft,
         appLanguage: (payload?.appLanguage ?? config.get('appLanguage')) as 'ru' | 'en',
         profiles,
+        currentDate: new Date().toISOString().slice(0, 10),
       })),
     })
     if (!res.ok) return { error: `HTTP ${res.status}` }

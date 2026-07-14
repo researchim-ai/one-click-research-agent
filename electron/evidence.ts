@@ -2,7 +2,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import { getSourceTracker } from './sources'
-import { loadCorpus } from './corpus'
+import { loadCorpus, saveCorpus } from './corpus'
 import { resolveResearchDir } from '../research-paths'
 
 export interface EvidenceClaim {
@@ -75,6 +75,44 @@ function normalizeEvidenceClaim(row: EvidenceClaim): EvidenceClaim {
       ? supportedStatus(support, sourceIdxs, corpusIds, sourceUrls)
       : row.status,
   }
+}
+
+/**
+ * Enforce the invariant: a corpus source that was actually READ and is cited by at least
+ * one SUPPORTED evidence claim must be part of the `selected` set. Screening is a heuristic
+ * pre-filter and can under-select — most notably for general (web) research where a
+ * cross-language query (e.g. a Russian question over English web pages) drives topical
+ * precision below the selection threshold, leaving `selected = 0`. Without this, the pipeline
+ * can read sources, extract grounded evidence, and still render an EMPTY report (0 selected →
+ * 0 presented), which is exactly the "info collected but 0 read sources" symptom.
+ *
+ * We only promote sources the agent genuinely read AND grounded a supported claim in, so we
+ * never inject unread/off-topic noise. Manually pinned rejections are always respected.
+ * Returns the number of newly promoted sources.
+ */
+export function reconcileSelectedFromEvidence(workspace: string, outputDir?: string): number {
+  const evidenced = new Set<string>()
+  for (const claim of loadEvidence(workspace, outputDir)) {
+    if (claim.status !== 'supported') continue
+    for (const cid of claim.corpusIds || []) if (cid) evidenced.add(cid)
+  }
+  if (evidenced.size === 0) return 0
+  const corpus = loadCorpus(workspace, outputDir)
+  let promoted = 0
+  for (const entry of corpus) {
+    const isRead = entry.readStatus === 'read' || entry.status === 'read'
+    if (!isRead) continue
+    if (!evidenced.has(entry.id)) continue
+    if (entry.pinnedStatus === 'rejected') continue
+    if (entry.screeningStatus === 'selected') continue
+    entry.screeningStatus = 'selected'
+    if (!entry.readPriority || entry.readPriority === 'low') entry.readPriority = 'medium'
+    entry.screeningReason = `Auto-selected: read and cited by supported evidence. ${entry.screeningReason ?? ''}`.trim()
+    entry.updatedAt = Date.now()
+    promoted++
+  }
+  if (promoted > 0) saveCorpus(workspace, corpus, outputDir)
+  return promoted
 }
 
 export function saveEvidence(workspace: string, rows: EvidenceClaim[], outputDir?: string): void {

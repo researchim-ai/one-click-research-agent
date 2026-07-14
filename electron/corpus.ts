@@ -9,6 +9,7 @@ export interface CorpusEntry {
   id: string
   title: string
   url: string
+  openAccessUrl?: string
   doi?: string
   arxivId?: string
   pmid?: string
@@ -35,6 +36,18 @@ export interface CorpusEntry {
   recencyScore?: number
   authorityScore?: number
   topicalPrecisionScore?: number
+  /**
+   * Language-agnostic topical relevance (0–100) judged by the LLM, which reads the query and
+   * the source in ANY language. This is the primary relevance signal when present: it replaces
+   * the brittle lexical token-overlap heuristic that failed whenever the query language differed
+   * from the source language (e.g. a Russian question over English web pages selected nothing).
+   * `semanticQueryKey` binds the score to the exact question+sub-questions it was computed for,
+   * so a re-screen for the same query reuses the cached score (free + deterministic) and a
+   * changed query invalidates it.
+   */
+  semanticRelevanceScore?: number
+  semanticOnTopic?: boolean
+  semanticQueryKey?: string
   readPriority?: 'high' | 'medium' | 'low'
   subQuestions?: string[]
   readStatus?: 'not_read' | 'queued' | 'read' | 'failed'
@@ -87,6 +100,16 @@ export interface CorpusScreenOptions {
    * gate actually filters off-topic pages for non-academic / non-ML topics.
    */
   researchKind?: 'general' | 'academic' | string
+  /**
+   * Extra topical vocabulary to fold into relevance/precision for GENERAL (web) research
+   * only. In practice these are the English search queries the agent actually ran. The user
+   * question is often in another language (e.g. Russian) than the English web pages it finds,
+   * so matching sources against the Russian question alone drives topical precision to near
+   * zero and nothing gets selected. Matching against the same English vocabulary used to find
+   * the sources makes screening language-robust. Ignored for academic research to keep the
+   * science pipeline byte-for-byte unchanged.
+   */
+  queryAugment?: string[]
 }
 
 /**
@@ -97,6 +120,20 @@ export interface CorpusScreenOptions {
  * topical_precision gate genuinely passable by re-screening instead of only via downgrade.
  */
 export const MIN_SELECTABLE_TOPICAL_PRECISION = 45
+
+/**
+ * Stable cache key for a screening query (question + sub-questions), language- and
+ * order-normalized. Used to bind a cached semantic relevance score to the exact query it was
+ * computed for, so re-screening the same query is free and changing the query invalidates it.
+ */
+export function semanticQueryKey(question: string, subQuestions?: string[]): string {
+  const norm = [String(question || ''), ...((subQuestions || []).map(String))]
+    .join(' ¶ ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+  return crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16)
+}
 
 function researchDir(workspace: string, outputDir?: string): string {
   return resolveResearchDir(workspace, outputDir)
@@ -208,6 +245,7 @@ export function sourceToCorpusEntry(source: Source | Omit<Source, 'idx'>, tags: 
     id,
     title: source.title,
     url: source.url,
+    openAccessUrl: source.openAccessUrl,
     doi,
     arxivId,
     pmid,
@@ -404,14 +442,19 @@ export function isReviewLike(entry: Pick<CorpusEntry, 'publicationType' | 'title
  */
 function genericTopicPrecisionFor(entry: CorpusEntry, queryText: string): { score: number; blockers: string[] } {
   const text = `${entry.title} ${entry.snippet ?? ''}`.toLowerCase()
-  const terms = [...new Set(tokenizeQuery(queryText))]
+  // Match on distinctive content words only: drop pure numbers (bare years like 2024/2025
+  // otherwise let a date-only page look on-topic) and 1–2 char tokens.
+  const terms = [...new Set(tokenizeQuery(queryText))].filter((t) => t.length >= 3 && !/^\d+$/.test(t))
   if (terms.length === 0) return { score: 60, blockers: [] }
   const hits = terms.filter((t) => text.includes(t)).length
-  const coverage = hits / terms.length
   if (hits === 0) {
     return { score: 8, blockers: ['Off-topic: none of the query terms appear in the source title/snippet'] }
   }
-  const score = Math.max(0, Math.min(100, Math.round(35 + coverage * 80)))
+  // Saturating count, NOT coverage-over-vocabulary: a handful of distinct topical hits is
+  // enough to be clearly on-topic. Dividing by the full vocabulary size (as before) meant a
+  // large or cross-language query vocabulary pushed every source below the selection floor,
+  // so nothing was ever selected — the "0 selected / screen_corpus loop" symptom.
+  const score = Math.max(0, Math.min(100, 30 + hits * 12))
   return { score, blockers: [] }
 }
 
@@ -442,7 +485,7 @@ function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?:
   return { score: Math.max(0, Math.min(100, score)), blockers }
 }
 
-function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string, researchKind?: string): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
+function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string, researchKind?: string, semanticScore?: number): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
   const text = `${entry.title} ${entry.snippet ?? ''} ${entry.authors ?? ''}`.toLowerCase()
   const matched = [...new Set(terms.filter((t) => text.includes(t)))]
   const rlBoost = ['reinforcement', 'learning', 'rl', 'rlhf', 'dpo', 'ppo', 'reward', 'policy', 'q-learning', 'offline', 'safe', 'robot', 'marl', 'agent', 'verifiable'].filter((t) => text.includes(t))
@@ -452,6 +495,19 @@ function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[
     .sort((a, b) => b.hits - a.hits)
     .slice(0, 3)
     .map((x) => x.id)
+  // Language-agnostic path: when the LLM has judged this source against the query, that score
+  // IS the topical relevance — no token overlap required, so it works across any language pair.
+  // The lexical heuristic below is only the offline fallback (no server / not yet scored).
+  if (typeof semanticScore === 'number' && Number.isFinite(semanticScore)) {
+    const sem = Math.max(0, Math.min(100, Math.round(semanticScore)))
+    return {
+      score: sem,
+      matched,
+      subQs: subQs.length ? subQs : subQuestions.map((_, i) => `Q${i + 1}`).slice(0, 3),
+      topicalPrecision: sem,
+      blockers: sem < 30 ? ['Semantically off-topic for the research question (LLM-judged)'] : [],
+    }
+  }
   const precision = topicPrecisionFor(entry, queryText, researchKind)
   return {
     score: Math.min(100, matched.length * 7 + rlBoost.length * 8 + subQs.length * 8 + Math.round(precision.score * 0.25)),
@@ -485,14 +541,26 @@ function authorityFor(entry: CorpusEntry): number {
 export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outputDir?: string): string {
   const entries = loadCorpus(workspace, outputDir)
   if (entries.length === 0) return 'Corpus is empty. Build corpus before screening.'
-  const queryText = [opts.question, ...(opts.subQuestions || [])].join(' ')
+  // Fold the executed (English) search queries into the vocabulary for GENERAL research so
+  // screening is robust when the user question language differs from the source language.
+  // Academic screening is intentionally left untouched.
+  const augment = String(opts.researchKind || 'academic') === 'general' && Array.isArray(opts.queryAugment)
+    ? opts.queryAugment.filter((s) => typeof s === 'string' && s.trim())
+    : []
+  const queryText = [opts.question, ...(opts.subQuestions || []), ...augment].join(' ')
   const terms = tokenizeQuery(queryText)
+  // Language-agnostic relevance: use the LLM-judged score cached for THIS exact query, if any.
+  const currentQueryKey = semanticQueryKey(opts.question, opts.subQuestions)
+  const semanticFor = (entry: CorpusEntry): number | undefined =>
+    entry.semanticQueryKey === currentQueryKey && typeof entry.semanticRelevanceScore === 'number'
+      ? entry.semanticRelevanceScore
+      : undefined
   const minSelected = opts.minSelected && opts.minSelected > 0 ? Math.min(200, Math.trunc(opts.minSelected)) : 0
   // The requested floor must be able to raise the cap: if the user asked for ≥50 but
   // max_selected defaulted to 30, the cap would otherwise silently limit selection.
   const maxSelected = Math.max(Math.max(1, Math.min(200, Number(opts.maxSelected) || 30)), minSelected)
   const screened = entries.map((entry) => {
-    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText, opts.researchKind)
+    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText, opts.researchKind, semanticFor(entry))
     const recency = recencyFor(entry, opts.yearFrom, opts.yearTo)
     const publicationType = classifyPublicationType(entry)
     const withType = { ...entry, publicationType }

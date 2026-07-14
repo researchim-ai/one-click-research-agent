@@ -4,6 +4,8 @@ export interface Source {
   idx: number
   title: string
   url: string
+  /** Direct open-access full-text/PDF location when the index provides one. */
+  openAccessUrl?: string
   authors?: string
   date?: string
   sourceTool: string
@@ -138,12 +140,13 @@ export function parseOpenAlexResults(text: string): Omit<Source, 'idx'>[] {
     const title = block.match(/^\d+\.\s+(.+)/m)?.[1]?.trim()
     const doi = block.match(/DOI:\s+(https:\/\/\S+)/)?.[1]?.trim()
     const landing = block.match(/Landing Page:\s+(https:\/\/\S+)/)?.[1]?.trim()
+    const openAccessUrl = block.match(/Open PDF:\s+(https:\/\/\S+)/)?.[1]?.trim()
     const url = doi || landing || block.match(/OpenAlex:\s+(https:\/\/\S+)/)?.[1]?.trim()
     const authors = block.match(/Authors:\s+(.+)/)?.[1]?.trim()
     const date = block.match(/Published:\s+(.+)/)?.[1]?.trim()
     const abstract = block.match(/Abstract:\s+(.+)/s)?.[1]?.trim()?.slice(0, 200)
     if (title && url) {
-      items.push({ title, url, authors, date, sourceTool: 'search_openalex', snippet: abstract })
+      items.push({ title, url, openAccessUrl, authors, date, sourceTool: 'search_openalex', snippet: abstract })
     }
   }
   return items

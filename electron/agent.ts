@@ -34,7 +34,14 @@ import {
   updateResearchRunState,
   wantsCompactContext,
 } from './research-context'
-import { ensureResearchRunSpec, formatWorkflowGuidance, updateResearchWorkflowAfterTool, formatDataStallDirective, nextSearchBudgetNudge } from './research-workflow'
+import {
+  ensureResearchRunSpec,
+  formatWorkflowGuidance,
+  updateResearchWorkflowAfterTool,
+  formatDataStallDirective,
+  nextSearchBudgetNudge,
+  registerResearchSearch,
+} from './research-workflow'
 import { extractTextToolCalls } from './tool-call-parser'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
@@ -2869,6 +2876,34 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   let evidenceLoopBreaks = 0
   let forcedGateRunDone = false
 
+  // Re-screen loop guard: the model can call screen_corpus repeatedly with slightly
+  // different args (e.g. bumping max_selected each turn) hoping for more selections. Those
+  // calls have DIFFERENT signatures, so the identical-args loop guard never fires, and if
+  // the underlying corpus is unchanged re-screening can never add selections → the run
+  // hangs re-screening (observed: 5-6 screen_corpus in a row, 1 of 57 selected). We count
+  // screen_corpus calls since the corpus last actually changed (build/search/reject) and,
+  // after a streak, inject a one-time directive to stop re-screening and advance.
+  let screensSinceCorpusChange = 0
+  let screenLoopDirectiveInjected = false
+  const SCREEN_LOOP_LIMIT = 3
+  const noteCorpusChanged = () => { screensSinceCorpusChange = 0; screenLoopDirectiveInjected = false }
+  const escalateScreenLoop = () => {
+    screensSinceCorpusChange++
+    if (screensSinceCorpusChange < SCREEN_LOOP_LIMIT || screenLoopDirectiveInjected) return
+    screenLoopDirectiveInjected = true
+    doEmit({ type: 'status', content: '⛔ Модель повторно скринит неизменный корпус — направляю на новый поиск или чтение уже отобранного.' })
+    messages.push({
+      role: 'user',
+      content: [
+        `[Runtime guard] You have called screen_corpus ${screensSinceCorpusChange} times without changing the corpus in between. Re-screening the SAME corpus cannot produce more selected sources — screening is deterministic.`,
+        'Do ONE of the following instead:',
+        '1) If you need MORE on-topic sources, run NEW, DISTINCT search queries (different angles/keywords), then build_corpus once — do NOT re-screen the unchanged corpus.',
+        '2) If enough sources are already selected, STOP screening: read the selected items (read_full_text_batch), extract evidence, and proceed to run_quality_gates.',
+        'A shorter-than-requested selection is ACCEPTABLE when the topic genuinely lacks more on-topic sources — document it honestly rather than looping.',
+      ].join('\n'),
+    })
+  }
+
   const EVIDENCE_LOOP_TOOLS = new Set(['record_evidence', 'extract_evidence_from_corpus_item'])
   /**
    * Called whenever a duplicate loop-break fires. For repeated evidence/extraction
@@ -2914,16 +2949,45 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     'search_arxiv', 'search_openalex', 'search_web', 'search_huggingface_papers',
     'search_crossref', 'search_semantic_scholar', 'search_pubmed', 'smart_search',
   ])
-  const executedSearchSigs = new Set<string>()
-  let duplicateSearchHits = 0
+  const persistedSearchState = activeResearchOutputDir
+    ? ensureResearchRunSpec(workspace, activeResearchOutputDir)
+    : null
+  // Migration for runs created before searchSignatures was persisted: recover the ledger
+  // from assistant tool calls already stored in the session. This prevents one extra replay
+  // of the stale batch immediately after upgrading an in-progress run.
+  let restoredSearchSigs = persistedSearchState?.searchSignatures ?? []
+  if (restoredSearchSigs.length === 0) {
+    for (const message of messages) {
+      if (message.role !== 'assistant' || !message.tool_calls) continue
+      for (const call of message.tool_calls) {
+        const name = call.function?.name
+        if (!name || !SEARCH_LOOP_TOOLS.has(name)) continue
+        try {
+          const args = typeof call.function.arguments === 'string'
+            ? JSON.parse(call.function.arguments)
+            : call.function.arguments
+          restoredSearchSigs = registerResearchSearch(restoredSearchSigs, 0, name, args || {}).signatures
+        } catch {}
+      }
+    }
+    if (activeResearchOutputDir && restoredSearchSigs.length > 0) {
+      ensureResearchRunSpec(workspace, activeResearchOutputDir, { searchSignatures: restoredSearchSigs })
+    }
+  }
+  const executedSearchSigs = new Set<string>(restoredSearchSigs)
+  let duplicateSearchHits = Number(persistedSearchState?.duplicateSearchHits) || 0
   let corpusBuiltThisRun = false
   let forcedCorpusBuildDone = false
 
-  const searchSignature = (name: string, args: any): string => {
-    const a = args || {}
-    const q = String(a.query ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
-    return [name, q, a.year_from ?? '', a.year_to ?? '', a.from_date ?? '', a.to_date ?? '', a.sort_by ?? ''].join('|')
+  const markCorpusBuilt = (): void => {
+    corpusBuiltThisRun = true
+    if (!activeResearchOutputDir) return
+    const spec = ensureResearchRunSpec(workspace, activeResearchOutputDir)
+    ensureResearchRunSpec(workspace, activeResearchOutputDir, {
+      searchCallsAtLastBuild: Number(spec.searchCallsTotal) || 0,
+    })
   }
+
   /**
    * For a search tool call: returns a forward directive (and marks it as a duplicate)
    * when the EXACT same search already ran this run, or null for a fresh search that
@@ -2931,10 +2995,24 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
    */
   const duplicateSearchDirective = (name: string, args: any): string | null => {
     if (!SEARCH_LOOP_TOOLS.has(name)) return null
-    const sig = searchSignature(name, args)
-    if (!executedSearchSigs.has(sig)) { executedSearchSigs.add(sig); return null }
-    duplicateSearchHits++
-    return `Duplicate search: you already ran this exact query this run — results are cached and unchanged, so re-running it adds no new sources. You have ${executedSearchSigs.size} distinct searches gathered already. STOP re-searching: call build_corpus now to turn the gathered results into the ranked corpus, then screen_corpus. Only search again if you have a genuinely NEW, specific query targeting a real gap.`
+    const next = registerResearchSearch([...executedSearchSigs], duplicateSearchHits, name, args || {})
+    executedSearchSigs.clear()
+    for (const sig of next.signatures) executedSearchSigs.add(sig)
+    duplicateSearchHits = next.duplicateHits
+    if (activeResearchOutputDir) {
+      ensureResearchRunSpec(workspace, activeResearchOutputDir, {
+        searchSignatures: next.signatures,
+        duplicateSearchHits,
+      })
+    }
+    if (!next.duplicate) return null
+    const spec = activeResearchOutputDir
+      ? ensureResearchRunSpec(workspace, activeResearchOutputDir)
+      : null
+    const hasUnbuiltSearches = (Number(spec?.searchCallsTotal) || 0) > (Number(spec?.searchCallsAtLastBuild) || 0)
+    return hasUnbuiltSearches
+      ? `Duplicate search: you already ran this exact query in this managed run — cached results are unchanged. You have ${executedSearchSigs.size} distinct searches and some NEW results not yet folded into the corpus. STOP repeating searches: call build_corpus exactly once, then screen_corpus.`
+      : `Duplicate search: you already ran this exact query in this managed run, and its results were already included in the latest corpus build. Re-running it and re-screening unchanged data cannot add sources. Use a genuinely NEW targeted query (different terminology, index, or date window) for a thin plan section; then call build_corpus once.`
   }
   /**
    * Called after a duplicate search is skipped. Once the model has clearly re-issued a
@@ -2947,12 +3025,26 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     if (duplicateSearchHits < 6 || executedSearchSigs.size < 6) return false
     forcedCorpusBuildDone = true
     try {
+      const before = ensureResearchRunSpec(workspace, activeResearchOutputDir)
+      const searchesNow = Number(before.searchCallsTotal) || 0
+      const searchesAtBuild = Number(before.searchCallsAtLastBuild) || 0
+      if (searchesNow <= searchesAtBuild) {
+        messages.push({
+          role: 'user',
+          content: [
+            '[Runtime hard stop] You repeatedly re-issued an already exhausted batch of searches, and NO new search results exist since the last corpus build.',
+            'Do NOT call build_corpus or screen_corpus again on the unchanged data.',
+            'Use genuinely NEW, targeted queries (different terminology/index/date window) for the specific missing plan sections. After those new searches, call build_corpus once. Never repeat the old batch.',
+          ].join('\n'),
+        })
+        return true
+      }
       const args = { output_dir: activeResearchOutputDir, session_id: session.id }
       doEmit({ type: 'status', content: '⛔ Модель зациклилась на повторных поисках — принудительно собираю corpus и перехожу к скринингу.' })
       doEmit({ type: 'tool_call', name: 'build_corpus', args })
       const res = executeTool('build_corpus', args, workspace)
       doEmit({ type: 'tool_result', name: 'build_corpus', result: res.length > 4000 ? res.slice(0, 4000) + '\n… [truncated]' : res })
-      if (!res.startsWith('Error')) corpusBuiltThisRun = true
+      if (!res.startsWith('Error')) markCorpusBuilt()
       try {
         const spec = updateResearchWorkflowAfterTool(workspace, activeResearchOutputDir, 'build_corpus')
         updateResearchRunState(workspace, { outputDir: activeResearchOutputDir, phase: phaseForResearchTool('build_corpus'), lastTool: 'build_corpus' })
@@ -3022,7 +3114,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       doEmit({ type: 'tool_call', name: 'build_corpus', args: buildArgs })
       const buildRes = executeTool('build_corpus', buildArgs, workspace)
       doEmit({ type: 'tool_result', name: 'build_corpus', result: buildRes.length > 2000 ? buildRes.slice(0, 2000) + '\n… [truncated]' : buildRes })
-      corpusBuiltThisRun = true
+      if (!buildRes.startsWith('Error')) markCorpusBuilt()
       doEmit({ type: 'tool_call', name: 'screen_corpus', args: screenArgs })
       const screenRes = executeTool('screen_corpus', screenArgs, workspace)
       doEmit({ type: 'tool_result', name: 'screen_corpus', result: screenRes.length > 3000 ? screenRes.slice(0, 3000) + '\n… [truncated]' : screenRes })
@@ -3444,7 +3536,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             result = executeTool(tc.name, toolArgs, workspace)
           }
           result = followUpQualityGates(tc.name, toolArgs, result, session, workspace)
-          if (tc.name === 'build_corpus' && !result.startsWith('Error')) corpusBuiltThisRun = true
+          if (tc.name === 'build_corpus' && !result.startsWith('Error')) markCorpusBuilt()
 
           const uiResult = result.length > 5000 ? result.slice(0, 5000) + '\n… [truncated]' : result
           doEmit( { type: 'tool_result', name: tc.name, result: uiResult })
@@ -3503,8 +3595,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             searchesSinceScreen++
             forceScreenBacklog()
             bumpSearchBudget()
+            noteCorpusChanged()
           } else if (tc.name === 'screen_corpus' && !result.startsWith('Error')) {
             searchesSinceScreen = 0
+            escalateScreenLoop()
+          } else if ((tc.name === 'build_corpus' || tc.name === 'reject_corpus_items') && !result.startsWith('Error')) {
+            noteCorpusChanged()
           }
 
           // Data-gathering stall guard (mirror of native path).
@@ -3766,7 +3862,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       }
 
       result = followUpQualityGates(toolName, toolArgs, result, session, workspace)
-      if (toolName === 'build_corpus' && !result.startsWith('Error')) corpusBuiltThisRun = true
+      if (toolName === 'build_corpus' && !result.startsWith('Error')) markCorpusBuilt()
 
       if (toolName === 'plan_research' && !result.startsWith('Error')) {
         const planOutputDir = toolArgs.output_dir ? String(toolArgs.output_dir).replace(/\\/g, '/') : activeResearchOutputDir ?? undefined
@@ -3844,8 +3940,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         searchesSinceScreen++
         forceScreenBacklog()
         bumpSearchBudget()
+        noteCorpusChanged()
       } else if (toolName === 'screen_corpus' && !result.startsWith('Error')) {
         searchesSinceScreen = 0
+        escalateScreenLoop()
+      } else if ((toolName === 'build_corpus' || toolName === 'reject_corpus_items') && !result.startsWith('Error')) {
+        noteCorpusChanged()
       }
 
       // Data-gathering stall guard: consecutive failing source reads use different
