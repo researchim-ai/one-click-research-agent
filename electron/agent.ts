@@ -2904,6 +2904,42 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     })
   }
 
+  // Inspection-spin guard: read-only listing/inspection tools NEVER change state, so any run
+  // of them — even ALTERNATING between several (list_selected_corpus ↔ list_corpus ↔ …) — is a
+  // pure stall. The identical-args loop guard can't catch an A-B-A-B cycle because consecutive
+  // signatures differ. We count consecutive inspection-only calls (in any order/combination)
+  // and, after a short streak, inject a one-time directive to advance. Any state-advancing tool
+  // resets the streak.
+  const INSPECTION_ONLY_TOOLS = new Set([
+    'list_corpus', 'list_selected_corpus', 'full_text_status', 'list_evidence',
+    'evidence_matrix', 'evidence_coverage_by_plan', 'gate_report',
+  ])
+  let inspectionSpin = 0
+  let inspectionDirectiveInjected = false
+  const INSPECTION_SPIN_LIMIT = 4
+  const noteToolForInspectionSpin = (toolName: string) => {
+    if (!INSPECTION_ONLY_TOOLS.has(toolName)) {
+      inspectionSpin = 0
+      inspectionDirectiveInjected = false
+      return
+    }
+    inspectionSpin++
+    if (inspectionSpin < INSPECTION_SPIN_LIMIT || inspectionDirectiveInjected) return
+    inspectionDirectiveInjected = true
+    doEmit({ type: 'status', content: '⛔ Модель зациклилась на просмотре корпуса — направляю к чтению/доказательствам/гейтам.' })
+    messages.push({
+      role: 'user',
+      content: [
+        `[Runtime guard] You have called read-only inspection tools ${inspectionSpin} times in a row (list_corpus / list_selected_corpus / full_text_status / …). These NEVER change state — re-listing cannot move the run forward.`,
+        'Proceed with a concrete state-advancing step now:',
+        '1) Read selected sources you have not read yet (read_full_text_batch / read_corpus_item).',
+        '2) Then extract/record evidence for the plan items (extract_evidence_from_corpus_item / record_evidence).',
+        '3) When each plan item has the evidence the corpus can support, call run_quality_gates once (it auto-generates report.md when gates pass).',
+        'If some selected sources FAILED to fetch (read=failed), that is fine — work with the ones that read successfully and note the gap honestly. Do NOT keep listing the corpus.',
+      ].join('\n'),
+    })
+  }
+
   const EVIDENCE_LOOP_TOOLS = new Set(['record_evidence', 'extract_evidence_from_corpus_item'])
   /**
    * Called whenever a duplicate loop-break fires. For repeated evidence/extraction
@@ -3602,6 +3638,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
           } else if ((tc.name === 'build_corpus' || tc.name === 'reject_corpus_items') && !result.startsWith('Error')) {
             noteCorpusChanged()
           }
+          noteToolForInspectionSpin(tc.name)
 
           // Data-gathering stall guard (mirror of native path).
           if (isSourceReadTool(tc.name)) {
@@ -3947,6 +3984,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
       } else if ((toolName === 'build_corpus' || toolName === 'reject_corpus_items') && !result.startsWith('Error')) {
         noteCorpusChanged()
       }
+      noteToolForInspectionSpin(toolName)
 
       // Data-gathering stall guard: consecutive failing source reads use different
       // IDs, so the identical-args loop guard never catches them. After a streak,

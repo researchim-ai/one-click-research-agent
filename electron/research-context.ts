@@ -196,6 +196,62 @@ function recommendNextSteps(
 }
 
 /** Structured snapshot from .research/ — injected into system prompt instead of LLM chat summary. */
+/**
+ * The single most important thing to do next, as one imperative sentence. Elevated to the
+ * top of the research-state block so the model never has to infer it from many sections.
+ * Priority order mirrors the workflow: finish if done → fix gate blockers → read pending →
+ * extract from what read → run gates → recover from a data stall → build/search.
+ */
+export function primaryNextAction(a: {
+  state: string
+  reportExists: boolean
+  blockers: string | null
+  selectedRead: number
+  unreadSelected: number
+  failedSelected: number
+  evidenceSupported: number
+  stalled: boolean
+  researchKind: string
+  corpusTotal: number
+  gatheredSources: number
+}): string {
+  const failedNote = a.failedSelected > 0
+    ? ` The ${a.failedSelected} source(s) that failed to fetch are UNAVAILABLE — do not retry them.`
+    : ''
+  if (a.reportExists && !a.blockers) {
+    return 'The run is complete — report.md exists and gates are satisfied. Give the user a short final summary and stop; do not call more tools.'
+  }
+  if (a.blockers) {
+    const b = /quote|citation|цит/i.test(a.blockers)
+      ? 'Repair missing evidence quotes/citations with repair_evidence_quotes, then run_quality_gates once.'
+      : 'Fix the failing quality-gate blocker(s) listed below with the recommended repair tool, then run_quality_gates once.'
+    return b
+  }
+  // Discovery not yet folded into a corpus.
+  if (a.corpusTotal === 0 && a.gatheredSources > 0) {
+    return 'Call build_corpus now to turn the sources you already gathered into the corpus, then screen_corpus. Do not search again.'
+  }
+  if (a.corpusTotal === 0) {
+    return 'Run one focused search for the topic, then build_corpus + screen_corpus.'
+  }
+  if (a.unreadSelected > 0) {
+    return `Read the ${a.unreadSelected} selected source(s) not yet read: call read_full_text_batch now.${failedNote}`
+  }
+  // Everything selected is read-or-failed. Move forward from what actually read.
+  if (a.selectedRead > 0 && a.evidenceSupported < 3) {
+    return `Extract evidence for the open plan items from the ${a.selectedRead} source(s) that read successfully: extract_evidence_from_corpus_item / record_evidence.${failedNote}`
+  }
+  if (a.evidenceSupported >= 1 && a.unreadSelected === 0) {
+    return 'Call run_quality_gates once now — it auto-generates report.md when gates pass. Do not gather more first.'
+  }
+  if (a.stalled) {
+    return a.researchKind === 'general'
+      ? `Too few reachable sources read. Run ONE new web search (search_web) with different phrasing for reachable pages, then build_corpus + screen_corpus. If you already retried, extract snippet-based evidence from what you have and call run_quality_gates to finish honestly.${failedNote}`
+      : `Too few reachable sources read. Run ONE new search (search_openalex/search_arxiv) for open-access, fetchable papers, then build_corpus + screen_corpus. If you already retried twice, call run_quality_gates to finish honestly with a documented data-availability limitation.${failedNote}`
+  }
+  return 'Follow the Allowed next tools below: read selected sources, extract evidence, then run_quality_gates.'
+}
+
 export function buildResearchWorkingSet(workspace: string, outputDir: string, maxChars = 6000, gatheredSources = 0): string {
   const abs = resolveResearchDir(workspace, outputDir)
   if (!fs.existsSync(abs)) return ''
@@ -248,8 +304,30 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     ? [...new Set([...spec.allowedActions, ...stall.recoveryActions])]
     : spec.allowedActions
 
+  // ONE authoritative next action, elevated to the very top. The state block has many
+  // sections and (on a stall) a long allowed-tools list, which caused decision paralysis:
+  // the model fell back to always-available read-only inspection tools (list_corpus /
+  // list_selected_corpus) and looped without ever advancing. A single imperative removes the
+  // ambiguity about what to do RIGHT NOW.
+  const nextAction = primaryNextAction({
+    state: spec.state,
+    reportExists,
+    blockers,
+    selectedRead: stats.selectedRead,
+    unreadSelected: unreadSelectedCount,
+    failedSelected: failedSelectedCount,
+    evidenceSupported: evidence.supported,
+    stalled: stall.stalled,
+    researchKind: String(th.researchKind || 'academic'),
+    corpusTotal: stats.total,
+    gatheredSources,
+  })
+
   const lines = [
     RESEARCH_STATE_MARKER.trim(),
+    '',
+    `**➡ NEXT ACTION:** ${nextAction}`,
+    '**Do NOT** call read-only inspection tools (list_corpus, list_selected_corpus, full_text_status, list_evidence) to decide what to do — they never change state and re-calling them is a wasted step. Act on NEXT ACTION.',
     '',
     `**Run directory:** \`${outputDir}\``,
     `**Workflow state:** ${spec.state}`,
