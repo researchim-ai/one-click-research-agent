@@ -17,6 +17,14 @@ files:
   - dist/**/*
   - dist-electron/**/*
 
+# Ship the editable prompt templates to <resources>/prompts so both the main
+# process and the agent worker can read (and users can override) them.
+extraResources:
+  - from: prompts
+    to: prompts
+    filter:
+      - "**/*.md"
+
 asar: true
 asarUnpack:
   - "node_modules/node-pty/**"

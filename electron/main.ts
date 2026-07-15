@@ -9,6 +9,20 @@ const SESSION_WRITE_YIELD_EVERY = 12 // yield to event loop every N messages (av
 
 nativeTheme.themeSource = 'dark'
 
+// Safety net: a late async callback (download/build progress, worker event, watcher) can try
+// to send to the window right as it is being destroyed on quit, throwing
+// "Object has been destroyed". That is harmless during teardown but Electron's default
+// handler pops a scary "A JavaScript error occurred in the main process" dialog. Swallow
+// exactly that benign case; anything else is logged and re-surfaced so real bugs stay visible.
+process.on('uncaughtException', (err) => {
+  const msg = String(err?.message || err)
+  if (/Object has been destroyed|Render frame was disposed|WebContents.*destroyed/i.test(msg)) {
+    console.warn('[main] ignored teardown error:', msg)
+    return
+  }
+  console.error('[main] uncaughtException:', err)
+})
+
 function isRunningAsLinuxAppImage(): boolean {
   if (process.platform !== 'linux') return false
   return !!process.env.APPIMAGE || !!process.env.APPDIR || /\.AppImage$/i.test(process.argv[0] ?? '')
@@ -60,9 +74,12 @@ import {
   saveUiMessages, getUiMessages,
   getActiveSession, getSessionPathForWorker, saveSession as persistSession, isCancelRequested,
   updateSessionFromWorker,
-  DEFAULT_SYSTEM_PROMPT, DEFAULT_SUMMARIZE_PROMPT,
   type SessionInfo, type AgentBridge,
 } from './agent'
+import {
+  listPrompts, savePromptOverride, resetAllPromptOverrides, seedUserPromptsDir,
+  migrateLegacyPromptConfig, userPromptsDir,
+} from './prompts'
 import * as terminalManager from './terminal-manager'
 import * as tsService from './ts-service'
 import * as pyResolve from './py-resolve'
@@ -261,11 +278,23 @@ function createMainBridge(win: BrowserWindow): AgentBridge {
   }
 }
 
+/**
+ * Send an IPC event to the renderer only when the window (and its webContents) is still
+ * alive. A `mainWindow?.` null-check is NOT enough: after the window closes, `mainWindow`
+ * still points at a *destroyed* BrowserWindow, and touching `.webContents.send` on it throws
+ * "Object has been destroyed" — which surfaced as an uncaught-exception dialog on quit.
+ */
+function sendToRenderer(channel: string, ...args: unknown[]): void {
+  const win = mainWindow
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+  try { win.webContents.send(channel, ...args) } catch {}
+}
+
 function sendMenuAction(action: string, payload?: unknown) {
   if (payload !== undefined) {
-    mainWindow?.webContents.send('menu-action', action, payload)
+    sendToRenderer('menu-action', action, payload)
   } else {
-    mainWindow?.webContents.send('menu-action', action)
+    sendToRenderer('menu-action', action)
   }
 }
 
@@ -424,15 +453,20 @@ function createWindow() {
     },
   })
 
+  // Drop the reference as soon as the window is gone so every `mainWindow?.` guard across
+  // the main process actually short-circuits (otherwise it stays a destroyed object and any
+  // late send throws "Object has been destroyed"). Applies to BOTH dev and packaged builds.
+  mainWindow.on('closed', () => {
+    globalShortcut.unregister('F12')
+    globalShortcut.unregister('CommandOrControl+Shift+I')
+    mainWindow = null
+  })
+
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
     mainWindow.webContents.once('did-finish-load', () => {
       globalShortcut.register('F12', () => mainWindow?.webContents.toggleDevTools())
       globalShortcut.register('CommandOrControl+Shift+I', () => mainWindow?.webContents.toggleDevTools())
-    })
-    mainWindow.on('closed', () => {
-      globalShortcut.unregister('F12')
-      globalShortcut.unregister('CommandOrControl+Shift+I')
     })
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
@@ -440,7 +474,25 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Tell the prompt registry where the shipped default prompts live. In dev they
+  // sit next to the repo (dist-electron/../prompts); packaged they are copied via
+  // electron-builder `extraResources` to <resources>/prompts. Exporting it on the
+  // env means the agent worker thread inherits the same path (it has no
+  // process.resourcesPath of its own).
+  if (!process.env.OCA_PROMPTS_DIR) {
+    process.env.OCA_PROMPTS_DIR = app.isPackaged
+      ? path.join(process.resourcesPath, 'prompts')
+      : path.join(__dirname, '..', 'prompts')
+  }
   initSessions()
+  // One-time migration of the legacy single-string prompt overrides (config.json)
+  // into the file-based prompt registry, then clear the old config fields.
+  try {
+    migrateLegacyPromptConfig(
+      () => ({ systemPrompt: config.get('systemPrompt'), summarizePrompt: config.get('summarizePrompt') }),
+      (cleared) => config.save(cleared),
+    )
+  } catch {}
   registerIpcHandlers()
   createWindow()
   // Pre-create agent worker so first send-message doesn't block on Worker load
@@ -538,16 +590,29 @@ function registerIpcHandlers() {
     return tools
   })
 
-  ipcMain.handle('get-prompts', () => ({
-    systemPrompt: config.get('systemPrompt'),
-    summarizePrompt: config.get('summarizePrompt'),
-    defaultSystemPrompt: DEFAULT_SYSTEM_PROMPT,
-    defaultSummarizePrompt: DEFAULT_SUMMARIZE_PROMPT,
-  }))
+  // Prompt registry: every LLM prompt is a file under `prompts/` with optional
+  // user overrides in `~/.one-click-agent/prompts/`.
+  ipcMain.handle('list-prompts', () => listPrompts())
 
-  ipcMain.handle('save-prompts', (_e, prompts: { systemPrompt?: string | null; summarizePrompt?: string | null }) => {
-    if (prompts.systemPrompt !== undefined) config.set('systemPrompt', prompts.systemPrompt)
-    if (prompts.summarizePrompt !== undefined) config.set('summarizePrompt', prompts.summarizePrompt)
+  ipcMain.handle('save-prompt', (_e, { id, text }: { id: string; text: string | null }) => {
+    savePromptOverride(id, text)
+    return listPrompts()
+  })
+
+  ipcMain.handle('reset-prompt', (_e, { id }: { id: string }) => {
+    savePromptOverride(id, null)
+    return listPrompts()
+  })
+
+  ipcMain.handle('reset-all-prompts', () => {
+    resetAllPromptOverrides()
+    return listPrompts()
+  })
+
+  ipcMain.handle('open-prompts-dir', async () => {
+    const dir = seedUserPromptsDir()
+    await shell.openPath(dir)
+    return dir
   })
 
   ipcMain.handle('reset-all-defaults', () => {

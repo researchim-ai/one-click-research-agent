@@ -19,13 +19,11 @@ interface ElectronAPI {
   getTools(): Promise<import('../electron/types').ToolInfo[]>
   saveCustomTool(tool: import('../electron/config').CustomTool): Promise<import('../electron/config').CustomTool[]>
   deleteCustomTool(toolId: string): Promise<import('../electron/config').CustomTool[]>
-  getPrompts(): Promise<{
-    systemPrompt: string | null
-    summarizePrompt: string | null
-    defaultSystemPrompt: string
-    defaultSummarizePrompt: string
-  }>
-  savePrompts(prompts: { systemPrompt?: string | null; summarizePrompt?: string | null }): Promise<void>
+  listPrompts(): Promise<PromptListItem[]>
+  savePrompt(id: string, text: string | null): Promise<PromptListItem[]>
+  resetPrompt(id: string): Promise<PromptListItem[]>
+  resetAllPrompts(): Promise<PromptListItem[]>
+  openPromptsDir(): Promise<string>
   resetAllDefaults(): Promise<void>
   restartServer(): Promise<{ requestedCtx: number; actualCtx: number } | void>
   autoSetup(): Promise<void>
@@ -131,6 +129,17 @@ interface ElectronAPI {
 }
 
 declare global {
+  interface PromptListItem {
+    id: string
+    group: string
+    title: string
+    description: string
+    placeholders: string[]
+    source: 'user' | 'default'
+    overridden: boolean
+    text: string
+    defaultText: string
+  }
   interface Window {
     api: ElectronAPI
   }

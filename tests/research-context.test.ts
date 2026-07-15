@@ -42,6 +42,19 @@ describe('primaryNextAction (single authoritative next step)', () => {
     const action = primaryNextAction({ ...base, stalled: true, selectedRead: 0, failedSelected: 4 })
     expect(action).toMatch(/search_openalex|search_arxiv|new search/i)
   })
+
+  it('a plan_section_coverage blocker steers to evidence (or an honest downgrade) — never update_plan_status', () => {
+    const action = primaryNextAction({
+      ...base,
+      state: 'GATES_FAILED',
+      blockers: 'Q3: needs selected+read sources and 2 evidence row(s).',
+      selectedRead: 8,
+      evidenceSupported: 10,
+    })
+    expect(action).toMatch(/extract_evidence_from_corpus_item|record_evidence|assign_corpus_to_plan/)
+    expect(action).toMatch(/never call update_plan_status/i)
+    expect(action).toMatch(/run_quality_gates/)
+  })
 })
 
 describe('buildResumeMessageWindow (stable prefix)', () => {

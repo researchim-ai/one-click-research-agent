@@ -217,7 +217,10 @@ function verifyBinary(binPath: string): boolean {
 // ---------------------------------------------------------------------------
 
 function emitBuild(win: BrowserWindow, msg: string) {
-  win.webContents.send('build-status', msg)
+  // Progress can arrive from async streams after the user closes the window; guard against a
+  // destroyed BrowserWindow/webContents so a late send never crashes the main process.
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+  try { win.webContents.send('build-status', msg) } catch {}
 }
 
 // ---------------------------------------------------------------------------

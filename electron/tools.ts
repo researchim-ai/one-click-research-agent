@@ -13,11 +13,12 @@ import { parseDocument, summarizeParsedForPrompt, isDocumentExtension } from './
 import { checkUrlHealth, formatHealthBadge } from './url-health'
 import { fetchUrl as fetchUrlImpl, classifyUrl as classifyUrlImpl, extractArxivId } from './url-fetch'
 import { classifyQuery } from './query-router'
-import { writePlan, parsePlan, updatePlanItem, planProgress, planQuestion } from './planner'
+import { writePlan, parsePlan, updatePlanItem, planProgress, planQuestion, type PlanItem } from './planner'
 import { runSubResearcher, canSpawnMore } from './sub-researcher'
 import { searchHybrid, indexStats, rebuildIndex, indexText as indexTextHybrid } from './knowledge-index'
 import { exportPdf, exportDocx, exportBibTex } from './export-report'
 import { screenshotPage } from './screenshot'
+import { renderPrompt } from './prompts'
 import {
   addSourcesToCorpus, assignCorpusToPlan, fullTextStatus, listCorpus, listSelectedCorpus, loadCorpus, markCorpusItemRead,
   queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats, saveCorpus,
@@ -25,7 +26,7 @@ import {
   type CorpusEntry,
 } from './corpus'
 import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, reconcileSelectedFromEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
-import { formatGateReport, formatGateResults, latestQualityGateFailure, readQualityGateSnapshot, runQualityGates, writeQualityGateSnapshot } from './quality-gates'
+import { formatGateReport, formatGateResults, isQualityGateSnapshotFresh, latestQualityGateFailure, readQualityGateSnapshot, runQualityGates, writeQualityGateSnapshot } from './quality-gates'
 import { applyGateEscapeValve, ensureResearchRunSpec } from './research-workflow'
 import { auditResearchRun, formatAuditResult } from './research-audit'
 import { listResearchSkills, loadResearchSkill, recommendSkills } from './research-skills'
@@ -834,7 +835,7 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'update_plan_status',
-      description: 'Mark a plan item as done or not done. Item ids are the "Q1", "Q2", "Q1.1" prefixes defined in plan.md.',
+      description: 'Toggle a plan.md checkbox for HUMAN progress tracking only. Item ids are the "Q1", "Q2", "Q1.1" prefixes defined in plan.md. This does NOT create evidence and does NOT satisfy any quality gate — in particular it has zero effect on plan_section_coverage, which counts supported evidence rows per plan item. Never call this to try to clear a failing gate.',
       parameters: {
         type: 'object',
         properties: {
@@ -1746,29 +1747,11 @@ function llmReviewReportSections(reportBody: string, ru: boolean): string {
     const body = s.replace(/^##\s+.+\n?/, '').replace(/\s+/g, ' ').trim().slice(0, 600)
     return `### ${head}\n${body}`
   }).join('\n\n').slice(0, 10000)
-  const prompt = ru
-    ? `Ты — придирчивый научный редактор. Оцени КАЖДУЮ секцию отчёта по качеству: ясность, связность, единый язык (русский), нет ли «висящих» утверждений без опоры, нет ли явного мусора (HTML-теги, обрывки навигации).
-ВАЖНО: ниже даны СОКРАЩЁННЫЕ выдержки секций (обрезаны для проверки) — НЕ считай саму обрезку/неполноту выдержки недостатком и НЕ пиши «обрезано/неполный».
-НЕ переписывай факты, числа и ссылки. Только оцени и кратко укажи замечание.
-
-Сокращённые выдержки секций:
-${condensed}
-
-Верни ТОЛЬКО markdown-таблицу, ничего больше:
-| Секция | Оценка | Замечание |
-|---|---|---|
-Оценка — одно из: ОК / Замечания / Слабая. Замечание — максимум одна короткая фраза (или «—»).`
-    : `You are a strict scientific editor. Rate EACH report section for quality: clarity, coherence, consistent language (English), no dangling unsupported claims, no obvious garbage (HTML tags, navigation fragments).
-IMPORTANT: the section excerpts below are CONDENSED (truncated for review) — do NOT treat the truncation/incompleteness of the excerpt itself as a defect and do NOT say "truncated/incomplete".
-Do NOT rewrite facts, numbers, or citations. Only rate and give a short note.
-
-Condensed section excerpts:
-${condensed}
-
-Return ONLY a markdown table, nothing else:
-| Section | Rating | Note |
-|---|---|---|
-Rating is one of: OK / Issues / Weak. Note is at most one short phrase (or "—").`
+  const prompt = renderPrompt(
+    ru ? 'report.section_review.user.ru' : 'report.section_review.user.en',
+    { sections: condensed },
+  )
+  const systemPrompt = renderPrompt('report.section_review.system')
   const script = `
 (async () => {
   const res = await fetch(process.argv[1] + '/v1/chat/completions', {
@@ -1777,7 +1760,7 @@ Rating is one of: OK / Issues / Weak. Note is at most one short phrase (or "—"
     body: JSON.stringify({
       model: 'local',
       messages: [
-        { role: 'system', content: 'You rate report sections and output exactly one markdown table. No prose, no code fences.' },
+        { role: 'system', content: process.argv[3] },
         { role: 'user', content: process.argv[2] },
       ],
       temperature: 0.2,
@@ -1791,7 +1774,7 @@ Rating is one of: OK / Issues / Weak. Note is at most one short phrase (or "—"
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
   try {
-    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt], {
+    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt, systemPrompt], {
       encoding: 'utf-8',
       timeout: 60000,
       maxBuffer: 1024 * 1024 * 2,
@@ -1881,14 +1864,6 @@ async function callLocalChatAsync(apiUrl: string, system: string, user: string, 
   }
 }
 
-const SEMANTIC_SCREEN_SYSTEM = [
-  'You are a strict, multilingual research-screening assistant.',
-  'You understand every language equally well. Judge each source purely by MEANING, never by whether it shares literal words with the query — the query and the sources may be written in different languages, and that must not lower the score.',
-  'For each candidate, rate how relevant it is to the research question and sub-questions based on its title and snippet.',
-  'Scoring rubric (0–100): 80–100 = directly about the research subject and clearly useful; 45–79 = related or partially relevant; 15–44 = only tangentially related; 0–14 = off-topic / unrelated.',
-  'Return ONLY compact JSON: {"scores":[{"id":"<id>","score":<int 0-100>,"on_topic":<true|false>}]}. Include every id exactly once. No prose.',
-].join('\n')
-
 /**
  * Language-agnostic relevance annotation. Asks the local LLM to score each not-yet-scored
  * corpus source against the research query, in ANY language, and caches the score on the
@@ -1932,7 +1907,7 @@ async function annotateSemanticRelevance(
       return `id=${e.id} | title: ${title}${snip ? ` | snippet: ${snip}` : ''}`
     }).join('\n')
     const user = `${header}\n\nCandidates:\n${lines}`
-    const out = await callLocalChatAsync(base, SEMANTIC_SCREEN_SYSTEM, user, {
+    const out = await callLocalChatAsync(base, renderPrompt('screening.semantic'), user, {
       maxTokens: Math.min(2000, 120 + batch.length * 40),
       timeoutMs: 60000,
     })
@@ -2012,9 +1987,7 @@ function llmSummarizeSources(
   const budgetMs = 4 * 60 * 1000
   const started = Date.now()
   const batchSize = 6
-  const sys = ru
-    ? 'Ты — научный аналитик. Ты пишешь СТРОГО на русском языке и возвращаешь только JSON.'
-    : 'You are a research analyst. You write STRICTLY in English and return only JSON.'
+  const sys = renderPrompt(ru ? 'report.source_summary.system.ru' : 'report.source_summary.system.en')
   let changed = false
   for (let i = 0; i < need.length; i += batchSize) {
     if (Date.now() - started > budgetMs) break
@@ -2027,17 +2000,10 @@ function llmSummarizeSources(
       evidence: (claimsByCorpus.get(e.id) || []).slice(0, 3),
       excerpt: readLocalExcerpt(e.localPath),
     }))
-    const user = ru
-      ? `Для КАЖДОЙ статьи напиши развёрнутую выжимку (3–5 предложений) СТРОГО на русском языке: о чём работа, какой метод/подход предложен, ключевые результаты и числа, главный вывод. Английские термины можно оставлять как термины (DPO, GRPO, RLHF и т.п.), но связный текст обязан быть на русском. Не выдумывай факты сверх предоставленных данных; если данных мало — опиши кратко по названию и аннотации.
-Верни ТОЛЬКО JSON-объект вида {"<id>": "<выжимка>", ...} без markdown и пояснений.
-
-Данные статей (JSON):
-${JSON.stringify(payload)}`
-      : `For EACH paper write a detailed summary (3–5 sentences) STRICTLY in English: what it is about, the proposed method/approach, key results and numbers, the main takeaway. Do not invent facts beyond the provided data; if data is scarce, summarize briefly from the title and abstract.
-Return ONLY a JSON object {"<id>": "<summary>", ...} with no markdown or explanations.
-
-Paper data (JSON):
-${JSON.stringify(payload)}`
+    const user = renderPrompt(
+      ru ? 'report.source_summary.user.ru' : 'report.source_summary.user.en',
+      { payload: JSON.stringify(payload) },
+    )
     const out = callLocalChat(sys, user, { maxTokens: 1500, timeoutMs: 120000 })
     const map = parseJsonStringMap(out)
     for (const e of batch) {
@@ -2072,31 +2038,12 @@ function llmReportSynthesis(
   ru: boolean,
 ): { tldr: string[]; conclusion: string } | null {
   if (!claimLines.length) return null
-  const sys = ru
-    ? 'Ты — научный аналитик. Пиши СТРОГО на русском языке и возвращай только JSON.'
-    : 'You are a research analyst. Write STRICTLY in English and return only JSON.'
+  const sys = renderPrompt(ru ? 'report.synthesis.system.ru' : 'report.synthesis.system.en')
   const evidence = claimLines.slice(0, 60).map((c, i) => `${i + 1}. ${c}`).join('\n').slice(0, 8000)
-  const user = ru
-    ? `Тема исследования: «${topic}».
-Ниже — подтверждённые доказательные утверждения по теме (из прочитанных источников).
-Сделай синтез по всей информации СТРОГО на русском языке:
-1) "tldr" — 4–6 кратких ключевых выводов по теме в целом (каждый ≤ 25 слов);
-2) "conclusion" — связное заключение (2–4 абзаца): главные тенденции, что считается установленным, открытые проблемы и направления.
-Опирайся только на приведённые утверждения, не выдумывай.
-Верни ТОЛЬКО JSON: {"tldr": ["...", "..."], "conclusion": "..."}.
-
-Утверждения:
-${evidence}`
-    : `Research topic: "${topic}".
-Below are supported evidence claims (from read sources).
-Synthesize across all of it STRICTLY in English:
-1) "tldr" — 4–6 concise key takeaways about the topic overall (each ≤ 25 words);
-2) "conclusion" — a coherent conclusion (2–4 paragraphs): main trends, what is established, open problems and directions.
-Rely only on the provided claims; do not invent.
-Return ONLY JSON: {"tldr": ["...", "..."], "conclusion": "..."}.
-
-Claims:
-${evidence}`
+  const user = renderPrompt(
+    ru ? 'report.synthesis.user.ru' : 'report.synthesis.user.en',
+    { topic, evidence },
+  )
   const out = callLocalChat(sys, user, { maxTokens: 1600, timeoutMs: 120000 })
   const start = out.indexOf('{')
   const end = out.lastIndexOf('}')
@@ -2272,8 +2219,16 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     if (downgradedGates.length) dataLimitations.push(`- Quality gates downgraded to warnings due to limits of the available sources: ${downgradedGates.join(', ')}.`)
     if (weakSelectedNow) dataLimitations.push(`- ${weakSelectedNow} selected source(s) have reduced topical precision; treat conclusions that rely on them with extra caution.`)
   }
+  // Render each annotation as its own block: a bold, linked title line followed by
+  // the summary as a separate paragraph (blank lines prevent markdown from
+  // collapsing the title and summary onto one line).
   const annotationLines = reportSources.length
-    ? reportSources.map((e, i) => `${i + 1}. **${link(cleanTitle(e.title), e.url)}**${e.year ? ` (${e.year})` : ''} \`${e.id}\`\n   ${sourceSummary(e)}`)
+    ? reportSources.flatMap((e, i) => [
+      `**${i + 1}. ${link(cleanTitle(e.title), e.url)}**${e.year ? ` (${e.year})` : ''} · \`${e.id}\``,
+      '',
+      sourceSummary(e),
+      '',
+    ])
     : [ru ? '- Нет прочитанных источников.' : '- No read sources.']
   const topSources = reportSources.map((e, i) => {
     const local = localHref(e.localPath)
@@ -2294,7 +2249,10 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     })
     : [ru ? '- Обзорных источников среди прочитанных отобранных источников недостаточно; это ограничение.' : '- Review/survey coverage among read selected sources is insufficient; this is a limitation.']
   const unavailableLines = unavailable.length
-    ? unavailable.map((e) => `- ${sourceTag(e.id)} ${link(cleanTitle(e.title), e.url)}: ${cleanReadReason(e.readReason) ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`)
+    ? unavailable.flatMap((e) => [
+      `- **${link(cleanTitle(e.title), e.url)}** (${sourceTag(e.id)})`,
+      `  - ${cleanReadReason(e.readReason) ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`,
+    ])
     : [ru ? '- Нет отобранных источников с недоступным полным текстом.' : '- No selected sources have failed full-text reads.']
   const planSections = plan.length ? plan : [{ id: 'Q1', text: ru ? 'Основные результаты исследования' : 'Main research findings', done: true, level: 0, children: [] }]
   const directionRows = planSections.slice(0, 8).map((item) => {
@@ -2318,20 +2276,28 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     const metadataOnly = rows.filter((c) => c.notes?.toLowerCase().includes('abstract-only'))
     const bullets = rows.length
       ? rows.map((claim) => {
-        const srcs = (claim.corpusIds || []).map((id) => {
+        // Each source is rendered as its own item so the article + link + full-text
+        // link stay on separate lines instead of collapsing into one paragraph.
+        const srcItems = (claim.corpusIds || []).slice(0, 3).map((id) => {
           const src = sourceById.get(id)
           const local = localHref(src?.localPath)
-          return `${sourceTag(id)}${src ? ` ${sourceLabel(id)}` : ''}${local ? ` (${link(fullTextLabel, local)})` : ''}`
-        }).slice(0, 2).join('; ')
+          return `${sourceTag(id)}${src ? ` — ${sourceLabel(id)}` : ''}${local ? ` · ${link(fullTextLabel, local)}` : ''}`
+        })
         const quote = compactQuote(claim.quote)
-        return [
-          `- **${claim.claim}**`,
-          `  ${ru ? 'Источник' : 'Source'}: ${srcs || cite(claim)}.`,
-          `  ${ru ? 'Сила доказательства' : 'Strength'}: ${evidenceStrength(claim)}; ${ru ? 'тип' : 'type'}: ${evidenceTypeLabel(claim.evidenceType)}; ${ru ? 'уверенность' : 'confidence'}=${confidenceLabel(claim.confidence)}.`,
-          quote ? `  ${ru ? 'Фрагмент' : 'Quote'}: "${quote}"` : '',
-        ].filter(Boolean).join('\n')
-      })
-      : [ru ? '- По этому разделу нет достаточно сильных доказательных утверждений; раздел требует дополнительного поиска и чтения.' : '- This section lacks strong claim-level evidence and needs more search/reading.']
+        // Nested markdown bullets: reliably render on their own lines (soft line
+        // breaks inside a single bullet are otherwise collapsed into one line).
+        const lines = [`- **${claim.claim}**`]
+        if (srcItems.length <= 1) {
+          lines.push(`  - ${ru ? 'Источник' : 'Source'}: ${srcItems[0] || cite(claim)}`)
+        } else {
+          lines.push(`  - ${ru ? 'Источники' : 'Sources'}:`)
+          for (const s of srcItems) lines.push(`    - ${s}`)
+        }
+        lines.push(`  - ${ru ? 'Сила доказательства' : 'Strength'}: ${evidenceStrength(claim)} · ${ru ? 'тип' : 'type'}: ${evidenceTypeLabel(claim.evidenceType)} · ${ru ? 'уверенность' : 'confidence'}: ${confidenceLabel(claim.confidence)}`)
+        if (quote) lines.push(`  - ${ru ? 'Фрагмент' : 'Quote'}: "${quote}"`)
+        return lines.join('\n')
+      }).join('\n\n')
+      : (ru ? '- По этому разделу нет достаточно сильных доказательных утверждений; раздел требует дополнительного поиска и чтения.' : '- This section lacks strong claim-level evidence and needs more search/reading.')
     return [
       `## ${item.id}. ${item.text.replace(/^Q\d+\.\s*/, '')}`,
       '',
@@ -2339,7 +2305,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
         ? `**Покрытие:** ${rows.length} доказательных утверждений; первичные/бенчмарк/безопасность=${primary.length}; обзорные=${surveys.length}; только метаданные=${metadataOnly.length}.`
         : `**Coverage:** ${rows.length} claims; primary/benchmark/safety=${primary.length}; survey=${surveys.length}; metadata-only=${metadataOnly.length}.`,
       '',
-      ...bullets,
+      bullets,
       '',
       ru
         ? 'Комментарий: эти выводы нужно читать как синтез отобранных и прочитанных источников, а не как исчерпывающую карту всей области.'
@@ -2985,32 +2951,12 @@ function reflectOnFindings(findings: string, criteria?: string, sessionId?: stri
  */
 function tryLlmCritic(findings: string, criteria: string[], sourcesContext: string): string | null {
   const apiUrl = 'http://127.0.0.1:7863'
-  const prompt = `You are a rigorous research critic. Review the findings below and produce concise structured markdown feedback.
-
-# Criteria to evaluate
-${criteria.map((c) => `- ${c}`).join('\n')}
-
-# Findings under review
-${findings.slice(0, 6000)}${findings.length > 6000 ? '\n... [truncated]' : ''}${sourcesContext}
-
-# Required output format (return EXACTLY this structure, nothing else)
-
-## Strengths
-- 3–5 bullet points.
-
-## Gaps
-- Missing sub-topics, under-explored angles, absent stakeholders.
-
-## Contradictions
-- Conflicts between findings or between findings and cited sources (or "None detected.").
-
-## Weak Sources
-- Sources that look speculative, outdated, or uncited (or "None detected.").
-
-## Action Items
-- Concrete next search queries or verification steps (3–5 max).
-
-Be direct, specific, and evidence-based. Do not repeat the findings verbatim.`
+  const prompt = renderPrompt('critic.user', {
+    criteria: criteria.map((c) => `- ${c}`).join('\n'),
+    findings: findings.slice(0, 6000) + (findings.length > 6000 ? '\n... [truncated]' : ''),
+    sourcesContext,
+  })
+  const systemPrompt = renderPrompt('critic.system')
 
   const script = `
 (async () => {
@@ -3020,7 +2966,7 @@ Be direct, specific, and evidence-based. Do not repeat the findings verbatim.`
     body: JSON.stringify({
       model: 'local',
       messages: [
-        { role: 'system', content: 'You are a rigorous research critic. Follow the requested output format exactly.' },
+        { role: 'system', content: process.argv[3] },
         { role: 'user', content: process.argv[2] },
       ],
       temperature: 0.3,
@@ -3033,7 +2979,7 @@ Be direct, specific, and evidence-based. Do not repeat the findings verbatim.`
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })
 `
   try {
-    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt], {
+    const out = execFileSync(process.execPath, ['-e', script, apiUrl, prompt, systemPrompt], {
       encoding: 'utf-8',
       timeout: 90000,
       maxBuffer: 1024 * 1024 * 2,
@@ -3865,11 +3811,43 @@ function planResearch(question: string, subQuestions: unknown, workspace: string
 
 function updatePlanStatus(itemId: string, done: boolean, workspace: string, outputDir?: string): string {
   if (!itemId) return 'Error: item_id is required.'
+
+  // Capture the prior checkbox state so we can tell the model when a call changed nothing.
+  const flatBefore: PlanItem[] = []
+  const walk = (list: PlanItem[]) => { for (const it of list) { flatBefore.push(it); if (it.children.length) walk(it.children) } }
+  walk(parsePlan(workspace, outputDir))
+  const norm = String(itemId).trim().toLowerCase()
+  const prior = flatBefore.find((it) => it.id.toLowerCase() === norm || it.text.toLowerCase().startsWith(norm))
+
   const ok = updatePlanItem(workspace, String(itemId), Boolean(done), outputDir)
   if (!ok) return `Could not find plan item "${itemId}" in ${canonicalResearchOutputDir(outputDir)}/plan.md. Make sure plan_research was called first and the id exists (e.g. "Q2").`
   const items = parsePlan(workspace, outputDir)
   const progress = planProgress(items)
-  return `Updated "${itemId}" → ${done ? 'done' : 'open'}. Progress: ${progress.done}/${progress.total} (${progress.pct}%).`
+
+  // Teaching signal. plan.md checkboxes are HUMAN progress tracking only — they never create
+  // evidence and are NOT what the plan_section_coverage gate measures (it counts supported
+  // evidence rows per plan item). The observed failure mode: when that gate failed, the model
+  // kept re-marking items done — a no-op that looked like progress ("100%") but never cleared
+  // the gate, so the run spun. Make the semantics explicit in the tool result so the agent
+  // self-corrects instead of relying on a runtime guard to catch it.
+  const noChange = Boolean(prior) && prior!.done === Boolean(done)
+  let gateNote = ''
+  if (outputDir) {
+    try {
+      if (isQualityGateSnapshotFresh(workspace, outputDir)) {
+        const snap = readQualityGateSnapshot(workspace, outputDir)
+        const psc = snap?.failed?.find((f) => f.gate === 'plan_section_coverage')
+        if (psc) {
+          gateNote = `\n\n⚠️ plan_section_coverage is currently FAILING, and update_plan_status has NO effect on it: that gate counts SUPPORTED EVIDENCE ROWS per plan item, not checkbox state. To clear it, for each listed item extract one more grounded claim from a selected+read source (extract_evidence_from_corpus_item / record_evidence), then run_quality_gates. If a subtopic's sources genuinely cannot support another claim, do NOT re-mark checkboxes — call run_quality_gates and it is downgraded to a documented limitation so the run finishes. Blockers: ${psc.blockers.slice(0, 4).join(' ')}`
+        }
+      }
+    } catch {}
+  }
+
+  const base = noChange
+    ? `No change: plan item "${itemId}" was already ${done ? 'done' : 'open'}. Toggling checkboxes does not add evidence or advance quality gates.`
+    : `Updated "${itemId}" → ${done ? 'done' : 'open'}. Progress: ${progress.done}/${progress.total} (${progress.pct}%). Note: this checkbox is human-facing progress only — it does not create evidence or satisfy quality gates.`
+  return `${base}${gateNote}`
 }
 
 function searchCrossref(query: string, maxResults?: number, yearFrom?: number, yearTo?: number): string {

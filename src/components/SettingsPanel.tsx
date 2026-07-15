@@ -130,11 +130,9 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   const [appLanguage, setAppLanguage] = useState<AppLanguage>('ru')
   const [agentDirty, setAgentDirty] = useState(false)
 
-  // Prompts state
-  const [sysPrompt, setSysPrompt] = useState('')
-  const [sumPrompt, setSumPrompt] = useState('')
-  const [defaultSysPrompt, setDefaultSysPrompt] = useState('')
-  const [defaultSumPrompt, setDefaultSumPrompt] = useState('')
+  // Prompts state — the full file-backed prompt registry plus per-prompt drafts.
+  const [prompts, setPrompts] = useState<PromptListItem[]>([])
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({})
   const [promptsDirty, setPromptsDirty] = useState(false)
 
   useEffect(() => {
@@ -155,7 +153,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       window.api.getConfig(),
       window.api.detectResources(),
       window.api.getTools(),
-      window.api.getPrompts(),
+      window.api.listPrompts(),
       window.api.getModelFamilies(),
     ]).then(async ([c, r, t, p, fams]) => {
       const gpuMode = c.gpuMode ?? 'single'
@@ -197,10 +195,8 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       }))
       setAgentDirty(false)
 
-      setSysPrompt(p.systemPrompt ?? p.defaultSystemPrompt)
-      setSumPrompt(p.summarizePrompt ?? p.defaultSummarizePrompt)
-      setDefaultSysPrompt(p.defaultSystemPrompt)
-      setDefaultSumPrompt(p.defaultSummarizePrompt)
+      setPrompts(p)
+      setPromptDrafts(Object.fromEntries(p.map((x) => [x.id, x.text])))
       setPromptsDirty(false)
     }).catch(() => {})
   }, [open])
@@ -307,23 +303,38 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
     setEditingTool(null)
   }
 
+  const applyPromptList = (list: PromptListItem[]) => {
+    setPrompts(list)
+    setPromptDrafts(Object.fromEntries(list.map((x) => [x.id, x.text])))
+    setPromptsDirty(false)
+  }
+
   const handleSavePrompts = async () => {
     setSaving(true)
     try {
-      const sysVal = sysPrompt === defaultSysPrompt ? null : sysPrompt
-      const sumVal = sumPrompt === defaultSumPrompt ? null : sumPrompt
-      await window.api.savePrompts({ systemPrompt: sysVal, summarizePrompt: sumVal })
-      setPromptsDirty(false)
+      let latest = prompts
+      for (const p of prompts) {
+        const draft = promptDrafts[p.id] ?? p.text
+        // savePromptOverride removes the override when the draft equals the default.
+        if (draft !== p.text) latest = await window.api.savePrompt(p.id, draft)
+      }
+      applyPromptList(latest)
     } finally {
       setSaving(false)
     }
   }
 
   const handleResetPrompts = async () => {
-    setSysPrompt(defaultSysPrompt)
-    setSumPrompt(defaultSumPrompt)
-    await window.api.savePrompts({ systemPrompt: null, summarizePrompt: null })
-    setPromptsDirty(false)
+    setSaving(true)
+    try {
+      applyPromptList(await window.api.resetAllPrompts())
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleOpenPromptsDir = async () => {
+    try { await window.api.openPromptsDir() } catch {}
   }
 
   const handleResetAllDefaults = async () => {
@@ -334,7 +345,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
         window.api.getConfig(),
         window.api.detectResources(),
         window.api.getTools(),
-        window.api.getPrompts(),
+        window.api.resetAllPrompts(),
       ])
       const gpuMode = c.gpuMode ?? 'single'
       const gpuIndex = c.gpuIndex ?? r.gpus[0]?.index ?? 0
@@ -369,10 +380,8 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
         webSearchProvider: c.webSearchProvider ?? (c.searxngBaseUrl ? 'custom-searxng' : 'disabled'),
         searxngBaseUrl: c.searxngBaseUrl ?? null,
       }))
-      setSysPrompt(p.defaultSystemPrompt)
-      setSumPrompt(p.defaultSummarizePrompt)
-      setDefaultSysPrompt(p.defaultSystemPrompt)
-      setDefaultSumPrompt(p.defaultSummarizePrompt)
+      setPrompts(p)
+      setPromptDrafts(Object.fromEntries(p.map((x) => [x.id, x.text])))
       setDirty(false)
       setAgentDirty(false)
       setPromptsDirty(false)
@@ -527,14 +536,15 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
           {tab === 'prompts' && (
             <PromptsTab
               appLanguage={appLanguage}
-              sysPrompt={sysPrompt}
-              sumPrompt={sumPrompt}
-              defaultSysPrompt={defaultSysPrompt}
-              defaultSumPrompt={defaultSumPrompt}
-              onSysChange={(v) => { setSysPrompt(v); setPromptsDirty(true) }}
-              onSumChange={(v) => { setSumPrompt(v); setPromptsDirty(true) }}
-              onResetSys={() => { setSysPrompt(defaultSysPrompt); setPromptsDirty(true) }}
-              onResetSum={() => { setSumPrompt(defaultSumPrompt); setPromptsDirty(true) }}
+              prompts={prompts}
+              drafts={promptDrafts}
+              onEdit={(id, v) => { setPromptDrafts((d) => ({ ...d, [id]: v })); setPromptsDirty(true) }}
+              onResetOne={(id) => {
+                const def = prompts.find((p) => p.id === id)?.defaultText ?? ''
+                setPromptDrafts((d) => ({ ...d, [id]: def }))
+                setPromptsDirty(true)
+              }}
+              onOpenDir={handleOpenPromptsDir}
             />
           )}
         </div>
@@ -599,7 +609,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
               disabled={saving}
               className="px-4 py-2 text-sm rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer transition-colors disabled:opacity-50"
             >
-              {appLanguage === 'ru' ? 'Сбросить оба' : 'Reset both'}
+              {appLanguage === 'ru' ? 'Сбросить все' : 'Reset all'}
             </button>
             <button
               onClick={handleSavePrompts}
@@ -1501,85 +1511,93 @@ function ToolEditor({
 // Prompts tab
 // ---------------------------------------------------------------------------
 
+const PROMPT_GROUP_LABELS: Record<string, { ru: string; en: string }> = {
+  system: { ru: 'Системные промпты агента', en: 'Agent system prompts' },
+  intake: { ru: 'Разбор запроса на исследование', en: 'Research intake' },
+  screening: { ru: 'Отбор источников (скрининг)', en: 'Source screening' },
+  report: { ru: 'Сборка отчёта', en: 'Report composition' },
+  critic: { ru: 'Критик / саморефлексия', en: 'Critic / self-reflection' },
+  'sub-researcher': { ru: 'Под-исследователь', en: 'Sub-researcher' },
+}
+
 function PromptsTab({
-  appLanguage, sysPrompt, sumPrompt, defaultSysPrompt, defaultSumPrompt,
-  onSysChange, onSumChange, onResetSys, onResetSum,
+  appLanguage, prompts, drafts, onEdit, onResetOne, onOpenDir,
 }: {
   appLanguage: AppLanguage
-  sysPrompt: string
-  sumPrompt: string
-  defaultSysPrompt: string
-  defaultSumPrompt: string
-  onSysChange: (v: string) => void
-  onSumChange: (v: string) => void
-  onResetSys: () => void
-  onResetSum: () => void
+  prompts: PromptListItem[]
+  drafts: Record<string, string>
+  onEdit: (id: string, v: string) => void
+  onResetOne: (id: string) => void
+  onOpenDir: () => void
 }) {
-  const sysIsDefault = sysPrompt === defaultSysPrompt
-  const sumIsDefault = sumPrompt === defaultSumPrompt
   const L = appLanguage === 'ru'
+  const groups: string[] = []
+  for (const p of prompts) if (!groups.includes(p.group)) groups.push(p.group)
 
   return (
     <div className="space-y-6">
-      <SettingsSection
-        title={L ? 'Системный промпт' : 'System prompt'}
-        description={L ? 'Главные инструкции для агента: стиль работы, ограничения, приоритеты и общий характер поведения.' : 'Main instructions for the agent: work style, constraints, priorities, and general behavior.'}
-      >
-        <div className="flex items-center justify-between mb-2">
-          <label className="block text-sm font-medium text-zinc-300">{L ? 'Системный промпт' : 'System prompt'}</label>
-          {!sysIsDefault && (
-            <button
-              onClick={onResetSys}
-              className="text-[10px] px-2 py-0.5 rounded text-zinc-500 hover:text-amber-400 hover:bg-amber-500/10 cursor-pointer transition-colors"
-            >
-              {L ? 'Вернуть по умолчанию' : 'Reset to default'}
-            </button>
-          )}
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3 flex items-start gap-3">
+        <div className="flex-1 text-[11px] text-zinc-500 leading-relaxed">
+          {L
+            ? 'Все промпты хранятся в редактируемых файлах. Правки из этого окна (или из файлов в папке промптов) переопределяют встроенные версии и подхватываются автоматически. Токены вида {{name}} подставляются на лету — не удаляйте их.'
+            : 'Every prompt lives in an editable file. Edits here (or in the prompts folder) override the built-in versions and are picked up automatically. {{name}} tokens are filled at runtime — keep them.'}
         </div>
-        <p className="text-[11px] text-zinc-600 mb-2">
-          {L ? 'Основные инструкции для агента: стиль работы, правила, поведение' : 'Core instructions for the agent: work style, rules, behavior'}
-        </p>
-        <textarea
-          value={sysPrompt}
-          onChange={(e) => onSysChange(e.target.value)}
-          rows={14}
-          spellCheck={false}
-          className="w-full px-3 py-2.5 bg-zinc-900 border border-zinc-700 rounded-xl text-xs text-zinc-300 font-mono leading-relaxed focus:border-blue-500 outline-none resize-y min-h-[120px]"
-        />
-        {sysIsDefault && (
-          <p className="text-[10px] text-zinc-700 mt-1">{L ? 'Используется промпт по умолчанию' : 'Using default prompt'}</p>
-        )}
-      </SettingsSection>
+        <button
+          onClick={onOpenDir}
+          className="shrink-0 px-3 py-1.5 text-xs rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer transition-colors"
+        >
+          {L ? 'Открыть папку промптов' : 'Open prompts folder'}
+        </button>
+      </div>
 
-      <SettingsSection
-        title={L ? 'Промпт суммаризации' : 'Summarization prompt'}
-        description={L ? 'Используется, когда агенту нужно сжать накопленный контекст и продолжить работу без потери сути.' : 'Used when the agent needs to compress accumulated context and continue without losing key information.'}
-      >
-        <div className="flex items-center justify-between mb-2">
-          <label className="block text-sm font-medium text-zinc-300">{L ? 'Промпт суммаризации' : 'Summarization prompt'}</label>
-          {!sumIsDefault && (
-            <button
-              onClick={onResetSum}
-              className="text-[10px] px-2 py-0.5 rounded text-zinc-500 hover:text-amber-400 hover:bg-amber-500/10 cursor-pointer transition-colors"
-            >
-              {L ? 'Вернуть по умолчанию' : 'Reset to default'}
-            </button>
-          )}
-        </div>
-        <p className="text-[11px] text-zinc-600 mb-2">
-          {L ? 'Инструкция для сжатия контекста при приближении к лимиту' : 'Instructions for compressing context when approaching the limit'}
-        </p>
-        <textarea
-          value={sumPrompt}
-          onChange={(e) => onSumChange(e.target.value)}
-          rows={8}
-          spellCheck={false}
-          className="w-full px-3 py-2.5 bg-zinc-900 border border-zinc-700 rounded-xl text-xs text-zinc-300 font-mono leading-relaxed focus:border-blue-500 outline-none resize-y min-h-[80px]"
-        />
-        {sumIsDefault && (
-          <p className="text-[10px] text-zinc-700 mt-1">{L ? 'Используется промпт по умолчанию' : 'Using default prompt'}</p>
-        )}
-      </SettingsSection>
+      {groups.map((g) => {
+        const label = PROMPT_GROUP_LABELS[g]?.[L ? 'ru' : 'en'] ?? g
+        return (
+          <SettingsSection key={g} title={label} description="">
+            <div className="space-y-5">
+              {prompts.filter((p) => p.group === g).map((p) => {
+                const draft = drafts[p.id] ?? p.text
+                const isDefault = draft === p.defaultText
+                return (
+                  <div key={p.id}>
+                    <div className="flex items-center justify-between mb-1 gap-2">
+                      <label className="block text-sm font-medium text-zinc-300">
+                        {p.title}
+                        {!isDefault && (
+                          <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 align-middle">
+                            {L ? 'изменён' : 'overridden'}
+                          </span>
+                        )}
+                      </label>
+                      {!isDefault && (
+                        <button
+                          onClick={() => onResetOne(p.id)}
+                          className="text-[10px] px-2 py-0.5 rounded text-zinc-500 hover:text-amber-400 hover:bg-amber-500/10 cursor-pointer transition-colors shrink-0"
+                        >
+                          {L ? 'Вернуть по умолчанию' : 'Reset to default'}
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-zinc-600 mb-1.5">{p.description}</p>
+                    {p.placeholders.length > 0 && (
+                      <p className="text-[10px] text-zinc-600 mb-2 font-mono">
+                        {(L ? 'Токены: ' : 'Tokens: ') + p.placeholders.map((x) => `{{${x}}}`).join('  ')}
+                      </p>
+                    )}
+                    <textarea
+                      value={draft}
+                      onChange={(e) => onEdit(p.id, e.target.value)}
+                      rows={Math.min(20, Math.max(4, draft.split('\n').length + 1))}
+                      spellCheck={false}
+                      className="w-full px-3 py-2.5 bg-zinc-900 border border-zinc-700 rounded-xl text-xs text-zinc-300 font-mono leading-relaxed focus:border-blue-500 outline-none resize-y min-h-[80px]"
+                    />
+                  </div>
+                )
+              })}
+            </div>
+          </SettingsSection>
+        )
+      })}
     </div>
   )
 }

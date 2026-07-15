@@ -161,7 +161,10 @@ function fetchJson(url: string): Promise<any> {
 }
 
 function emitProgress(win: BrowserWindow, p: DownloadProgress) {
-  win.webContents.send('download-progress', p)
+  // Download progress streams in asynchronously; if the window was closed mid-download the
+  // BrowserWindow/webContents is destroyed and a naive send throws "Object has been destroyed".
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+  try { win.webContents.send('download-progress', p) } catch {}
 }
 
 function sleep(ms: number): Promise<void> {

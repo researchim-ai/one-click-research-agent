@@ -1,6 +1,8 @@
 // Pure, dependency-free parsing/sanitization for the LLM research-intake response.
 // Kept separate from main.ts (which pulls in Electron) so it can be unit-tested.
 
+import { renderPrompt } from './prompts'
+
 export function lastBalancedJsonObject(s: string): string | null {
   let depth = 0
   let start = -1
@@ -81,35 +83,7 @@ function todayIso(): string {
 }
 
 function buildIntakeSystemPrompt(currentDate: string): string {
-  return [
-  `Today's date is ${currentDate} (YYYY-MM-DD). Treat this as "now" for every relative time expression; NEVER assume a different or past year.`,
-  'You are the parameter planner for a research-run UI. You are the ONLY component that fills these parameters — there is no fallback keyword/regex parser, so analyze the user request carefully and return complete, sensible values.',
-  'Return ONLY compact JSON with a top-level "patch" object. No prose, no markdown, no code fences.',
-  'Allowed patch keys: topic, profileId, researchKind, mode, dateRange, customDateRange, maxSources, needFullText, minSelectedSources, minFullTextReads, evidencePerSection, strictDateRange, requireQualityPass, reportLanguage, outputs, checkpoints, extraDirections.',
-  'Choose profileId by matching the domain: ML/AI, LLM, RL, deep learning, NLP, transformers, neural networks → "ml-ai"; life sciences / medicine / genetics → "biology"; math / theorems / proofs → "mathematics"; academic finance / economics research → "finance"; reproducing a paper end-to-end with code → "paper-reproduction". Use "universal" for general / consumer / everyday / web topics (e.g. "сколько стоят квартиры", "какой ноутбук купить"). For an ACADEMIC request always pick the matching DOMAIN profile, NOT "universal"; reserve "universal" for general (web) research.',
-  'CRITICAL — researchKind ("academic" or "general") is REQUIRED; ALWAYS include it. It decides whether the SCIENTIFIC pipeline and academic quality gates (survey/review coverage, recency) apply.',
-  ' Use "academic" whenever the user wants scholarly/scientific work: research papers / scientific articles / научные статьи / preprints / arXiv / PubMed / OpenAlex / citations / systematic or literature reviews / benchmarks, OR the topic is a research field (ML/AI, LLM, RL, deep learning, physics, chemistry, biology, mathematics, medicine, economics research), OR the user asks to review/analyze/cite a number of papers/sources. Academic examples: "ресеч на тему RL в LLM по самым новым статьям, разобрать 50 источников" → academic (profileId ml-ai); "обзор методов diffusion models" → academic; "сравни подходы к выравниванию LLM по статьям" → academic; "systematic review of X" → academic.',
-  ' Use "general" for everyday / consumer / how-to / product / shopping / pricing / market-price / local-info / news topics that just need web sources, even if the topic brushes a domain like finance or biology. General examples: "сколько стоят квартиры в Магадане" → general; "какой ноутбук купить" → general; "как настроить роутер" → general; "цены на недвижимость" → general. The "general" kind relaxes academic-only gates and prioritizes web sources.',
-  ' Decide academic vs general from the user INTENT (do they want scientific literature, or practical/consumer web info?), not from a single keyword. researchKind and profileId must be consistent: academic ↔ a domain profile; general ↔ universal.',
-  'Allowed modes: quick, deep, systematic, reproduction, idea-scout. Pick the mode that matches the requested depth/rigor; default to deep, use systematic for "обзор/review/строго", quick for "быстро/кратко".',
-  'Allowed dateRange: any, last-year, last-2-years, since-2024, custom.',
-  ` DATE HANDLING (compute everything from today = ${currentDate}):`,
-  '  • Sub-year / recent windows — "last week / за последнюю неделю / свежее за неделю", "last month / за месяц", "last N days", "last quarter", "за последние полгода", or any span shorter than a full year — MUST use dateRange "custom" with customDateRange as an EXACT day range "YYYY-MM-DD..YYYY-MM-DD" computed relative to today. Examples given today: "последняя неделя" → the 7 days ending today; "последний месяц" → the ~30 days ending today; "за 3 дня" → the 3 days ending today. The end date is today unless the user says otherwise.',
-  '  • Explicit whole years ("за 2024", "2023-2025") → dateRange "custom" with "YYYY-01-01..YYYY-12-31" spanning those years.',
-  '  • Coarse relative year windows map to the enum: "за последний год" → last-year; "за 2 года / последние пару лет" → last-2-years; "с 2024" → since-2024. "любой период / без ограничений" → any.',
-  '  • NEVER emit a stale/guessed year (e.g. 2024) for a request that is relative to now — always anchor to today\'s date above. Set strictDateRange true unless the user allows any period.',
-  'Allowed reportLanguage: ru, en. Infer from the user request; otherwise use appLanguage.',
-  'Meaning of numeric keys: maxSources = how many papers/sources to discover and build the corpus from (the raw cap). minSelectedSources = minimum papers kept after screening. minFullTextReads = minimum papers read in full.',
-  'ALWAYS include researchKind, maxSources, minSelectedSources, minFullTextReads in the patch. If the user gives no count, pick reasonable values for the chosen profile/mode (e.g. ML/AI systematic ≈ maxSources 40). An explicit user number ALWAYS overrides profile defaults. Do NOT confuse a count with a year ("2024") or a time span ("2 года").',
-  'CRITICAL — how many sources end up IN THE REPORT. Any explicit count N of papers/sources/статей/источников is, BY DEFAULT, how many sources must be PRESENTED in the final report (e.g. "не менее 50 статей", "статьи самые новые не менее 50", "минимум 100 источников", "report with 50 references"). The report shows exactly the top-N most relevant; discovery and full-text reading are deliberately LARGER than N.',
-  ' For such a report count N: set minSelectedSources = N (this is the number shown in the report; cap 200); set minFullTextReads = N (read at least as many as the report presents; cap 200); set maxSources = round(2.5*N) but at least 30 (cap 200) — discovery must exceed N so the best N can be chosen.',
-  ' ONLY treat N as a DISCOVERY/search count (not report count) when the user explicitly talks about FINDING/COLLECTING that many, e.g. "найди/собери/просмотри не менее N статей" with no mention of the report. In that case set maxSources = N (cap 200), minSelectedSources = round(0.4*N), minFullTextReads = round(0.4*N).',
-  ' When in doubt, ALWAYS use the report-count interpretation. The count word (статей/источников/papers/sources) may come before or after the number. Never silently shrink the user number (do NOT turn "50" into 23).',
-  'Other toggles to infer from the request (use sensible defaults otherwise): needFullText = true when the user wants full-text reading / "полный текст / full text / читать статьи целиком" or for deep/systematic modes; requireQualityPass = true when the user says "строго / только по источникам / с проверкой / тщательно"; evidencePerSection default 2, raise to 3 for "тщательно/много доказательств"; outputs default ["brief","report","evidence-matrix"], add "ideas" if the user wants brainstorming/идеи. strictDateRange = true when a period is given and the user did not say "любой период / можно старые".',
-  'Always set a topic from the user request unless they truly gave none; strip meta words like counts/dates/language from the topic itself.',
-  'Checkpoints control where the run PAUSES for the user. This is auto-research: default checkpoints to ["plan"] (approve the plan, then run autonomously to report.md). Only add "corpus", "evidence" or "report" if the user explicitly asks to review that phase. If the user asks for fully autonomous / no pauses, use [].',
-  'Preserve currentDraft values the user did not change.',
-  ].join('\n')
+  return renderPrompt('intake.system', { currentDate })
 }
 
 // Builds the exact /v1/chat/completions request body used for LLM-driven intake.

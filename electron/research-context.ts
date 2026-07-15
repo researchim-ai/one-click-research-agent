@@ -222,10 +222,13 @@ export function primaryNextAction(a: {
     return 'The run is complete — report.md exists and gates are satisfied. Give the user a short final summary and stop; do not call more tools.'
   }
   if (a.blockers) {
-    const b = /quote|citation|цит/i.test(a.blockers)
-      ? 'Repair missing evidence quotes/citations with repair_evidence_quotes, then run_quality_gates once.'
-      : 'Fix the failing quality-gate blocker(s) listed below with the recommended repair tool, then run_quality_gates once.'
-    return b
+    if (/quote|citation|цит/i.test(a.blockers)) {
+      return 'Repair missing evidence quotes/citations with repair_evidence_quotes, then run_quality_gates once.'
+    }
+    if (/evidence row|needs selected\+read|per section|plan item|Q\d+:/i.test(a.blockers)) {
+      return 'A plan subtopic is short on evidence: assign a selected+read source to it (assign_corpus_to_plan) and extract ONE more grounded claim for it (extract_evidence_from_corpus_item / record_evidence). If no read source can support that subtopic, do NOT pad or fake it — and never call update_plan_status to satisfy this gate. Just call run_quality_gates again: a genuinely thin subtopic is downgraded to a documented limitation so the run finishes.'
+    }
+    return 'Fix the failing quality-gate blocker(s) listed below with the recommended repair tool, then run_quality_gates once.'
   }
   // Discovery not yet folded into a corpus.
   if (a.corpusTotal === 0 && a.gatheredSources > 0) {
