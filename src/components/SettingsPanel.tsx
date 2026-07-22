@@ -639,6 +639,75 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 }
 
 // ---------------------------------------------------------------------------
+// llama.cpp version / update
+// ---------------------------------------------------------------------------
+
+function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
+  const L = appLanguage === 'ru'
+  const [info, setInfo] = useState<{ tag: string | null; latestTag: string | null; updateAvailable: boolean; installed: boolean } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState('')
+  const [done, setDone] = useState<string | null>(null)
+
+  const refresh = async (checkLatest: boolean) => {
+    try { setInfo(await window.api.getLlamaInfo(checkLatest)) } catch {}
+  }
+
+  useEffect(() => { refresh(true) }, [])
+
+  const handleUpdate = async () => {
+    setBusy(true); setDone(null); setProgress('')
+    const off = window.api.onBuildStatus((s) => setProgress(s))
+    try {
+      const r = await window.api.updateLlama()
+      const restartNote = r.restarted ? (L ? ', сервер перезапущен' : ', server restarted') : (r.wasRunning ? (L ? ', но сервер не поднялся — запустите вручную' : ', but server did not come back — start it manually') : '')
+      setDone(r.updated
+        ? (L ? `Обновлено ${r.previousTag ?? '—'} → ${r.tag}${restartNote}.` : `Updated ${r.previousTag ?? '—'} → ${r.tag}${restartNote}.`)
+        : (L ? `Уже последняя версия (${r.tag ?? '—'})${restartNote}.` : `Already the latest version (${r.tag ?? '—'})${restartNote}.`))
+      await refresh(true)
+    } catch (e: any) {
+      setDone((L ? 'Ошибка обновления: ' : 'Update failed: ') + (e?.message ?? e))
+    } finally {
+      off?.()
+      setBusy(false)
+    }
+  }
+
+  return (
+    <SettingsSection
+      title={L ? 'Версия llama.cpp' : 'llama.cpp version'}
+      description={L ? 'Движок инференса. Обновление скачивает последний релиз с GitHub и автоматически перезапускает сервер, чтобы всё было готово к работе.' : 'The inference engine. Updating downloads the latest GitHub release and automatically restarts the server so it is ready to work.'}
+    >
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="text-sm text-zinc-300">
+          <div>
+            {L ? 'Установлено' : 'Installed'}:{' '}
+            <span className="font-mono text-zinc-100">{info?.tag ?? (info?.installed ? (L ? 'неизвестно' : 'unknown') : (L ? 'не установлено' : 'not installed'))}</span>
+          </div>
+          {info?.latestTag && (
+            <div className="text-[11px] text-zinc-500 mt-0.5">
+              {L ? 'Последняя на GitHub' : 'Latest on GitHub'}: <span className="font-mono">{info.latestTag}</span>
+              {info.updateAvailable
+                ? <span className="ml-2 text-amber-400">{L ? '● доступно обновление' : '● update available'}</span>
+                : (info.tag ? <span className="ml-2 text-emerald-500">{L ? '● актуально' : '● up to date'}</span> : null)}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={handleUpdate}
+          disabled={busy}
+          className="px-4 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-500 cursor-pointer transition-colors disabled:opacity-50"
+        >
+          {busy ? (L ? 'Обновление…' : 'Updating…') : (L ? 'Обновить до последней' : 'Update to latest')}
+        </button>
+      </div>
+      {busy && progress && <p className="text-xs text-zinc-500 mt-3 font-mono truncate">{progress}</p>}
+      {done && <p className="text-xs mt-3 text-zinc-400">{done}</p>}
+    </SettingsSection>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Model & Context tab
 // ---------------------------------------------------------------------------
 
@@ -671,6 +740,7 @@ function ModelTab({
 
   return (
     <div className="space-y-6">
+      <LlamaUpdateSection appLanguage={appLanguage} />
       {hasMultipleGpus && (
         <SettingsSection
           title={appLanguage === 'ru' ? 'GPU и размещение модели' : 'GPU & model placement'}

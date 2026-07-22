@@ -64,6 +64,7 @@ import * as planner from './planner'
 import * as knowledgeIndex from './knowledge-index'
 import { corpusStats, getCorpusSelection, setCorpusItemIncluded } from './corpus'
 import { evidenceStats } from './evidence'
+import { readResearchRunSpec } from './research-workflow'
 import { loadIdeas } from './idea-scout'
 import { getResearchProfileByPresetId, RESEARCH_PROFILES } from '../research-profiles'
 import { parseInferredResearchPatch, buildResearchIntakeRequestBody } from './research-intake-parse'
@@ -642,6 +643,55 @@ function registerIpcHandlers() {
     return { requestedCtx: ctxSize, actualCtx }
   })
 
+  // Bring the llama-server up with the currently selected model + ctx. Shared by the
+  // update flow and any future restart path. Returns whether it actually started.
+  const bootServer = async (): Promise<boolean> => {
+    let modelPath = modelManager.getModelPath()
+    if (!modelPath) return false
+    loadModelArch(modelPath)
+    const ctxSize = config.get('ctxSize')
+    serverManager.start(modelPath, mainWindow ?? undefined, undefined, modelManager.getSelectedQuant(), ctxSize)
+    await serverManager.waitReady(300, mainWindow ?? undefined)
+    return true
+  }
+
+  ipcMain.handle('get-llama-info', async (_e, checkLatest?: boolean) => {
+    const info = serverManager.getInstalledInfo()
+    const latestTag = checkLatest ? await serverManager.getLatestReleaseTag() : null
+    return {
+      ...info,
+      latestTag,
+      updateAvailable: Boolean(checkLatest && latestTag && info.tag && latestTag !== info.tag),
+    }
+  })
+
+  // Update llama.cpp to the newest release, then automatically restart the server so the
+  // app is immediately ready to work on the fresh build. The old binary stays in place if
+  // the download fails, and we bring the server back up either way.
+  ipcMain.handle('update-llama', async () => {
+    if (!mainWindow) throw new Error('No window')
+    const wasRunning = serverManager.isRunning()
+    // Stop first: on Windows the running llama-server.exe is locked and cannot be overwritten.
+    serverManager.stop()
+    await new Promise((r) => setTimeout(r, 1500))
+    let result: { previousTag: string | null; tag: string | null; updated: boolean }
+    try {
+      result = await serverManager.updateBinary(mainWindow)
+    } catch (e) {
+      // Update failed — restore the previous server so the app stays usable, then surface the error.
+      try { await bootServer() } catch {}
+      throw e
+    }
+    let restarted = false
+    try {
+      restarted = await bootServer()
+      console.log(`[update-llama] ${result.previousTag ?? '—'} → ${result.tag ?? '—'}, restarted=${restarted}`)
+    } catch (e) {
+      console.error('[update-llama] restart after update failed:', e)
+    }
+    return { ...result, restarted, wasRunning }
+  })
+
   // Window control handlers (frameless window)
   ipcMain.on('win-minimize', () => mainWindow?.minimize())
   ipcMain.on('win-maximize', () => {
@@ -819,50 +869,91 @@ function registerIpcHandlers() {
 
   ipcMain.handle('infer-research-request', async (_e, payload: any) => inferResearchRequest(payload))
 
-  ipcMain.handle('get-research-dashboard', (_e, workspace: string) => {
-    const emptyCorpus = { total: 0, primary: 0, selected: 0, rejected: 0, needsReview: 0, queuedFullText: 0, read: 0, failed: 0, withDoi: 0, withArxiv: 0, selectedRead: 0, highPriority: 0, highPriorityRead: 0 }
-    const quality = (ws: string) => {
+  // Most-recently-updated managed run directory (".research/<ts>_<slug>"), or null.
+  const findLatestRunDir = (ws: string): string | null => {
+    const root = path.join(ws, '.research')
+    if (!fs.existsSync(root)) return null
+    const RUN_RE = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_/
+    let best: { name: string; mtime: number } | null = null
+    let names: string[] = []
+    try { names = fs.readdirSync(root) } catch { return null }
+    for (const name of names) {
+      if (!RUN_RE.test(name)) continue
       try {
-        const p = path.join(ws, '.research', 'quality-gates.json')
-        if (!fs.existsSync(p)) return { blockers: [] as string[] }
+        const st = fs.statSync(path.join(root, name, 'run.json'))
+        if (st.isFile() && (!best || st.mtimeMs > best.mtime)) best = { name, mtime: st.mtimeMs }
+      } catch {}
+    }
+    return best ? `.research/${best.name}` : null
+  }
+
+  ipcMain.handle('get-research-dashboard', (_e, workspace: string) => {
+    const profile = getResearchProfileByPresetId(config.get('selectedPreset'))
+    const emptyCorpus = { total: 0, primary: 0, selected: 0, rejected: 0, needsReview: 0, queuedFullText: 0, read: 0, failed: 0, withDoi: 0, withArxiv: 0, selectedRead: 0, highPriority: 0, highPriorityRead: 0 }
+    const base: any = {
+      profile,
+      run: null,
+      plan: { total: 0, done: 0, pct: 0 },
+      corpus: emptyCorpus,
+      evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
+      quality: { blockers: [] as string[] },
+      ideas: 0,
+      index: { chunks: 0, docs: 0, hasVectors: false },
+    }
+    if (!workspace) return base
+
+    // Read blockers from a specific run/root quality-gates.json (dir = folder containing it).
+    const qualityFrom = (dir: string) => {
+      try {
+        const p = path.join(dir, 'quality-gates.json')
+        if (!fs.existsSync(p)) return [] as string[]
         const data = JSON.parse(fs.readFileSync(p, 'utf-8'))
-        const blockers = (data.results || []).filter((r: any) => !r.passed).flatMap((r: any) => (r.blockers || []).map((b: string) => `${r.gate}: ${b}`))
-        return { blockers: blockers.slice(0, 8) }
-      } catch { return { blockers: [] as string[] } }
+        return (data.results || []).filter((r: any) => !r.passed)
+          .flatMap((r: any) => (r.blockers || []).map((b: string) => `${r.gate}: ${b}`)).slice(0, 8)
+      } catch { return [] as string[] }
     }
-    if (!workspace) {
-      return {
-        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
-        plan: { total: 0, done: 0, pct: 0 },
-        corpus: emptyCorpus,
-        evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
-        quality: { blockers: [] },
-        ideas: 0,
-        index: { chunks: 0, docs: 0, hasVectors: false },
-      }
-    }
+
+    try { base.ideas = loadIdeas(workspace).length } catch {}
+    try { base.index = knowledgeIndex.indexStats(workspace) } catch {}
+
+    // Dashboard now reflects the ACTIVE (latest) managed run's per-run directory, where
+    // artifacts actually live — the old code read the shared .research root, which managed
+    // runs never write to, so every metric was permanently 0.
+    const outputDir = findLatestRunDir(workspace)
     try {
-      const items = planner.parsePlan(workspace)
-      return {
-        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
-        plan: planner.planProgress(items),
-        corpus: corpusStats(workspace),
-        evidence: evidenceStats(workspace),
-        quality: quality(workspace),
-        ideas: loadIdeas(workspace).length,
-        index: knowledgeIndex.indexStats(workspace),
+      const items = planner.parsePlan(workspace, outputDir ?? undefined)
+      base.plan = planner.planProgress(items)
+      base.corpus = corpusStats(workspace, outputDir ?? undefined)
+      base.evidence = evidenceStats(workspace, outputDir ?? undefined)
+      if (outputDir) {
+        const runDir = path.join(workspace, outputDir)
+        base.quality = { blockers: qualityFrom(runDir) }
+        let spec: any = null
+        try { spec = readResearchRunSpec(workspace, outputDir) } catch {}
+        if (spec) {
+          const gateScores = spec.gateScores ?? {}
+          base.run = {
+            outputDir,
+            reportPath: path.join(runDir, 'report.md'),
+            reportReady: fs.existsSync(path.join(runDir, 'report.md')),
+            topic: spec.topic ?? (() => { try { return planner.planQuestion(workspace, outputDir) } catch { return null } })(),
+            state: spec.state,
+            lastTool: spec.lastTool ?? null,
+            updatedAt: spec.updatedAt,
+            downgradedGates: spec.downgradedGates ?? [],
+            gates: Object.keys(gateScores).map((gate) => ({
+              gate,
+              score: gateScores[gate],
+              downgraded: (spec.downgradedGates ?? []).includes(gate),
+              failing: (spec.lastGateFailures ?? []).some((f: any) => f.gate === gate),
+            })),
+          }
+        }
+      } else {
+        base.quality = { blockers: qualityFrom(path.join(workspace, '.research')) }
       }
-    } catch {
-      return {
-        profile: getResearchProfileByPresetId(config.get('selectedPreset')),
-        plan: { total: 0, done: 0, pct: 0 },
-        corpus: emptyCorpus,
-        evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
-        quality: { blockers: [] },
-        ideas: 0,
-        index: { chunks: 0, docs: 0, hasVectors: false },
-      }
-    }
+    } catch {}
+    return base
   })
 
   // Non-blocking source review: toggle a single source in/out of the selected set.
@@ -978,6 +1069,43 @@ function registerIpcHandlers() {
     }
     runs.sort((a, b) => b.createdAt - a.createdAt || b.mtime - a.mtime)
     return runs
+  })
+
+  // Compact "run graph" snapshot for the activity drawer: the FSM state + transition history
+  // + gate health for a managed research run. With no explicit outputDir, picks the most
+  // recently updated run that has a run.json. Returns null for non-research sessions (the
+  // drawer then shows only the live tool timeline it accumulates from agent events).
+  ipcMain.handle('get-run-graph', (_e, workspace: string, outputDir?: string) => {
+    if (!workspace) return null
+    const root = path.join(workspace, '.research')
+    if (!fs.existsSync(root)) return null
+    let targetOutputDir = outputDir && String(outputDir).trim() ? String(outputDir).trim() : findLatestRunDir(workspace)
+    if (!targetOutputDir) return null
+    let spec
+    try { spec = readResearchRunSpec(workspace, targetOutputDir) } catch { spec = null }
+    if (!spec) return null
+    let topic: string | null = spec.topic ?? null
+    try { if (!topic) topic = planner.planQuestion(workspace, targetOutputDir) } catch {}
+    const gateScores = spec.gateScores ?? {}
+    const gates = Object.keys(gateScores).map((gate) => ({
+      gate,
+      score: gateScores[gate],
+      attempts: spec.gateAttempts?.[gate] ?? 0,
+      downgraded: (spec.downgradedGates ?? []).includes(gate),
+      failing: (spec.lastGateFailures ?? []).some((f) => f.gate === gate),
+    }))
+    return {
+      id: spec.id,
+      outputDir: targetOutputDir,
+      topic,
+      state: spec.state,
+      lastTool: spec.lastTool ?? null,
+      updatedAt: spec.updatedAt,
+      transitions: (spec.transitions ?? []).slice(-40),
+      gateFailures: spec.lastGateFailures ?? [],
+      gates,
+      downgradedGates: spec.downgradedGates ?? [],
+    }
   })
 
   // Delete a research run directory (and all its artifacts) from disk. Hardened: only a

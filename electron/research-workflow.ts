@@ -35,6 +35,10 @@ export interface ResearchRunSpec {
     subQuestions?: string[]
     yearFrom?: number
     yearTo?: number
+    /** Day-precise lower/upper bound (YYYY-MM-DD). Enforced ahead of yearFrom/yearTo so
+     * sub-year windows ("last 3 months") are honored instead of being floored to a year. */
+    fromDate?: string
+    toDate?: string
     maxSelected?: number
     minSelected?: number
     strictDateRange?: boolean
@@ -99,6 +103,11 @@ export const STRUCTURAL_GATES = new Set([
   // screen_corpus → run_quality_gates loop forever (the root cause of stalled runs).
   'selected_corpus_minimum',
   'plan_section_coverage',
+  // Self-reported plan completion. Checkboxes are now auto-reconciled from real evidence
+  // coverage (see reconcilePlanFromEvidence), so a lingering shortfall means some subtopic
+  // genuinely lacks enough sources — an availability limitation, not lack of effort. Downgrade
+  // it like the other coverage gates instead of blocking the report on a self-report proxy.
+  'plan_progress',
 ])
 
 // NOTE: topical_precision is deliberately NOT structural. It measures whether the selected

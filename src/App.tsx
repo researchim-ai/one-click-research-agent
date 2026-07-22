@@ -16,6 +16,8 @@ import { ResearchArtifacts } from './components/ResearchArtifacts'
 import { ResearchDashboard } from './components/ResearchDashboard'
 import { NewResearchDialog, type NewResearchRequest } from './components/NewResearchDialog'
 import { ResearchLibrary } from './components/ResearchLibrary'
+import { RunActivityDrawer } from './components/RunActivityDrawer'
+import { useRunActivity } from './hooks/useRunActivity'
 import { TitleBar } from './components/TitleBar'
 import { DiffViewer } from './components/DiffViewer'
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -47,6 +49,8 @@ export function App() {
   const [newResearchOpen, setNewResearchOpen] = useState(false)
   const [newResearchSeq, setNewResearchSeq] = useState(0)
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [runActivityOpen, setRunActivityOpen] = useState(false)
+  const runActivity = useRunActivity()
   const [diffView, setDiffView] = useState<{ filePath: string; original: string; modified: string } | null>(null)
   const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
   const [appLanguage, setAppLanguage] = useState<'ru' | 'en'>('ru')
@@ -151,6 +155,13 @@ export function App() {
     const yearArgs = hasBounds
       ? `\`year_from: ${yearBounds.from ?? '*'}\`, \`year_to: ${yearBounds.to ?? nowYear}\`, `
       : ''
+    // A genuine SUB-YEAR window (custom "YYYY-MM-DD..YYYY-MM-DD") must be enforced at day
+    // precision, not floored to a calendar year. For coarse enum ranges (last-2-years, etc.)
+    // year granularity is the intent, so we keep year_from/year_to only.
+    const isDayWindow = request.dateRange === 'custom' && /^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$/.test(request.customDateRange.trim())
+    const screenDateArgs = isDayWindow
+      ? `\`from_date: ${fromDate}\`, \`to_date: ${toDate}\`, `
+      : yearArgs
     // Non-academic ("general") topics use a separate, web-first contract: the tuned
     // academic pipeline stays the default, but for the general profile we tell the
     // agent to rely on web search and we relax academic-only quality gates.
@@ -195,14 +206,16 @@ export function App() {
       'Run parameters:',
       `- Store all artifacts in \`${runDir}\` (not the shared \`.research/\` root). Treat the directory as an opaque id: copy it exactly into \`output_dir\` for every tool that supports it. Never translate or re-slugify it.`,
       hasBounds
-        ? `- Date period is ${yearBounds.from ?? '*'}–${yearBounds.to ?? nowYear}. ENFORCE it: pass ${yearArgs}(or \`from_date: ${fromDate}\`, \`to_date: ${toDate}\`) to search_arxiv/search tools, and the same \`year_from\`/\`year_to\` to screen_corpus. ${request.strictDateRange ? 'strict_date_range is true — sources outside this period must be rejected, not just down-ranked.' : 'strict_date_range is false — prefer in-period sources but older seminal works are allowed.'}`
+        ? (isDayWindow
+          ? `- Date period is a SUB-YEAR window ${fromDate}..${toDate}. ENFORCE it at DAY precision: pass \`from_date: ${fromDate}\`, \`to_date: ${toDate}\` to search_arxiv/search tools AND the same \`from_date\`/\`to_date\` to screen_corpus (do NOT collapse it to a whole year — year_from/year_to alone would wrongly admit older ${yearBounds.from ?? nowYear} papers). ${request.strictDateRange ? 'strict_date_range is true — sources outside this window must be rejected, not just down-ranked; sources with no determinable date are kept for review but not auto-selected.' : 'strict_date_range is false — prefer in-window sources but older seminal works are allowed.'}`
+          : `- Date period is ${yearBounds.from ?? '*'}–${yearBounds.to ?? nowYear}. ENFORCE it: pass ${yearArgs}(or \`from_date: ${fromDate}\`, \`to_date: ${toDate}\`) to search_arxiv/search tools, and the same \`year_from\`/\`year_to\` to screen_corpus. ${request.strictDateRange ? 'strict_date_range is true — sources outside this period must be rejected, not just down-ranked.' : 'strict_date_range is false — prefer in-period sources but older seminal works are allowed.'}`)
         : '- No date restriction: do not filter by year, but still prefer recent work for fast-moving topics.',
       `- The final report.md must PRESENT exactly the top ${request.minSelectedSources} most relevant read sources (each with a short summary in ${reportLanguageLabel}, plus an overall synthesis). Discovery and full-text reading are intentionally LARGER than ${request.minSelectedSources} so the best ${request.minSelectedSources} can be chosen — do not stop discovery/reading at ${request.minSelectedSources}.`,
-      `- screen_corpus: \`min_selected: ${request.minSelectedSources}\` (FLOOR — at least this many on-topic selected so the report can present ${request.minSelectedSources}), \`max_selected: ${Math.min(request.maxSources, Math.max(request.minSelectedSources + 5, Math.round(request.minSelectedSources * 1.4)))}\` (select a bit more than the report needs), ${yearArgs}\`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`, \`research_kind: '${researchKind}'\`. To get the freshest work, pass \`sub_questions\` and prefer recent items; when discovering via search_arxiv use \`sort_by: 'submittedDate'\` for "latest/новые" requests.`,
+      `- screen_corpus: \`min_selected: ${request.minSelectedSources}\` (FLOOR — at least this many on-topic selected so the report can present ${request.minSelectedSources}), \`max_selected: ${Math.min(request.maxSources, Math.max(request.minSelectedSources + 5, Math.round(request.minSelectedSources * 1.4)))}\` (select a bit more than the report needs), ${screenDateArgs}\`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`, \`research_kind: '${researchKind}'\`. To get the freshest work, pass \`sub_questions\` and prefer recent items; when discovering via search_arxiv use \`sort_by: 'submittedDate'\` for "latest/новые" requests.`,
       `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`, \`research_kind: '${researchKind}'\`.`,
       isGeneral
         ? '- GENERAL (non-academic) research: prioritize web sources. Use `smart_search`/`search_web` to discover pages and `fetch_url` to read them; arXiv/OpenAlex/PubMed are optional and only when actually relevant. Survey/review coverage and recency are NOT required for this kind — do not waste turns hunting for academic surveys or recent-year papers; rank by topical relevance and source authority/credibility instead. Still ground every claim in a read source with a quote/passage.'
-        : '',
+        : '- ACADEMIC research: PREFER open, well-dated scholarly indexes — lead discovery with `search_arxiv` and `search_openalex` (then `search_semantic_scholar`/`search_crossref`/`search_pubmed`). These carry reliable dates and readable full text. Closed publisher landing pages (Springer/Elsevier/IEEE/ACM/Wiley) are usually paywalled and often undated, so they are down-ranked in screening and hard to read — do not rely on them: when a relevant paper is only a closed DOI, look up its arXiv/OpenAlex open-access version and read that instead.',
       `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources presented in the report (${request.minSelectedSources}). Report found/selected/read/evidence counts separately.`,
       request.requireQualityPass
         ? '- A quality pass is required before the report: data/evidence gates must pass before `generate_evidence_report`.'
@@ -497,6 +510,22 @@ export function App() {
             {appLanguage === 'ru' ? 'Мои исследования' : 'Library'}
           </button>
           <button
+            onClick={() => setRunActivityOpen((v) => !v)}
+            className={`relative flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] cursor-pointer transition-colors ${
+              runActivityOpen ? 'text-blue-200 bg-blue-500/15' : 'text-zinc-400 hover:text-zinc-100 bg-zinc-800/60 hover:bg-zinc-700/70'
+            }`}
+            style={{ WebkitAppRegion: 'no-drag' } as any}
+            title={appLanguage === 'ru' ? 'Ход выполнения: фазы, инструменты, ошибки' : 'Run activity: phases, tools, failures'}
+          >
+            <span className={`inline-block w-1.5 h-1.5 rounded-full ${runActivity.running ? 'bg-blue-400 animate-pulse' : 'bg-zinc-600'}`} />
+            {appLanguage === 'ru' ? 'Ход' : 'Activity'}
+            {runActivity.failedCount > 0 && (
+              <span className="ml-0.5 px-1 rounded-full bg-red-500/20 text-red-300 text-[10px] leading-tight border border-red-500/40">
+                {runActivity.failedCount}
+              </span>
+            )}
+          </button>
+          <button
             onClick={() => { setSettingsTab('model'); setSettingsOpen(true) }}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/80 cursor-pointer transition-colors"
             style={{ WebkitAppRegion: 'no-drag' } as any}
@@ -527,6 +556,18 @@ export function App() {
         onClose={() => setLibraryOpen(false)}
         onOpenReport={openFile}
         onNewResearch={openNewResearch}
+      />
+      <RunActivityDrawer
+        open={runActivityOpen}
+        onClose={() => setRunActivityOpen(false)}
+        workspace={workspace}
+        appLanguage={appLanguage}
+        steps={runActivity.steps}
+        currentPhase={runActivity.currentPhase}
+        activityLabel={runActivity.activityLabel}
+        running={runActivity.running}
+        failedCount={runActivity.failedCount}
+        toolStats={runActivity.toolStats}
       />
       {pendingExternalUrl && (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
@@ -659,6 +700,7 @@ export function App() {
                         workspace={workspace}
                         appLanguage={appLanguage}
                         onNewResearch={openNewResearch}
+                        onOpenReport={openFile}
                         onOpenSettings={() => {
                           setSettingsTab('agent')
                           setSettingsOpen(true)

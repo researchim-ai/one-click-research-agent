@@ -29,6 +29,8 @@ interface ElectronAPI {
   autoSetup(): Promise<void>
   downloadModel(): Promise<string>
   ensureLlama(): Promise<void>
+  getLlamaInfo(checkLatest?: boolean): Promise<{ variant: string | null; tag: string | null; installed: boolean; latestTag: string | null; updateAvailable: boolean }>
+  updateLlama(): Promise<{ previousTag: string | null; tag: string | null; updated: boolean; restarted: boolean; wasRunning: boolean }>
   startServer(): Promise<void>
   stopServer(): Promise<void>
   sendMessage(msg: string, workspace: string): Promise<string>
@@ -88,6 +90,17 @@ interface ElectronAPI {
   getResearchProfiles(): Promise<import('../research-profiles').ResearchProfile[]>
   getResearchDashboard(workspace: string): Promise<{
     profile: import('../research-profiles').ResearchProfile
+    run: {
+      outputDir: string
+      reportPath: string
+      reportReady: boolean
+      topic: string | null
+      state: string
+      lastTool: string | null
+      updatedAt: number
+      downgradedGates: string[]
+      gates: Array<{ gate: string; score: number; downgraded: boolean; failing: boolean }>
+    } | null
     plan: { total: number; done: number; pct: number }
     corpus: { total: number; primary: number; selected: number; rejected: number; needsReview: number; queuedFullText: number; read: number; failed: number; withDoi: number; withArxiv: number; selectedRead: number; highPriority: number; highPriorityRead: number }
     evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number; withCorpus?: number; withQuotes?: number }
@@ -95,6 +108,7 @@ interface ElectronAPI {
     ideas: number
     index: { chunks: number; docs: number; hasVectors: boolean }
   }>
+  getRunGraph(workspace: string, outputDir?: string): Promise<RunGraphData | null>
   inferResearchRequest(payload: {
     message: string
     draft: any
@@ -129,6 +143,18 @@ interface ElectronAPI {
 }
 
 declare global {
+  interface RunGraphData {
+    id: string
+    outputDir: string
+    topic: string | null
+    state: 'INIT' | 'PLANNED' | 'CORPUS_READY' | 'READING' | 'EVIDENCE' | 'GATES_PENDING' | 'GATES_FAILED' | 'GATES_PASSED' | 'REPORT_READY' | 'BLOCKED'
+    lastTool: string | null
+    updatedAt: number
+    transitions: Array<{ at: number; from: string; to: string; event: string; tool?: string }>
+    gateFailures: Array<{ gate: string; blockers: string[]; repairTools: string[] }>
+    gates: Array<{ gate: string; score: number; attempts: number; downgraded: boolean; failing: boolean }>
+    downgradedGates: string[]
+  }
   interface PromptListItem {
     id: string
     group: string

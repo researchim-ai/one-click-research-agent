@@ -30,6 +30,10 @@ function variantFile(): string {
   return path.join(binDir(), '.variant')
 }
 
+function tagFile(): string {
+  return path.join(binDir(), '.release-tag')
+}
+
 function getInstalledVariant(): string | null {
   try { return fs.readFileSync(variantFile(), 'utf-8').trim() } catch { return null }
 }
@@ -37,6 +41,26 @@ function getInstalledVariant(): string | null {
 function setInstalledVariant(variant: string): void {
   fs.mkdirSync(binDir(), { recursive: true })
   fs.writeFileSync(variantFile(), variant)
+}
+
+/** Release tag (e.g. "b4321") of the currently installed llama.cpp build, if known. */
+export function getInstalledTag(): string | null {
+  try { return fs.readFileSync(tagFile(), 'utf-8').trim() || null } catch { return null }
+}
+
+function setInstalledTag(tag: string): void {
+  fs.mkdirSync(binDir(), { recursive: true })
+  fs.writeFileSync(tagFile(), tag)
+}
+
+/** Installed variant + release tag, for display in Settings. */
+export function getInstalledInfo(): { variant: string | null; tag: string | null; installed: boolean } {
+  return { variant: getInstalledVariant(), tag: getInstalledTag(), installed: findServerBin() !== null }
+}
+
+/** Latest available llama.cpp release tag on GitHub (null if the check fails). */
+export async function getLatestReleaseTag(): Promise<string | null> {
+  try { return (await getLatestRelease()).tag || null } catch { return null }
 }
 
 function serverBinName(): string {
@@ -231,10 +255,19 @@ export async function ensureBinary(win: BrowserWindow): Promise<string> {
   const existing = findServerBin()
   const installedVariant = getInstalledVariant()
   if (existing && installedVariant) {
-    emitBuild(win, `llama-server уже установлен (${installedVariant})`)
+    emitBuild(win, `llama-server уже установлен (${installedVariant}${getInstalledTag() ? ` ${getInstalledTag()}` : ''})`)
     return existing
   }
+  return downloadAndInstallLatest(win)
+}
 
+/**
+ * Download the LATEST llama.cpp release and install it, overwriting any existing binary.
+ * Used both for first-time install (ensureBinary) and for the explicit "update" action.
+ * The old binary is only overwritten as the new archive extracts, so a failed download
+ * leaves the previous working build in place.
+ */
+async function downloadAndInstallLatest(win: BrowserWindow): Promise<string> {
   const res = detect()
   const selection = pickBinaryVariant(res)
 
@@ -308,7 +341,8 @@ export async function ensureBinary(win: BrowserWindow): Promise<string> {
 
     if (verifyBinary(bin)) {
       setInstalledVariant(variant)
-      emitBuild(win, `llama-server (${variant}) готов!`)
+      setInstalledTag(release.tag)
+      emitBuild(win, `llama-server (${variant} ${release.tag}) готов!`)
       return bin
     }
 
@@ -317,6 +351,21 @@ export async function ensureBinary(win: BrowserWindow): Promise<string> {
   }
 
   throw new Error('Не удалось установить llama-server. Проверьте интернет-соединение.')
+}
+
+/**
+ * Force-update llama.cpp to the newest GitHub release (even if one is already installed).
+ * Returns the previous/new release tags and whether the tag actually changed. The caller
+ * (main.ts) is responsible for restarting the server afterwards.
+ */
+export async function updateBinary(win: BrowserWindow): Promise<{ previousTag: string | null; tag: string | null; updated: boolean }> {
+  const previousTag = getInstalledTag()
+  emitBuild(win, previousTag ? `Текущая версия llama.cpp: ${previousTag}. Проверяю обновления…` : 'Проверяю последнюю версию llama.cpp…')
+  await downloadAndInstallLatest(win)
+  const tag = getInstalledTag()
+  const updated = Boolean(tag && tag !== previousTag)
+  emitBuild(win, updated ? `Обновлено: ${previousTag ?? '—'} → ${tag}` : `Уже последняя версия (${tag ?? '—'}) — переустановлено.`)
+  return { previousTag, tag, updated }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,12 +524,20 @@ function killOrphanServers(): void {
     if (process.platform === 'win32') {
       execSync(`for /f "tokens=5" %a in ('netstat -aon ^| findstr :${LLAMA_PORT} ^| findstr LISTENING') do taskkill /F /PID %a`, { timeout: 5000, stdio: 'ignore' })
     } else {
-      const out = execSync(`lsof -ti :${LLAMA_PORT} 2>/dev/null || true`, { timeout: 5000, encoding: 'utf-8' }).trim()
+      // CRITICAL: filter to processes LISTENING on the port (the llama-server itself), NOT
+      // every process with a socket on it. A plain `lsof -ti :PORT` also returns CLIENT
+      // connections — including this Electron app's own keep-alive sockets to llama-server —
+      // so SIGKILLing those PIDs would kill the app (it "just closed" on the user). The
+      // -sTCP:LISTEN state filter keeps only the server; we also never kill our own PID.
+      const out = execSync(`lsof -ti tcp:${LLAMA_PORT} -sTCP:LISTEN 2>/dev/null || true`, { timeout: 5000, encoding: 'utf-8' }).trim()
       if (out) {
+        const killed: string[] = []
         for (const pid of out.split('\n').filter(Boolean)) {
-          try { process.kill(parseInt(pid), 'SIGKILL') } catch {}
+          const n = parseInt(pid)
+          if (!Number.isFinite(n) || n === process.pid || n === process.ppid) continue
+          try { process.kill(n, 'SIGKILL'); killed.push(pid) } catch {}
         }
-        console.log(`[server-manager] Killed orphan processes on port ${LLAMA_PORT}: ${out.replace(/\n/g, ', ')}`)
+        if (killed.length) console.log(`[server-manager] Killed orphan llama-server(s) on port ${LLAMA_PORT}: ${killed.join(', ')}`)
       }
     }
   } catch {}

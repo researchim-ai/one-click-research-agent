@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld('api', {
   autoSetup: (): Promise<void> => ipcRenderer.invoke('auto-setup'),
   downloadModel: (): Promise<string> => ipcRenderer.invoke('download-model'),
   ensureLlama: (): Promise<void> => ipcRenderer.invoke('ensure-llama'),
+  getLlamaInfo: (checkLatest?: boolean): Promise<{ variant: string | null; tag: string | null; installed: boolean; latestTag: string | null; updateAvailable: boolean }> => ipcRenderer.invoke('get-llama-info', checkLatest),
+  updateLlama: (): Promise<{ previousTag: string | null; tag: string | null; updated: boolean; restarted: boolean; wasRunning: boolean }> => ipcRenderer.invoke('update-llama'),
   startServer: (): Promise<void> => ipcRenderer.invoke('start-server'),
   stopServer: (): Promise<void> => ipcRenderer.invoke('stop-server'),
   sendMessage: (msg: string, workspace: string): Promise<string> =>
@@ -122,6 +124,7 @@ contextBridge.exposeInMainWorld('api', {
   getResearchPlan: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-plan', workspace),
   getResearchProfiles: (): Promise<any[]> => ipcRenderer.invoke('get-research-profiles'),
   getResearchDashboard: (workspace: string): Promise<any> => ipcRenderer.invoke('get-research-dashboard', workspace),
+  getRunGraph: (workspace: string, outputDir?: string): Promise<any> => ipcRenderer.invoke('get-run-graph', workspace, outputDir),
   inferResearchRequest: (payload: any): Promise<any> => ipcRenderer.invoke('infer-research-request', payload),
   setResearchSourceIncluded: (
     workspace: string, outputDir: string, id: string, included: boolean,

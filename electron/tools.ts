@@ -526,8 +526,8 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'screen_corpus',
-      description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage. max_selected caps how many are selected; min_selected sets a floor — pass the run\'s minimum-selected target so the best on-topic items are promoted to reach it (off-topic items are never promoted).',
-      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, max_selected: { type: 'number' }, min_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, research_kind: { type: 'string', enum: ['academic', 'general'], description: "Relevance strategy. 'academic' (default) keeps the ML/RL-aware precision; 'general' judges relevance generically from query-term coverage for non-academic web research. Pass the value given in the run parameters." }, output_dir: { type: 'string' } }, required: ['question'] },
+      description: 'Screen raw corpus into selected / rejected / needs_review using relevance, date compliance, authority, and plan sub-question coverage. max_selected caps how many are selected; min_selected sets a floor — pass the run\'s minimum-selected target so the best on-topic items are promoted to reach it (off-topic items are never promoted). For a SUB-YEAR window ("last 3 months / last week"), pass from_date/to_date (day-precise) — they are enforced ahead of year_from/year_to so recent windows are not floored to a whole year.',
+      parameters: { type: 'object', properties: { question: { type: 'string' }, sub_questions: { type: 'array', items: { type: 'string' } }, year_from: { type: 'number' }, year_to: { type: 'number' }, from_date: { type: 'string', description: 'Day-precise lower bound YYYY-MM-DD. Use for sub-year windows; takes precedence over year_from.' }, to_date: { type: 'string', description: 'Day-precise upper bound YYYY-MM-DD. Use for sub-year windows; takes precedence over year_to.' }, max_selected: { type: 'number' }, min_selected: { type: 'number' }, strict_date_range: { type: 'boolean' }, research_kind: { type: 'string', enum: ['academic', 'general'], description: "Relevance strategy. 'academic' (default) keeps the ML/RL-aware precision; 'general' judges relevance generically from query-term coverage for non-academic web research. Pass the value given in the run parameters." }, output_dir: { type: 'string' } }, required: ['question'] },
     },
   },
   {
@@ -1012,6 +1012,8 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
                 subQuestions: Array.isArray(args.sub_questions) ? args.sub_questions.map(String) : undefined,
                 yearFrom: args.year_from,
                 yearTo: args.year_to,
+                fromDate: toIsoDay(args.from_date) ?? undefined,
+                toDate: toIsoDay(args.to_date) ?? undefined,
                 maxSelected: args.max_selected,
                 minSelected: args.min_selected,
                 strictDateRange: args.strict_date_range,
@@ -1020,7 +1022,7 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
             })
           } catch {}
         }
-        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range, researchKind: screenKind, queryAugment }, args.output_dir)
+        return screenCorpus(workspace, { question: args.question, subQuestions: args.sub_questions, yearFrom: args.year_from, yearTo: args.year_to, fromDate: toIsoDay(args.from_date) ?? undefined, toDate: toIsoDay(args.to_date) ?? undefined, maxSelected: args.max_selected, minSelected: args.min_selected, strictDateRange: args.strict_date_range, researchKind: screenKind, queryAugment }, args.output_dir)
       }
       case 'list_selected_corpus':
         return listSelectedCorpus(workspace, args.max_items, args.output_dir)
@@ -1129,7 +1131,7 @@ const ASYNC_ONLY_TOOLS = new Set([
 // screen_corpus has BOTH a sync path (executeTool: pure lexical fallback, used by tests and
 // offline) and an async path (executeToolAsync: runs the language-agnostic LLM relevance pass
 // first, then the sync screening). Routing it as async lets the agent get semantic screening.
-const ASYNC_CAPABLE_TOOLS = new Set(['screen_corpus'])
+const ASYNC_CAPABLE_TOOLS = new Set(['screen_corpus', 'build_corpus'])
 
 export function isAsyncTool(name: string): boolean {
   return ASYNC_ONLY_TOOLS.has(name) || ASYNC_CAPABLE_TOOLS.has(name)
@@ -1164,6 +1166,30 @@ export async function executeToolAsync(name: string, args: Record<string, any>, 
           } catch {}
         }
         return executeTool(name, args, workspace)
+      }
+      case 'build_corpus': {
+        // Selection quality must not depend on whether the model separately calls
+        // screen_corpus: build_corpus runs the deterministic screening internally, so run the
+        // language-agnostic LLM relevance pass here too, on the freshly merged corpus, BEFORE
+        // that screening consumes the scores. Otherwise a build_corpus → read flow (no explicit
+        // screen_corpus) selects on lexical scores alone and lets recent-but-tangential papers in.
+        const pre = buildCorpusMergeSources(args.session_id, args.tags, workspace, args.output_dir)
+        if (typeof pre === 'string') return pre
+        if (args.output_dir) {
+          try {
+            const spec = ensureResearchRunSpec(workspace, String(args.output_dir))
+            const sp = spec.screenParams
+            if (sp?.question) {
+              await annotateSemanticRelevance(
+                workspace,
+                String(args.output_dir),
+                { question: sp.question, subQuestions: sp.subQuestions },
+                ctx?.apiUrl,
+              )
+            }
+          } catch {}
+        }
+        return buildCorpusScreenAndReport(pre.merged, args.queue_full_text, workspace, args.output_dir)
       }
       default:
         // Fallback to synchronous executor
@@ -1215,13 +1241,27 @@ function recallFindingsHybrid(workspace: string, query: string, maxResults?: num
   return recallFindings(workspace, query, maxResults)
 }
 
-function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefined, queue: boolean | undefined, workspace: string, outputDir?: string): string {
+type BuildCorpusMerge = { merged: ReturnType<typeof addSourcesToCorpus> }
+
+// Merge this session's collected sources into the corpus. Split out from screening so the
+// async build_corpus path can run the language-agnostic LLM relevance pass on the freshly
+// merged items BEFORE the deterministic screening consumes their scores.
+function buildCorpusMergeSources(sessionId: string | undefined, tagsRaw: string | undefined, workspace: string, outputDir?: string): string | BuildCorpusMerge {
   if (!sessionId) return 'Error: session id missing; build_corpus must be called from an agent session.'
   const sources = getSourceTracker(sessionId).getAll()
   if (sources.length === 0) return 'No collected sources in this session yet. Run search tools first.'
   const tags = String(tagsRaw ?? '').split(',').map((s) => s.trim()).filter(Boolean)
   const merged = addSourcesToCorpus(workspace, sources, tags, outputDir)
+  return { merged }
+}
 
+function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefined, queue: boolean | undefined, workspace: string, outputDir?: string): string {
+  const pre = buildCorpusMergeSources(sessionId, tagsRaw, workspace, outputDir)
+  if (typeof pre === 'string') return pre
+  return buildCorpusScreenAndReport(pre.merged, queue, workspace, outputDir)
+}
+
+function buildCorpusScreenAndReport(merged: ReturnType<typeof addSourcesToCorpus>, queue: boolean | undefined, workspace: string, outputDir?: string): string {
   // Root-cause guard against search loops: once the model has screened at least once, a
   // screening contract is stored on the run spec. Re-apply it to the freshly merged corpus
   // so newly gathered items are screened immediately and an unscreened `raw` backlog can
@@ -1246,6 +1286,8 @@ function buildCorpusTool(sessionId: string | undefined, tagsRaw: string | undefi
             subQuestions: sp.subQuestions,
             yearFrom: sp.yearFrom,
             yearTo: sp.yearTo,
+            fromDate: sp.fromDate,
+            toDate: sp.toDate,
             maxSelected: sp.maxSelected,
             minSelected: sp.minSelected,
             strictDateRange: sp.strictDateRange,
@@ -1880,7 +1922,11 @@ async function annotateSemanticRelevance(
   if (process.env.VITEST) return 0
   const question = String(opts.question || '').trim()
   if (!question) return 0
-  const base = (apiUrl && apiUrl.trim()) || 'http://127.0.0.1:7863'
+  // The caller passes the FULL chat URL (…/v1/chat/completions), but callLocalChatAsync
+  // appends that path itself. Strip it here or the fetch hits …/v1/chat/completions/v1/chat/
+  // completions → 404 → every batch silently returns nothing (semantic screening never ran,
+  // so the language-agnostic relevance + sub-topic assignment were dormant). Normalize to base.
+  const base = (String(apiUrl || '').replace(/\/v1\/chat\/completions\/?$/, '').trim()) || 'http://127.0.0.1:7863'
   const queryKey = semanticQueryKey(question, opts.subQuestions)
   const corpus = loadCorpus(workspace, outputDir)
   // Score everything not already scored for this exact query, skipping manual rejections.
@@ -1925,6 +1971,15 @@ async function annotateSemanticRelevance(
       if (!Number.isFinite(raw)) continue
       entry.semanticRelevanceScore = Math.max(0, Math.min(100, Math.round(raw)))
       entry.semanticOnTopic = typeof row?.on_topic === 'boolean' ? row.on_topic : entry.semanticRelevanceScore >= 45
+      // LLM-assigned plan coverage (language-agnostic). Map 1-based indices to Q ids, keeping
+      // only valid, in-range sub-questions. This becomes the primary sub-topic signal.
+      if (Array.isArray(row?.covers)) {
+        const ids = [...new Set(row.covers
+          .map((n: any) => Math.trunc(Number(n)))
+          .filter((n: number) => Number.isFinite(n) && n >= 1 && n <= subQ.length)
+          .map((n: number) => `Q${n}`))] as string[]
+        entry.semanticSubQuestions = ids
+      }
       entry.semanticQueryKey = queryKey
       entry.updatedAt = Date.now()
       scored++
@@ -2110,11 +2165,19 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     return `${cleanTitle(src.title)}${src.year ? ` (${src.year})` : ''}`
   }
   const cite = (claim: { corpusIds?: string[] }) => (claim.corpusIds || []).slice(0, 3).map(sourceTag).join(', ') || (ru ? 'источник не привязан' : 'no linked source')
+  const strengthBucket = (claim: { quote?: string; notes?: string; evidenceType?: string }): 'strong' | 'quoted' | 'metadata' | 'weak' => {
+    if (claim.notes?.toLowerCase().includes('abstract-only')) return 'metadata'
+    if (claim.quote && claim.evidenceType === 'primary_result') return 'strong'
+    if (claim.quote) return 'quoted'
+    return 'weak'
+  }
   const evidenceStrength = (claim: { quote?: string; notes?: string; evidenceType?: string; confidence?: string }) => {
-    if (claim.notes?.toLowerCase().includes('abstract-only')) return ru ? 'только метаданные/аннотация' : 'metadata-only'
-    if (claim.quote && claim.evidenceType === 'primary_result') return ru ? 'сильная' : 'strong'
-    if (claim.quote) return ru ? 'средняя' : 'medium'
-    return ru ? 'слабая' : 'weak'
+    switch (strengthBucket(claim)) {
+      case 'metadata': return ru ? 'только метаданные/аннотация' : 'metadata-only'
+      case 'strong': return ru ? 'сильная' : 'strong'
+      case 'quoted': return ru ? 'средняя' : 'medium'
+      default: return ru ? 'слабая' : 'weak'
+    }
   }
   const confidenceLabel = (value?: string) => {
     if (!ru) return value ?? 'unknown'
@@ -2258,14 +2321,17 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
   const directionRows = planSections.slice(0, 8).map((item) => {
     const rows = (byPlan.get(item.id) || []).slice(0, 4)
     const sourceCount = new Set(rows.flatMap((claim) => claim.corpusIds ?? [])).size
-    const strongCount = rows.filter((claim) => evidenceStrength(claim) === (ru ? 'сильная' : 'strong')).length
-    const weakCount = rows.length - strongCount
+    const strongCount = rows.filter((claim) => strengthBucket(claim) === 'strong').length
+    const quotedCount = rows.filter((claim) => strengthBucket(claim) === 'quoted').length
+    const limitedCount = rows.length - strongCount - quotedCount
     const titleText = item.text.replace(/^Q\d+\.\s*/, '').replace(/\|/g, '\\|')
     const citeIds = [...new Set(rows.flatMap((c) => c.corpusIds ?? []))].slice(0, 5).map(sourceTag).join(', ') || '-'
     return [
       `| ${item.id}: ${titleText}`,
       ru ? `${rows.length} утвержд.; ${sourceCount} источн.` : `${rows.length} claims; ${sourceCount} source(s)`,
-      ru ? `${strongCount} сильных; ${weakCount} ограниченных` : `${strongCount} strong; ${weakCount} limited`,
+      ru
+        ? `${strongCount} сильных; ${quotedCount} с цитатой; ${limitedCount} ограниченных`
+        : `${strongCount} strong; ${quotedCount} quote-backed; ${limitedCount} limited`,
       `${citeIds} |`,
     ].join(' | ')
   })
@@ -2833,6 +2899,13 @@ function normalizeIsoDate(value: string | undefined): string | null {
   return `${match[1]}${match[2]}${match[3]}`
 }
 
+/** Like normalizeIsoDate but returns the dashed YYYY-MM-DD form (or null). Used for the
+ * day-precise screening window, which compares ISO dates lexicographically. */
+function toIsoDay(value: string | undefined): string | null {
+  const compact = normalizeIsoDate(value)
+  return compact ? `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}` : null
+}
+
 function generateReport(
   title: string,
   content: string,
@@ -3028,19 +3101,106 @@ function searchArxiv(
   const safeSortOrder = ['ascending', 'descending'].includes(String(sortOrder ?? ''))
     ? String(sortOrder)
     : 'descending'
-  const dateFilter = (normalizedFrom || normalizedTo)
-    ? ` AND submittedDate:[${normalizedFrom ? normalizedFrom + '0000' : '*'} TO ${normalizedTo ? normalizedTo + '2359' : '*'}]`
-    : ''
+  const buildDateFilter = (from: string | null, to: string | null) =>
+    (from || to)
+      ? ` AND submittedDate:[${from ? from + '0000' : '*'} TO ${to ? to + '2359' : '*'}]`
+      : ''
+  const dateFilter = buildDateFilter(normalizedFrom || null, normalizedTo || null)
+
+  // Last-resort tier pulls the lower bound back ~6 months so a genuinely fresh but
+  // sparse subtopic still returns something (annotated as out-of-window below).
+  const shiftIsoBackDays = (iso8: string, days: number): string => {
+    const dt = new Date(Date.UTC(+iso8.slice(0, 4), +iso8.slice(4, 6) - 1, +iso8.slice(6, 8)))
+    dt.setUTCDate(dt.getUTCDate() - days)
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${dt.getUTCFullYear()}${p(dt.getUTCMonth() + 1)}${p(dt.getUTCDate())}`
+  }
+  const widenedFrom = normalizedFrom ? shiftIsoBackDays(normalizedFrom, 183) : null
+  const widenedDateFilter = buildDateFilter(widenedFrom, normalizedTo || null)
+
+  // arXiv treats `all:a b c` as an implicit AND of every word. That has two failure modes:
+  //   1. ANDing a rare/odd token (acronyms like RLVR, "sim-to-real", "DeepSeek-R1") with a
+  //      tight date window legitimately returns 0.
+  //   2. The naive fallback — OR of EVERY word — includes generic words ("learning", "deep",
+  //      "survey", "review", "model"), so `... OR all:learning` matches thousands of unrelated
+  //      preprints (quantum physics, medical imaging) and, sorted by date, returns pure junk.
+  // Fix: build the query from PHRASES, keep publication-type words ("survey"/"review") as a
+  // separate ANDed OR-group instead of a hard AND term, and never OR bare generic words.
+  const AR_STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'for', 'in', 'on', 'to', 'with', 'using', 'via', 'based', 'from', 'new', 'recent', 'latest'])
+  // Words that describe the DELIVERABLE (a survey/review), not the topic. Required as
+  // "at least one of", not ANDed onto every topical term (many surveys omit the word).
+  const AR_SURVEY = new Set(['survey', 'surveys', 'review', 'reviews', 'overview', 'systematic', 'tutorial', 'taxonomy'])
+  // Words too generic to stand alone in an OR — they match half of arXiv.
+  const AR_GENERIC = new Set(['learning', 'deep', 'model', 'models', 'method', 'methods', 'approach', 'approaches', 'study', 'studies', 'analysis', 'framework', 'frameworks', 'network', 'networks', 'system', 'systems', 'application', 'applications', 'technique', 'techniques', 'research', 'paper', 'papers', 'article', 'articles'])
+  // Canonical multi-word ML phrases (longest first) kept intact and quoted so the phrase —
+  // not its individual words — is what arXiv matches. Acronyms are deduped against phrases.
+  const AR_PHRASES: Array<{ phrase: string; drops: string[] }> = [
+    { phrase: 'reinforcement learning from human feedback', drops: ['rlhf'] },
+    { phrase: 'multi-agent reinforcement learning', drops: ['marl'] },
+    { phrase: 'deep reinforcement learning', drops: [] },
+    { phrase: 'offline reinforcement learning', drops: [] },
+    { phrase: 'inverse reinforcement learning', drops: [] },
+    { phrase: 'reinforcement learning', drops: ['rl'] },
+    { phrase: 'large language models', drops: ['llm', 'llms'] },
+    { phrase: 'large language model', drops: ['llm', 'llms'] },
+    { phrase: 'language models', drops: [] },
+    { phrase: 'preference optimization', drops: [] },
+    { phrase: 'policy optimization', drops: [] },
+    { phrase: 'human feedback', drops: [] },
+    { phrase: 'sim-to-real', drops: [] },
+  ]
+  const arxTerm = (u: string) => 'all:' + (/[\s-]/.test(u) ? '"' + u.replace(/"/g, '') + '"' : u)
+  const lowerQuery = trimmedQuery.toLowerCase()
+  let working = ` ${lowerQuery} `
+  const phraseUnits: string[] = []
+  const dropAcronyms = new Set<string>()
+  for (const { phrase, drops } of AR_PHRASES) {
+    if (working.includes(` ${phrase} `) || working.includes(phrase)) {
+      if (!phraseUnits.some((p) => p.includes(phrase))) {
+        phraseUnits.push(phrase)
+        drops.forEach((d) => dropAcronyms.add(d))
+      }
+      working = working.split(phrase).join(' ')
+    }
+  }
+  const surveyWords = [...new Set(
+    lowerQuery.split(/[\s,;]+/).map((t) => t.trim()).filter((t) => AR_SURVEY.has(t)),
+  )]
+  const looseTokens = working
+    .split(/[\s,;]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !AR_STOP.has(t) && !AR_SURVEY.has(t) && !AR_GENERIC.has(t) && !dropAcronyms.has(t) && !/^\d+$/.test(t))
+  const topicalUnits = [...phraseUnits, ...looseTokens]
+  const surveyGroup = surveyWords.length ? ` AND (${surveyWords.map((w) => 'all:' + w).join(' OR ')})` : ''
+  // Strict: AND all distinctive topical units (+ require a survey/review word if asked).
+  const strictTopical = topicalUnits.length ? topicalUnits.map(arxTerm).join(' AND ') : `all:${trimmedQuery}`
+  const strictQuery = `(${strictTopical}${surveyGroup})${dateFilter}`
+  // Broadened: relax the topical AND to an OR (so any ONE distinctive term suffices) but KEEP
+  // the survey/review constraint and the date window — that is what stops the junk flood.
+  const broadTopical = topicalUnits.length >= 2 ? `(${topicalUnits.map(arxTerm).join(' OR ')})` : strictTopical
+  const broadenedQuery = `(${broadTopical}${surveyGroup})${dateFilter}`
+  const widenedQuery = `(${broadTopical}${surveyGroup})${widenedDateFilter}`
+
+  // Tiered recall: only the tiers AFTER the first fire, and only when the previous
+  // tier returned nothing — so the common case is exactly one request and unchanged.
+  type ArxivTier = { label: 'strict' | 'broadened' | 'widened-window'; searchQuery: string; sortBy: string; note?: string }
+  const tiers: ArxivTier[] = [{ label: 'strict', searchQuery: strictQuery, sortBy: safeSortBy }]
+  if (topicalUnits.length >= 2) {
+    // OR of key terms; sort by relevance so the best matches surface first.
+    tiers.push({ label: 'broadened', searchQuery: broadenedQuery, sortBy: 'relevance', note: 'no exact matches — broadened to OR of key terms' })
+  }
+  if (dateFilter && widenedDateFilter !== dateFilter && widenedFrom) {
+    tiers.push({ label: 'widened-window', searchQuery: widenedQuery, sortBy: 'relevance', note: `no matches in the requested window — widened back to ${widenedFrom.slice(0, 4)}-${widenedFrom.slice(4, 6)}-${widenedFrom.slice(6, 8)}` })
+  }
+
   const script = `
 ${fetchWithTimeoutSnippet(25000)}
 ${fetchRetrySnippet()}
-const query = process.argv[1]
+const searchQuery = process.argv[1]
 const limit = Number(process.argv[2] || '5')
 const sortBy = process.argv[3] || 'relevance'
 const sortOrder = process.argv[4] || 'descending'
-const dateFilter = process.argv[5] || ''
-const searchQuery = dateFilter ? '(all:' + query + ')' + dateFilter : 'all:' + query
-const startOffset = Number(process.argv[6] || '0')
+const startOffset = Number(process.argv[5] || '0')
 // Use https directly: http://export.arxiv.org now 301-redirects to https, and
 // the extra hop is a needless failure point.
 const url = 'https://export.arxiv.org/api/query?search_query=' + encodeURIComponent(searchQuery) + '&start=' + startOffset + '&max_results=' + limit + '&sortBy=' + encodeURIComponent(sortBy) + '&sortOrder=' + encodeURIComponent(sortOrder)
@@ -3060,40 +3220,46 @@ __fetchRetry(url, {
 }).finally(() => clearTimeout(__timer))
 `
 
-  // arXiv asks for no more than ~1 request every 3s and a single connection at a
-  // time. Use adaptive spacing: stays at 3s normally, widens automatically if arXiv
-  // starts rate-limiting, so a long run keeps using arXiv without tripping the limit.
-  throttleHost('arxiv', arxivThrottle.current('arxiv'))
+  let entries: string[] = []
+  let usedTier: ArxivTier = tiers[0]
+  for (const tier of tiers) {
+    // arXiv asks for no more than ~1 request every 3s and a single connection at a
+    // time. Use adaptive spacing: stays at 3s normally, widens automatically if arXiv
+    // starts rate-limiting, so a long run keeps using arXiv without tripping the limit.
+    throttleHost('arxiv', arxivThrottle.current('arxiv'))
 
-  let xml = ''
-  try {
-    xml = runNodeScript(script, [trimmedQuery, String(limit), safeSortBy, safeSortOrder, dateFilter, String(startOffset)], 40000)
-  } catch (e: any) {
-    const stderr = String(e?.stderr || e?.message || e).trim()
-    const rateLimited = /HTTP 5\d\d|HTTP 429|HTTP 400|timed out/i.test(stderr)
-    // Back off adaptively so the NEXT arXiv call waits longer instead of piling
-    // onto the limit. Only open the breaker after a *sustained* streak.
-    if (rateLimited) arxivThrottle.onRateLimited('arxiv')
-    const tripped = rateLimited && hostBreaker.recordFailure('arxiv')
-    const cause = /timed out/i.test(stderr)
-      ? ' arXiv (export.arxiv.org) did not respond in time.'
-      : /HTTP 5\d\d|HTTP 429|HTTP 400/i.test(stderr)
-        ? ' arXiv throttles rapid bursts with 400/429/500 (the export API is a separate service, so it can be busy even when arxiv.org opens fine in a browser).'
-        : ''
-    const guidance = tripped
-      ? ' arXiv is now on a short cooldown — pause it and use search_openalex / search_semantic_scholar / search_crossref (they index most arXiv papers) or smart_search.'
-      : rateLimited
-        ? ' This is usually transient — wait a few seconds and retry, or query search_openalex / search_semantic_scholar / search_crossref / smart_search meanwhile.'
-        : ''
-    return `Error: failed to search arXiv.${cause}${guidance} ${stderr}`.trim()
+    let xml = ''
+    try {
+      xml = runNodeScript(script, [tier.searchQuery, String(limit), tier.sortBy, safeSortOrder, String(startOffset)], 40000)
+    } catch (e: any) {
+      const stderr = String(e?.stderr || e?.message || e).trim()
+      const rateLimited = /HTTP 5\d\d|HTTP 429|HTTP 400|timed out/i.test(stderr)
+      // Back off adaptively so the NEXT arXiv call waits longer instead of piling
+      // onto the limit. Only open the breaker after a *sustained* streak.
+      if (rateLimited) arxivThrottle.onRateLimited('arxiv')
+      const tripped = rateLimited && hostBreaker.recordFailure('arxiv')
+      const cause = /timed out/i.test(stderr)
+        ? ' arXiv (export.arxiv.org) did not respond in time.'
+        : /HTTP 5\d\d|HTTP 429|HTTP 400/i.test(stderr)
+          ? ' arXiv throttles rapid bursts with 400/429/500 (the export API is a separate service, so it can be busy even when arxiv.org opens fine in a browser).'
+          : ''
+      const guidance = tripped
+        ? ' arXiv is now on a short cooldown — pause it and use search_openalex / search_semantic_scholar / search_crossref (they index most arXiv papers) or smart_search.'
+        : rateLimited
+          ? ' This is usually transient — wait a few seconds and retry, or query search_openalex / search_semantic_scholar / search_crossref / smart_search meanwhile.'
+          : ''
+      return `Error: failed to search arXiv.${cause}${guidance} ${stderr}`.trim()
+    }
+    // Successful contact clears any prior penalty assumption and decays the spacing
+    // back toward the base interval so arXiv speeds up again once it's happy.
+    hostBreaker.recordSuccess('arxiv')
+    arxivThrottle.onSuccess('arxiv')
+
+    entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map((match) => match[1]).slice(0, limit)
+    usedTier = tier
+    if (entries.length > 0) break
   }
-  // Successful contact clears any prior penalty assumption and decays the spacing
-  // back toward the base interval so arXiv speeds up again once it's happy.
-  hostBreaker.recordSuccess('arxiv')
-  arxivThrottle.onSuccess('arxiv')
-
-  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map((match) => match[1]).slice(0, limit)
-  if (entries.length === 0) return `No arXiv papers found for "${trimmedQuery}".`
+  if (entries.length === 0) return `No arXiv papers found for "${trimmedQuery}" (tried strict, OR-broadened${dateFilter ? ', and widened-window' : ''} queries). Try search_openalex / search_semantic_scholar / search_crossref, or drop the date window.`
 
   const lines = entries.map((entry, idx) => {
     const idUrl = extractXmlTag(entry, 'id')
@@ -3120,11 +3286,14 @@ __fetchRetry(url, {
     ].join('\n')
   })
 
+  // Report the window actually queried: the widened tier uses an earlier lower bound.
+  const effFrom = usedTier.label === 'widened-window' ? widenedFrom : normalizedFrom
   const filters: string[] = []
-  if (normalizedFrom) filters.push(`from ${normalizedFrom.slice(0, 4)}-${normalizedFrom.slice(4, 6)}-${normalizedFrom.slice(6, 8)}`)
+  if (effFrom) filters.push(`from ${effFrom.slice(0, 4)}-${effFrom.slice(4, 6)}-${effFrom.slice(6, 8)}`)
   if (normalizedTo) filters.push(`to ${normalizedTo.slice(0, 4)}-${normalizedTo.slice(4, 6)}-${normalizedTo.slice(6, 8)}`)
-  filters.push(`sort ${safeSortBy} ${safeSortOrder}`)
-  const out = `Found ${entries.length} arXiv paper(s) for "${trimmedQuery}" (${filters.join(', ')}):\n\n${lines.join('\n\n')}`
+  filters.push(`sort ${usedTier.sortBy} ${safeSortOrder}`)
+  const recallNote = usedTier.note ? `⚠️ ${usedTier.note}. Screen these for on-topic relevance and note any that fall outside the requested period.\n\n` : ''
+  const out = `${recallNote}Found ${entries.length} arXiv paper(s) for "${trimmedQuery}" (${filters.join(', ')}):\n\n${lines.join('\n\n')}`
   searchCache.set('search_arxiv', cacheParams, out)
   return out
 }
@@ -3365,11 +3534,18 @@ function searchOpenAlex(query: string, maxResults?: number, yearFrom?: number, y
   params.set('per_page', String(limit))
   if (inferredWindow.freshness) params.set('sort', 'publication_date:desc')
 
+  // Polite pool: OpenAlex gives requests that identify a contact `mailto` a much higher,
+  // separate rate-limit bucket. Without it, bursts of searches quickly hit HTTP 429 (the
+  // failure observed in runs). Reuse the configured Crossref e-mail, else a project contact.
+  const oaConfig = (() => { try { return cfg.load() } catch { return null } })()
+  const oaMailto = oaConfig?.crossrefMailto ? String(oaConfig.crossrefMailto).trim() : 'research@one-click-agent.local'
+  if (oaMailto) params.set('mailto', oaMailto)
+
   const script = `
 ${httpGetSnippet()}
 const url = 'https://api.openalex.org/works?' + process.argv[1]
 ;(async () => {
-  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' } }, { timeoutMs: 20000 })
+  const r = await __httpGet(url, { headers: { 'User-Agent': 'one-click-research-agent/0.1 (mailto:${oaMailto})', Accept: 'application/json' } }, { timeoutMs: 20000 })
   if (!r.ok) { console.error('HTTP ' + r.status); process.exit(1) }
   process.stdout.write(r.text)
 })().catch((err) => { console.error(String(err?.message || err)); process.exit(1) })

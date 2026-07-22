@@ -3,7 +3,7 @@ import * as path from 'path'
 import { isReviewLike, loadCorpus, corpusStats, MIN_SELECTABLE_TOPICAL_PRECISION } from './corpus'
 import { evidenceStats, loadEvidence, verifyClaims, reconcileSelectedFromEvidence } from './evidence'
 import { getSourceTracker } from './sources'
-import { parsePlan, planProgress } from './planner'
+import { parsePlan, planProgress, updatePlanItem, type PlanItem } from './planner'
 import { resolveResearchDir } from '../research-paths'
 
 export interface GateResult {
@@ -63,6 +63,31 @@ function uniqueClaims<T extends { claim: string; planItemId?: string; topic?: st
   return [...byKey.values()]
 }
 
+/**
+ * Mark plan.md checkboxes done for items that actually have enough supported evidence from an
+ * assigned+read selected source (the same "covered" bar as plan_section_coverage). Only ever
+ * checks boxes (never unchecks), so it is safe to run on every gate pass and keeps plan_progress
+ * aligned with real coverage instead of the model's memory of update_plan_status.
+ */
+function reconcilePlanFromEvidence(workspace: string, outputDir: string | undefined, evidencePerSection: number): void {
+  try {
+    const plan = parsePlan(workspace, outputDir)
+    if (plan.length === 0) return
+    const flat: PlanItem[] = []
+    const walk = (list: PlanItem[]) => { for (const it of list) { flat.push(it); if (it.children.length) walk(it.children) } }
+    walk(plan)
+    if (flat.every((i) => i.done)) return
+    const corpus = loadCorpus(workspace, outputDir)
+    const claims = uniqueClaims(loadEvidence(workspace, outputDir))
+    for (const item of flat) {
+      if (item.done) continue
+      const assignedRead = corpus.some((e) => e.screeningStatus === 'selected' && (e.readStatus === 'read' || e.status === 'read') && e.subQuestions?.includes(item.id))
+      const evCount = claims.filter((c) => (c.planItemId === item.id || c.topic === item.id) && c.status === 'supported').length
+      if (assignedRead && evCount >= evidencePerSection) updatePlanItem(workspace, item.id, true, outputDir)
+    }
+  } catch {}
+}
+
 export function runQualityGates(workspace: string, sessionId?: string, opts?: { minSources?: number; minEvidence?: number; requirePlanCompletion?: boolean; outputDir?: string; researchKind?: string }): { results: GateResult[]; summary: string } {
   // 'general' = non-academic web research. It reuses the whole tuned pipeline but
   // relaxes the academic-only gates (survey/review coverage and recency), because
@@ -82,6 +107,15 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
   // sources the pipeline actually used (fixes general/web runs where cross-language screening
   // under-selected everything and the gates saw selected = 0 despite real evidence).
   reconcileSelectedFromEvidence(workspace, opts?.outputDir)
+
+  // Auto-reconcile plan checkboxes from REAL evidence coverage. plan_progress used to depend
+  // purely on whether the model remembered to call update_plan_status — which conflicts with
+  // the (correct) rule that checkboxes must never be used to fake gate coverage. That left the
+  // model dithering and plan_progress stuck. Here we mark an item done iff it genuinely has an
+  // assigned+read selected source and enough supported evidence rows (same bar as
+  // plan_section_coverage). Monotonic: we only CHECK items, never uncheck — so manual/earlier
+  // progress is preserved and plan_progress now tracks substance, consistent with coverage.
+  reconcilePlanFromEvidence(workspace, opts?.outputDir, Math.max(1, Number((opts as any)?.evidencePerSection) || 2))
 
   const tracker = sessionId ? getSourceTracker(sessionId) : null
   const sourceCount = tracker?.count() ?? 0

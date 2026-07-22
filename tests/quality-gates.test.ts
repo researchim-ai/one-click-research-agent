@@ -280,6 +280,44 @@ describe('runQualityGates', () => {
   }
 })
 
+describe('plan checkbox auto-reconciliation from evidence', () => {
+  function writeUncheckedPlan() {
+    const run = path.join(ws, OUT)
+    fs.mkdirSync(run, { recursive: true })
+    fs.writeFileSync(path.join(run, 'plan.md'), [
+      '# Plan',
+      '- [ ] Q1. Covered topic',
+      '- [ ] Q2. Uncovered topic',
+      '- [x] Q3. Already done',
+    ].join('\n'))
+  }
+  function writeEvidence(rows: any[]) {
+    const run = path.join(ws, OUT)
+    fs.mkdirSync(run, { recursive: true })
+    fs.writeFileSync(path.join(run, 'evidence.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  }
+
+  it('checks a plan item that has assigned+read sources and enough supported evidence, but not an uncovered one', () => {
+    writeUncheckedPlan()
+    // Two read+selected sources assigned to Q1; none to Q2.
+    writeCorpus([
+      corpusEntry(0, { id: 'c1', subQuestions: ['Q1'] }),
+      corpusEntry(1, { id: 'c2', subQuestions: ['Q1'] }),
+    ])
+    writeEvidence([
+      { id: 'e1', claim: 'Claim one for Q1', planItemId: 'Q1', status: 'supported', sourceIdxs: [], corpusIds: ['c1'], quote: 'q1' },
+      { id: 'e2', claim: 'Claim two for Q1', planItemId: 'Q1', status: 'supported', sourceIdxs: [], corpusIds: ['c2'], quote: 'q2' },
+    ])
+
+    runQualityGates(ws, undefined, { minSources: 2, outputDir: OUT, evidencePerSection: 2 } as any)
+
+    const plan = fs.readFileSync(path.join(ws, OUT, 'plan.md'), 'utf-8')
+    expect(plan).toMatch(/- \[x\] Q1\./) // auto-checked from real coverage
+    expect(plan).toMatch(/- \[ \] Q2\./) // genuinely uncovered → stays open
+    expect(plan).toMatch(/- \[x\] Q3\./) // pre-existing state preserved
+  })
+})
+
 describe('escape valve end-to-end on disk', () => {
   it('downgrades review_source_coverage after repeated runs WITH genuine extra searching, and persists it', () => {
     writeCorpus(Array.from({ length: 6 }, (_, i) => corpusEntry(i)))

@@ -252,3 +252,173 @@ describe('screen_corpus min_selected soft floor', () => {
     expect(corpus.filter((e) => e.screeningStatus === 'selected').length).toBe(0)
   })
 })
+
+describe('screen_corpus day-precise window + source preference', () => {
+  const mk = (id: string, title: string, over: Record<string, any> = {}) => ({ ...raw(id, title), ...over })
+  const FROM = `${YEAR}-05-01`
+  const TO = `${YEAR}-08-01`
+
+  it('enforces a sub-year window at DAY precision even within the same calendar year', () => {
+    writeCorpus([
+      mk('in1', 'Reinforcement Learning for LLM alignment with RLHF and DPO', { date: `${YEAR}-06-15T00:00:00Z` }),
+      // Same YEAR but January → outside the May..Aug window; year-only filtering would keep it.
+      mk('out1', 'Reinforcement Learning for LLM reasoning via GRPO and PPO', { date: `${YEAR}-01-10T00:00:00Z` }),
+    ])
+    screenCorpus(ws, { question: 'reinforcement learning LLM', yearFrom: YEAR, yearTo: YEAR, fromDate: FROM, toDate: TO, strictDateRange: true, minSelected: 1 }, OUT)
+    const corpus = loadCorpus(ws, OUT)
+    expect(corpus.find((e) => e.id === 'in1')?.screeningStatus).toBe('selected')
+    expect(corpus.find((e) => e.id === 'out1')?.screeningStatus).toBe('rejected')
+    expect(corpus.find((e) => e.id === 'out1')?.screeningReason).toMatch(/Outside strict date range/)
+  })
+
+  it('demotes an undated source under a strict day window (never auto-selects, never re-promotes)', () => {
+    writeCorpus([
+      mk('u1', 'Reinforcement Learning for LLM alignment with RLHF and DPO', { date: undefined, year: undefined, arxivId: undefined, url: 'https://link.springer.com/article/xyz' }),
+    ])
+    // A minimum floor must NOT re-promote the demoted undated source.
+    screenCorpus(ws, { question: 'reinforcement learning LLM', fromDate: FROM, toDate: TO, strictDateRange: true, minSelected: 3 }, OUT)
+    const e = loadCorpus(ws, OUT).find((c) => c.id === 'u1')
+    expect(e?.screeningStatus).toBe('needs_review')
+    expect(e?.screeningReason).toMatch(/No day-precise date/)
+  })
+
+  it('demotes a YEAR-ONLY source under a strict day window (a bare 2026 cannot confirm Apr–Jul)', () => {
+    writeCorpus([
+      // On-topic web page tagged year 2026 but with no day-precise date — the exact leak seen
+      // in production where undated 2026 aggregator pages slipped in via the year fallback.
+      mk('y1', 'Reinforcement Learning for LLM alignment: a comprehensive survey', { date: undefined, year: YEAR, arxivId: undefined, sourceTool: 'search_web', url: 'https://example.com/rl-llm-survey' }),
+    ])
+    screenCorpus(ws, { question: 'reinforcement learning LLM', yearFrom: YEAR, yearTo: YEAR, fromDate: FROM, toDate: TO, strictDateRange: true, minSelected: 3 }, OUT)
+    const e = loadCorpus(ws, OUT).find((c) => c.id === 'y1')
+    expect(e?.screeningStatus).toBe('needs_review')
+    expect(e?.screeningReason).toMatch(/only year/)
+  })
+
+  it('does NOT demand day precision for a whole-year-aligned multi-year window (2024-01-01..2026-12-31)', () => {
+    // A 3-year range expressed with Jan-1/Dec-31 edges is really a YEAR range: an undated
+    // survey must stay selectable, not get demoted "No day-precise date" (the bug that left
+    // reasoning/quantum/robotics plan items empty because all their surveys were undated).
+    writeCorpus([
+      mk('u1', 'A Survey of Reinforcement Learning for Large Reasoning Models', { date: undefined, year: undefined }),
+    ])
+    screenCorpus(ws, {
+      question: 'reinforcement learning survey',
+      fromDate: '2024-01-01', toDate: '2026-12-31', yearFrom: 2024, yearTo: 2026,
+      strictDateRange: true, minSelected: 1,
+    }, OUT)
+    const e = loadCorpus(ws, OUT).find((c) => c.id === 'u1')!
+    expect(e.screeningReason ?? '').not.toMatch(/No day-precise date/)
+    expect(e.screeningStatus).toBe('selected')
+  })
+
+  it('prefers open arXiv/OpenAlex over a closed, undated publisher landing page for academic runs', () => {
+    writeCorpus([
+      mk('open1', 'Reinforcement learning for robotics control policy and value methods'),
+      mk('closed1', 'Reinforcement learning for robotics control policy and value methods', { arxivId: undefined, url: 'https://www.sciencedirect.com/science/article/pii/x' }),
+    ])
+    screenCorpus(ws, { question: 'reinforcement learning robotics', researchKind: 'academic' }, OUT)
+    const open1 = loadCorpus(ws, OUT).find((c) => c.id === 'open1')!
+    const closed1 = loadCorpus(ws, OUT).find((c) => c.id === 'closed1')!
+    expect(open1.score).toBeGreaterThan(closed1.score)
+  })
+
+  it('assigns cross-language sub-topics: quantum survey → quantum Q, broad survey → general Q', () => {
+    // Plan phrased in Russian, sources in English. The old token-overlap matcher tagged
+    // neither (sub=[]) so those plan items stayed uncovered. Now: quantum → its own Q,
+    // and a broad RL survey with no specific match falls back to the "general" Q.
+    writeCorpus([
+      mk('qz', 'Quantum Reinforcement Learning: Recent Advances and Future Directions', { arxivId: 'qz' }),
+      mk('gen', 'A Survey on Model-Based Reinforcement Learning', { arxivId: 'gen' }),
+    ])
+    screenCorpus(ws, {
+      question: 'Обзорные статьи по Reinforcement Learning за 2024–2026',
+      subQuestions: [
+        'Обзорные статьи по общим направлениям RL (general RL surveys)',
+        'Обзорные статьи по RL для LLM и alignment (RLHF, DPO)',
+        'Обзорные статьи по квантовому RL и hybrid quantum-classical RL',
+      ],
+      researchKind: 'academic',
+    }, OUT)
+    const c = loadCorpus(ws, OUT)
+    expect(c.find((e) => e.id === 'qz')?.subQuestions).toContain('Q3')
+    expect(c.find((e) => e.id === 'gen')?.subQuestions).toContain('Q1')
+  })
+
+  it('guarantees a sparse sub-topic its slot instead of letting popular topics take the whole cap', () => {
+    // 4 popular RLHF/multi-agent surveys + 1 quantum survey, cap = 3. A pure top-3-by-score
+    // cutoff would drop the quantum survey; balanced selection must still keep it.
+    writeCorpus([
+      mk('a1', 'Reinforcement Learning from Human Feedback for LLM alignment: A Survey', { arxivId: 'a1' }),
+      mk('a2', 'A Survey of RLHF and DPO preference optimization for large language models', { arxivId: 'a2' }),
+      mk('a3', 'Multi-Agent Reinforcement Learning: A Comprehensive Survey', { arxivId: 'a3' }),
+      mk('a4', 'Cooperative Multi-Agent Reinforcement Learning: A Review', { arxivId: 'a4' }),
+      mk('qz', 'Quantum Reinforcement Learning: A Survey of Recent Advances', { arxivId: 'qz' }),
+    ])
+    screenCorpus(ws, {
+      question: 'Обзорные статьи по Reinforcement Learning',
+      subQuestions: [
+        'Обзорные статьи по RL для LLM и alignment (RLHF, DPO)',
+        'Обзорные статьи по multi-agent RL и cooperative systems',
+        'Обзорные статьи по квантовому RL и hybrid quantum-classical RL',
+      ],
+      researchKind: 'academic',
+      maxSelected: 3,
+    }, OUT)
+    const qz = loadCorpus(ws, OUT).find((e) => e.id === 'qz')!
+    expect(qz.subQuestions).toContain('Q3')
+    expect(qz.screeningStatus).toBe('selected')
+  })
+
+  it('keeps strong on-topic surveys even when max_selected is set too low (model guessed a small cap)', () => {
+    writeCorpus([
+      mk('s1', 'A Survey of Reinforcement Learning for Robotics', { arxivId: 's1' }),
+      mk('s2', 'Multi-Agent Reinforcement Learning: A Comprehensive Survey', { arxivId: 's2' }),
+      mk('s3', 'A Survey of Quantum Reinforcement Learning', { arxivId: 's3' }),
+      mk('s4', 'Reinforcement Learning for LLM alignment: A Survey', { arxivId: 's4' }),
+      mk('s5', 'Model-Based Reinforcement Learning: A Survey', { arxivId: 's5' }),
+    ])
+    screenCorpus(ws, {
+      question: 'Обзорные статьи по Reinforcement Learning',
+      subQuestions: [
+        'Обзорные статьи по RL в robotics',
+        'Обзорные статьи по multi-agent RL',
+        'Обзорные статьи по квантовому RL (quantum RL)',
+        'Обзорные статьи по RL для LLM alignment',
+        'Обзорные статьи по model-based RL',
+      ],
+      researchKind: 'academic',
+      maxSelected: 2,
+    }, OUT)
+    const sel = loadCorpus(ws, OUT).filter((e) => e.screeningStatus === 'selected')
+    expect(sel.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('does not demand an RL+LLM intersection when only ONE sub-topic mentions LLM (broad-RL run)', () => {
+    // Reproduces run 2026-07-19: main question is "RL surveys", but sub-topics include an
+    // RLHF/LLM item. Intent must come from the MAIN question, so RL-only surveys (quantum,
+    // robotics, multi-agent) stay on-topic instead of being rejected as "missing RL+LLM".
+    writeCorpus([
+      mk('q4', 'A survey of quantum reinforcement learning', { arxivId: 'q4', url: 'https://arxiv.org/abs/q4' }),
+      mk('q5', 'Reinforcement learning for robotics and sim-to-real: a review', { arxivId: 'q5', url: 'https://arxiv.org/abs/q5' }),
+      mk('q3', 'Multi-agent reinforcement learning survey', { arxivId: 'q3', url: 'https://arxiv.org/abs/q3' }),
+    ])
+    screenCorpus(ws, {
+      question: 'Обзорные (survey/review) статьи по Reinforcement Learning (RL) за 2024–2026',
+      subQuestions: [
+        'Обзорные статьи по общим вопросам RL / Deep RL',
+        'Обзорные статьи по RLHF и alignment LLM',
+        'Обзорные статьи по Multi-Agent RL',
+        'Обзорные статьи по квантовому RL',
+        'Обзорные статьи по RL в робототехнике и sim-to-real',
+      ],
+      researchKind: 'academic',
+      minSelected: 3,
+    }, OUT)
+    const corpus = loadCorpus(ws, OUT)
+    for (const id of ['q4', 'q5', 'q3']) {
+      const e = corpus.find((c) => c.id === id)!
+      expect(e.screeningReason ?? '').not.toMatch(/RL\+LLM topical intersection/)
+      expect(e.screeningStatus).toBe('selected')
+    }
+  })
+})

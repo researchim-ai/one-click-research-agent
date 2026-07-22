@@ -48,6 +48,14 @@ export interface CorpusEntry {
   semanticRelevanceScore?: number
   semanticOnTopic?: boolean
   semanticQueryKey?: string
+  /**
+   * Plan sub-questions (e.g. ["Q1","Q4"]) the LLM judged this source to cover, computed in
+   * the same language-agnostic screening pass as `semanticRelevanceScore`. This is the PRIMARY
+   * sub-topic signal: it works across languages, unlike lexical token overlap between a
+   * (often non-English) plan and English titles, which left broad/quantum surveys tagged to
+   * NO plan item and their plan rows uncovered. Bound to the query via `semanticQueryKey`.
+   */
+  semanticSubQuestions?: string[]
   readPriority?: 'high' | 'medium' | 'low'
   subQuestions?: string[]
   readStatus?: 'not_read' | 'queued' | 'read' | 'failed'
@@ -89,6 +97,14 @@ export interface CorpusScreenOptions {
   subQuestions?: string[]
   yearFrom?: number
   yearTo?: number
+  /**
+   * Day-precise window (YYYY-MM-DD). When present these take precedence over yearFrom/yearTo,
+   * so sub-year requests ("last 3 months") are enforced at day granularity instead of being
+   * floored to a calendar year. yearFrom/yearTo remain the fallback for undated-but-year-known
+   * entries and for coarse year windows.
+   */
+  fromDate?: string
+  toDate?: string
   maxSelected?: number
   /** Soft floor: promote the best on-topic items to reach this many selected. */
   minSelected?: number
@@ -406,6 +422,76 @@ function tokenizeQuery(text: string): string[] {
     .filter((t) => t.length >= 3 && !stop.has(t))
 }
 
+// Words that describe the DELIVERABLE or the umbrella field, not a specific sub-topic.
+// They appear in (almost) every RL/ML sub-question, so matching on them assigns a source
+// to every plan item and defeats the point. Excluded from sub-question discrimination.
+const SUBQ_GENERIC = new Set([
+  'survey', 'surveys', 'review', 'reviews', 'overview', 'systematic', 'tutorial', 'taxonomy',
+  'обзор', 'обзорные', 'обзорных', 'обзорная', 'статьи', 'статья', 'статей', 'работы', 'публикации',
+  'reinforcement', 'learning', 'deep', 'general', 'algorithm', 'algorithms', 'method', 'methods',
+  'model', 'models', 'paper', 'papers', 'research', 'study', 'studies', 'approach', 'approaches',
+  'направлениям', 'направления', 'общим', 'общие', 'основные',
+])
+
+/** Split hyphenated compounds into their parts too, so "quantum-classical" also yields
+ *  the discriminative bare terms "quantum"/"classical" that appear in English titles. */
+function expandTokens(text: string): string[] {
+  const base = tokenizeQuery(text)
+  const out = new Set<string>()
+  for (const t of base) {
+    out.add(t)
+    if (t.includes('-')) for (const part of t.split('-')) if (part.length >= 3) out.add(part)
+  }
+  return [...out]
+}
+
+/** Does `text` contain the discriminative term, tolerant of trivial plural/stem variation
+ *  ("survey" vs "surveys", "robotic" vs "robotics")? */
+function docHasTerm(text: string, term: string): boolean {
+  if (text.includes(term)) return true
+  if (term.endsWith('s') && term.length > 4 && text.includes(term.slice(0, -1))) return true
+  if (!term.endsWith('s') && term.length >= 4 && text.includes(term + 's')) return true
+  return false
+}
+
+/**
+ * Assign a corpus entry to the plan sub-questions it actually covers — robustly across
+ * languages. The previous approach matched raw sub-question tokens against the (often
+ * English) title, so a Cyrillic plan phrase like "квантовому RL" never matched "Quantum
+ * Reinforcement Learning" and the survey ended up tagged to NO sub-question (sub=[]),
+ * hence uncovered plan items even though the paper was in the corpus. Fixes:
+ *   - expand hyphenated compounds ("quantum-classical" → quantum, classical);
+ *   - drop deliverable/umbrella words (survey/review/reinforcement/learning/RL/general/…)
+ *     that occur in every sub-question and carry no discriminative signal;
+ *   - drop terms shared by most sub-questions (data-frequency filter);
+ *   - if nothing specific matches, fall back to the plan's GENERAL sub-topic (if any),
+ *     so a broad RL survey lands on "general RL" instead of nowhere.
+ */
+function assignSubQuestions(text: string, subQuestions: string[]): string[] {
+  const n = subQuestions.length
+  if (n === 0) return []
+  const perQ = subQuestions.map((q) =>
+    new Set(expandTokens(q).filter((t) => t.length >= 3 && !SUBQ_GENERIC.has(t) && !/^\d+$/.test(t))),
+  )
+  const df = new Map<string, number>()
+  for (const s of perQ) for (const t of s) df.set(t, (df.get(t) ?? 0) + 1)
+  const tooCommon = Math.max(2, Math.ceil(n / 2))
+  const scored = perQ.map((terms, i) => {
+    let hits = 0
+    for (const t of terms) {
+      if ((df.get(t) ?? 0) >= tooCommon) continue
+      if (docHasTerm(text, t)) hits++
+    }
+    return { id: `Q${i + 1}`, hits }
+  })
+  const matched = scored.filter((x) => x.hits > 0).sort((a, b) => b.hits - a.hits).slice(0, 3).map((x) => x.id)
+  if (matched.length > 0) return matched
+  // Catch-all: a broad RL survey that matched no specific sub-topic belongs to the
+  // "general" plan item, if the plan has one (English "general" or Russian "общ…").
+  const generalIdx = subQuestions.findIndex((q) => /\bgeneral\b|общ|общих|общими|широк/i.test(q))
+  return generalIdx >= 0 ? [`Q${generalIdx + 1}`] : []
+}
+
 function extractLineValue(text: string, label: string): string | undefined {
   return text.match(new RegExp(`^\\s*${label}:\\s*(.+)$`, 'im'))?.[1]?.trim()
 }
@@ -458,7 +544,7 @@ function genericTopicPrecisionFor(entry: CorpusEntry, queryText: string): { scor
   return { score, blockers: [] }
 }
 
-function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?: string): { score: number; blockers: string[] } {
+function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?: string, scopeQuery?: string): { score: number; blockers: string[] } {
   // General (web) research is not RL/LLM-specific, so the academic heuristic would be a
   // no-op (flat 50) and let junk through. Use the generic query-coverage relevance instead.
   if (String(researchKind || 'academic') === 'general') return genericTopicPrecisionFor(entry, queryText)
@@ -468,7 +554,12 @@ function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?:
   // defeat this gate — letting astrophysics/quantum/math papers pass screening.
   // Topical precision must be judged from the source's own title + snippet only.
   const text = `${entry.title} ${entry.snippet ?? ''}`.toLowerCase()
-  const query = queryText.toLowerCase()
+  // Intent (what the study is ABOUT) must come from the MAIN research question, not the
+  // merged sub-question text. Otherwise a single LLM-flavoured sub-topic (e.g. "RLHF for
+  // LLM alignment") turns the whole run into "RL AND LLM", and every legitimate RL-only
+  // survey (multi-agent RL, quantum RL, robotics RL) gets rejected as "missing RL+LLM
+  // intersection" — the exact reason broad-RL runs leave topics uncovered.
+  const query = String(scopeQuery ?? queryText).toLowerCase()
   const wantsLlm = /\b(llm|large language model|language models?|chatgpt|reasoning model|post-training|post training)\b/i.test(query)
   const wantsRl = /\b(reinforcement learning|rlhf|rlvr|grpo|dpo|ppo|rloo|\brl\b|reward|policy optimization|preference optimization)\b/i.test(query)
   const hasLlm = /\b(llm|large language model|language models?|chatgpt|reasoning model|post-training|post training)\b/i.test(text)
@@ -485,16 +576,13 @@ function topicPrecisionFor(entry: CorpusEntry, queryText: string, researchKind?:
   return { score: Math.max(0, Math.min(100, score)), blockers }
 }
 
-function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string, researchKind?: string, semanticScore?: number): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
+function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[], queryText: string, researchKind?: string, semanticScore?: number, scopeQuery?: string, semanticSubQs?: string[]): { score: number; matched: string[]; subQs: string[]; topicalPrecision: number; blockers: string[] } {
   const text = `${entry.title} ${entry.snippet ?? ''} ${entry.authors ?? ''}`.toLowerCase()
   const matched = [...new Set(terms.filter((t) => text.includes(t)))]
   const rlBoost = ['reinforcement', 'learning', 'rl', 'rlhf', 'dpo', 'ppo', 'reward', 'policy', 'q-learning', 'offline', 'safe', 'robot', 'marl', 'agent', 'verifiable'].filter((t) => text.includes(t))
-  const subQs = subQuestions
-    .map((q, i) => ({ id: `Q${i + 1}`, hits: tokenizeQuery(q).filter((t) => text.includes(t)).length }))
-    .filter((x) => x.hits > 0)
-    .sort((a, b) => b.hits - a.hits)
-    .slice(0, 3)
-    .map((x) => x.id)
+  // Prefer the LLM's language-agnostic plan-coverage assignment; fall back to the lexical
+  // matcher only when the LLM has not assigned anything (no server / empty coverage).
+  const subQs = (semanticSubQs && semanticSubQs.length) ? semanticSubQs : assignSubQuestions(text, subQuestions)
   // Language-agnostic path: when the LLM has judged this source against the query, that score
   // IS the topical relevance — no token overlap required, so it works across any language pair.
   // The lexical heuristic below is only the offline fallback (no server / not yet scored).
@@ -508,7 +596,7 @@ function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[
       blockers: sem < 30 ? ['Semantically off-topic for the research question (LLM-judged)'] : [],
     }
   }
-  const precision = topicPrecisionFor(entry, queryText, researchKind)
+  const precision = topicPrecisionFor(entry, queryText, researchKind, scopeQuery)
   return {
     score: Math.min(100, matched.length * 7 + rlBoost.length * 8 + subQs.length * 8 + Math.round(precision.score * 0.25)),
     matched,
@@ -516,6 +604,102 @@ function relevanceFor(entry: CorpusEntry, terms: string[], subQuestions: string[
     topicalPrecision: precision.score,
     blockers: precision.blockers,
   }
+}
+
+/** Parse a corpus entry's publication date to an ISO YYYY-MM-DD, if determinable. */
+function entryIsoDate(entry: CorpusEntry): string | null {
+  if (entry.date) {
+    const m = String(entry.date).match(/(\d{4})-(\d{2})-(\d{2})/)
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`
+    const d = new Date(entry.date)
+    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10)
+  }
+  return null
+}
+
+/**
+ * Whether a genuinely SUB-ANNUAL window was requested (e.g. "last 3 months"), for which a
+ * year-only or undated source cannot be confirmed in-range and must be demoted.
+ *
+ * A range aligned to whole-year boundaries — fromDate = YYYY-01-01 AND toDate = YYYY-12-31 —
+ * is really just a YEAR range (e.g. 2024–2026), even though intake expresses it with day
+ * boundaries. For it, a year-only source date is sufficient, so it is NOT a day window.
+ * Treating "2024-01-01..2026-12-31" as day-precise wrongly demoted every undated survey to
+ * needs_review and left whole plan sub-topics (reasoning, quantum, robotics) uncovered.
+ */
+function hasDayWindow(opts: CorpusScreenOptions): boolean {
+  const from = opts.fromDate && /^\d{4}-\d{2}-\d{2}$/.test(opts.fromDate) ? opts.fromDate : null
+  const to = opts.toDate && /^\d{4}-\d{2}-\d{2}$/.test(opts.toDate) ? opts.toDate : null
+  if (!from && !to) return false
+  const fromWholeYear = !from || /^\d{4}-01-01$/.test(from)
+  const toWholeYear = !to || /^\d{4}-12-31$/.test(to)
+  // Both edges land on year boundaries → coarse year range, not a day-precise window.
+  if (fromWholeYear && toWholeYear) return false
+  return true
+}
+
+/**
+ * Is the entry outside the requested window? Prefers day-precision (fromDate/toDate)
+ * when the entry has a real date, and falls back to year bounds otherwise. Undated
+ * entries are NOT flagged here — they are demoted (never auto-selected) separately so
+ * they can still be used deliberately rather than silently dropped ("resolve then demote").
+ */
+function outsideRequestedWindow(entry: CorpusEntry, opts: CorpusScreenOptions): boolean {
+  const iso = entryIsoDate(entry)
+  if (iso && hasDayWindow(opts)) {
+    if (opts.fromDate && iso < opts.fromDate) return true
+    if (opts.toDate && iso > opts.toDate) return true
+    return false
+  }
+  if (entry.year && (opts.yearFrom || opts.yearTo)) {
+    if (opts.yearFrom && entry.year < opts.yearFrom) return true
+    if (opts.yearTo && entry.year > opts.yearTo) return true
+    return false
+  }
+  return false
+}
+
+/** Publisher hosts whose landing pages are typically paywalled AND often carry no clean
+ * date — for the science pipeline we prefer open, dated indexes (arXiv/OpenAlex/…). */
+const CLOSED_PUBLISHER_RE = /(?:springer|sciencedirect|elsevier|ieeexplore|ieee\.org|dl\.acm\.org|onlinelibrary\.wiley|tandfonline|jstor|sagepub|cambridge\.org|academic\.oup|oup\.com|researchgate|annualreviews)/i
+const OPEN_SCHOLARLY_TOOL_RE = /arxiv|openalex|semantic|crossref|pubmed|biorxiv/i
+// Non-scholarly hosts (blogs/aggregators): even when a post is titled "… survey", it is not a
+// citable review AND typically not cleanly readable full text. Never worth a selection slot in
+// an academic run.
+const NON_SCHOLARLY_HOST_RE = /(?:medium\.com|towardsdatascience|substack|blogspot|wordpress|dev\.to|kaggle\.com|reddit\.com|quora\.com)/i
+
+/** Open, readable, well-dated scholarly source (arXiv id, an OA URL, or an open index tool). */
+function isOpenScholarly(entry: CorpusEntry): boolean {
+  if (entry.arxivId) return true
+  if (entry.openAccessUrl) return true
+  return OPEN_SCHOLARLY_TOOL_RE.test(entry.sourceTool ?? '')
+}
+
+function isClosedPublisher(entry: CorpusEntry): boolean {
+  return CLOSED_PUBLISHER_RE.test(entry.url ?? '')
+}
+
+/** Likely NOT retrievable as clean full text — paywalled publisher landing page or a blog.
+ *  Selecting these wastes a slot and shows up as an "unavailable" source in the report. */
+function likelyUnreadable(entry: CorpusEntry): boolean {
+  if (entry.arxivId || entry.openAccessUrl) return false
+  return isClosedPublisher(entry) || NON_SCHOLARLY_HOST_RE.test(entry.url ?? '')
+}
+
+/**
+ * Score nudge for the ACADEMIC pipeline: prefer open, dated sources (arXiv/OpenAlex) and
+ * down-rank closed publisher landing pages that we cannot read and that are usually undated
+ * (Springer/Elsevier/IEEE/ACM/Wiley…). No effect on general (web) research.
+ */
+function sourcePreferenceDelta(entry: CorpusEntry, researchKind?: string): number {
+  if (String(researchKind || 'academic') !== 'academic') return 0
+  let d = 0
+  if (isOpenScholarly(entry)) d += 8
+  else if (isClosedPublisher(entry)) d -= 12
+  // Blog/aggregator "surveys" are neither citable nor readable — push them well down so they
+  // don't consume selection slots ahead of real, retrievable scholarly reviews.
+  if (NON_SCHOLARLY_HOST_RE.test(entry.url ?? '')) d -= 16
+  return d
 }
 
 function recencyFor(entry: CorpusEntry, yearFrom?: number, yearTo?: number): number {
@@ -555,21 +739,38 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
     entry.semanticQueryKey === currentQueryKey && typeof entry.semanticRelevanceScore === 'number'
       ? entry.semanticRelevanceScore
       : undefined
+  // LLM-assigned plan coverage for THIS query (language-agnostic). Primary sub-topic signal.
+  const semanticSubQFor = (entry: CorpusEntry): string[] | undefined =>
+    entry.semanticQueryKey === currentQueryKey && Array.isArray(entry.semanticSubQuestions)
+      ? entry.semanticSubQuestions
+      : undefined
   const minSelected = opts.minSelected && opts.minSelected > 0 ? Math.min(200, Math.trunc(opts.minSelected)) : 0
   // The requested floor must be able to raise the cap: if the user asked for ≥50 but
   // max_selected defaulted to 30, the cap would otherwise silently limit selection.
   const maxSelected = Math.max(Math.max(1, Math.min(200, Number(opts.maxSelected) || 30)), minSelected)
   const screened = entries.map((entry) => {
-    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText, opts.researchKind, semanticFor(entry))
+    const rel = relevanceFor(entry, terms, opts.subQuestions || [], queryText, opts.researchKind, semanticFor(entry), opts.question, semanticSubQFor(entry))
     const recency = recencyFor(entry, opts.yearFrom, opts.yearTo)
     const publicationType = classifyPublicationType(entry)
     const withType = { ...entry, publicationType }
     const authority = authorityFor(withType)
-    const outsideDate = Boolean(opts.strictDateRange && entry.year && ((opts.yearFrom && entry.year < opts.yearFrom) || (opts.yearTo && entry.year > opts.yearTo)))
+    const outsideDate = Boolean(opts.strictDateRange && outsideRequestedWindow(entry, opts))
+    // Under a STRICT day-precise window a source WITHOUT a real day date cannot be confirmed
+    // in-range — a bare year (2026) says nothing about whether it falls in Apr–Jul. Such a
+    // source must never auto-select; we demote it to needs_review instead of rejecting
+    // ("resolve then demote"): resolve its exact date (OpenAlex/arXiv/DOI) and it can count.
+    // (Entries whose KNOWN year is already outside the window are rejected via outsideDate above.)
+    const undatedUnderStrictWindow = Boolean(opts.strictDateRange && hasDayWindow(opts) && !entryIsoDate(entry))
+    const windowLabel = hasDayWindow(opts)
+      ? `${opts.fromDate ?? '*'}..${opts.toDate ?? '*'}`
+      : `${opts.yearFrom ?? '*'}-${opts.yearTo ?? '*'}`
     const lowPrecision = rel.topicalPrecision < 50 || rel.blockers.length > 0
     // Recency is weighted higher (0.30) so genuinely new primary papers are not
     // crowded out by older high-authority surveys when the user wants the latest work.
-    const selectedScore = rel.score * 0.5 + recency * 0.3 + authority * 0.2
+    // sourcePreference nudges the academic pipeline toward open, dated indexes (arXiv/OpenAlex)
+    // and away from closed, undated publisher landing pages (Springer/Elsevier/…).
+    const selectedScore = rel.score * 0.5 + recency * 0.3 + authority * 0.2 + sourcePreferenceDelta(entry, opts.researchKind)
+    const rejected = outsideDate || rel.score < 18 || rel.topicalPrecision < 30
     const updated: CorpusEntry = {
       ...entry,
       publicationType,
@@ -578,13 +779,15 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
       authorityScore: Math.round(authority),
       topicalPrecisionScore: Math.round(rel.topicalPrecision),
       subQuestions: rel.subQs.length ? rel.subQs : entry.subQuestions ?? [],
-      screeningStatus: outsideDate || rel.score < 18 || rel.topicalPrecision < 30 ? 'rejected' : lowPrecision ? 'needs_review' : selectedScore >= 42 ? 'selected' : 'needs_review',
+      screeningStatus: rejected ? 'rejected' : (undatedUnderStrictWindow || lowPrecision) ? 'needs_review' : selectedScore >= 42 ? 'selected' : 'needs_review',
       screeningReason: outsideDate
-        ? `Outside strict date range ${opts.yearFrom ?? '*'}-${opts.yearTo ?? '*'}`
+        ? `Outside strict date range ${windowLabel}`
         : rel.blockers.length
           ? `${rel.blockers.join('; ')}; matched: ${rel.matched.join(', ') || 'none'}`
         : rel.score < 18
           ? `Low topic relevance; matched: ${rel.matched.join(', ') || 'none'}`
+        : undatedUnderStrictWindow
+          ? `No day-precise date${entry.year ? ` (only year ${entry.year})` : ''} — cannot confirm within strict window ${windowLabel}; kept for review, not auto-selected. Resolve its exact date (OpenAlex/arXiv/DOI) to include it.`
           : `Selected score ${Math.round(selectedScore)}; precision ${Math.round(rel.topicalPrecision)}; type=${publicationType}; citations=${entry.citationCount ?? 'unknown'}; matched: ${rel.matched.slice(0, 8).join(', ') || 'semantic/context'}`,
       readPriority: selectedScore >= 62 && rel.topicalPrecision >= 60 ? 'high' : selectedScore >= 44 ? 'medium' : 'low',
       readStatus: entry.readStatus ?? (entry.status === 'read' ? 'read' : 'not_read'),
@@ -610,22 +813,80 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
     return updated
   }).sort((a, b) => (b.score - a.score) || ((b.year ?? 0) - (a.year ?? 0)))
 
-  let selectedCount = 0
-  for (const entry of screened) {
-    if (entry.screeningStatus === 'selected') {
-      // Manually pinned selections always survive the cap.
-      if (entry.pinnedStatus === 'selected') {
-        selectedCount++
-      } else if (selectedCount >= maxSelected) {
-        entry.screeningStatus = 'needs_review'
-        entry.screeningReason = `Below top ${maxSelected} selected cutoff. ${entry.screeningReason ?? ''}`.trim()
-        entry.readPriority = 'low'
-        entry.score = scoreEntry(entry)
-      } else {
-        selectedCount++
-      }
+  // ---- Balanced selection under the cap -------------------------------------
+  // A naive "top N by global score" cutoff lets a high-volume sub-topic (e.g. RLHF/LLM,
+  // multi-agent RL — many highly-cited papers) consume every slot and starve sparser plan
+  // items (general RL surveys, quantum RL) down to zero, even though on-topic surveys for
+  // them ARE in the corpus. Guarantee each plan sub-question a small floor of slots first,
+  // then fill the remainder by global score. `screened` is already sorted best-first.
+  const planSubIds = (opts.subQuestions || []).map((_, i) => `Q${i + 1}`)
+  const perTopicFloor = planSubIds.length
+    ? Math.max(1, Math.min(3, Math.floor(maxSelected / planSubIds.length)))
+    : 0
+  const isSelectableEntry = (e: CorpusEntry) =>
+    e.screeningStatus === 'selected'
+    || (e.screeningStatus === 'needs_review'
+      && (e.topicalPrecisionScore ?? 0) >= MIN_SELECTABLE_TOPICAL_PRECISION
+      && (e.relevanceScore ?? 0) >= 18
+      && !/^No day-precise date/.test(e.screeningReason ?? ''))
+  const pool = screened.filter(isSelectableEntry)
+  const covers = (e: CorpusEntry, q: string) => (e.subQuestions ?? []).includes(q)
+  // A low max_selected — often the MODEL's arbitrary guess (e.g. 17) — must not discard
+  // genuinely strong, clearly on-topic SURVEY/REVIEW sources that cover a plan sub-topic.
+  // That is the recurring "good papers were left out" complaint. Expand the effective cap to
+  // admit such strong items, bounded by a hard ceiling so reading effort stays sane.
+  const STRONG_SELECT_CEILING = 40
+  const isStrongSurvey = (e: CorpusEntry) =>
+    (e.topicalPrecisionScore ?? 0) >= 70
+    && (e.publicationType === 'survey' || e.publicationType === 'review' || (e.relevanceScore ?? 0) >= 60)
+    && (e.subQuestions ?? []).length > 0
+    // Don't spend EXPANDED slots on sources we probably can't read (paywalled publisher landing
+    // pages, blogs). Half of an over-expanded selection was failing full-text read and showing
+    // as "unavailable"; keep the expansion to open, retrievable surveys (arXiv/OA).
+    && !likelyUnreadable(e)
+  const strongCount = pool.filter(isStrongSurvey).length
+  const effectiveMax = Math.min(STRONG_SELECT_CEILING, Math.max(maxSelected, Math.min(strongCount, STRONG_SELECT_CEILING)))
+  const keep = new Set<string>()
+  // Manually pinned selections always survive the cap.
+  for (const e of screened) if (e.pinnedStatus === 'selected' && e.screeningStatus === 'selected') keep.add(e.id)
+  // Phase 1: guarantee each plan sub-topic its floor of the best covering sources.
+  for (const q of planSubIds) {
+    if (keep.size >= effectiveMax) break
+    let covered = pool.filter((e) => keep.has(e.id) && covers(e, q)).length
+    for (const e of pool) {
+      if (keep.size >= effectiveMax || covered >= perTopicFloor) break
+      if (keep.has(e.id) || !covers(e, q)) continue
+      keep.add(e.id)
+      covered++
     }
   }
+  // Phase 2: admit strong on-topic surveys, then fill remaining slots by global score.
+  for (const e of pool) {
+    if (keep.size >= effectiveMax) break
+    if (isStrongSurvey(e) && !keep.has(e.id)) keep.add(e.id)
+  }
+  for (const e of pool) {
+    if (keep.size >= effectiveMax) break
+    if (e.screeningStatus === 'selected' && !keep.has(e.id)) keep.add(e.id)
+  }
+  // Apply decisions: promote kept needs_review items, demote selected items that lost the cap.
+  for (const entry of screened) {
+    if (entry.pinnedStatus === 'selected') continue
+    if (keep.has(entry.id)) {
+      if (entry.screeningStatus !== 'selected') {
+        entry.screeningStatus = 'selected'
+        if (entry.readPriority === 'low') entry.readPriority = 'medium'
+        entry.screeningReason = `Selected for plan coverage (${(entry.subQuestions ?? []).join(',') || 'general'}). ${entry.screeningReason ?? ''}`.trim()
+        entry.score = scoreEntry(entry)
+      }
+    } else if (entry.screeningStatus === 'selected') {
+      entry.screeningStatus = 'needs_review'
+      entry.screeningReason = `Below top ${effectiveMax} selected cutoff. ${entry.screeningReason ?? ''}`.trim()
+      entry.readPriority = 'low'
+      entry.score = scoreEntry(entry)
+    }
+  }
+  let selectedCount = keep.size
   // Soft floor: if the user asked for a minimum, promote the best ON-TOPIC
   // needs_review items (never rejected/off-topic) up to that floor. We never inject
   // off-topic noise just to hit a number — if there genuinely aren't enough on-topic
@@ -634,6 +895,10 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
     for (const entry of screened) {
       if (selectedCount >= minSelected) break
       if (entry.screeningStatus !== 'needs_review') continue
+      // Never re-promote a source demoted for lacking a day-precise date under a strict window —
+      // that would silently re-admit exactly what "resolve then demote" is meant to keep out. Its
+      // exact date must be resolved (OpenAlex/arXiv/DOI) before it can count toward the window.
+      if (/^No day-precise date/.test(entry.screeningReason ?? '')) continue
       // Only promote items that will also satisfy the topical_precision gate — otherwise a
       // promoted-to-hit-the-count item is flagged by the gate and the run loops/downgrades.
       const onTopic = (entry.topicalPrecisionScore ?? 0) >= MIN_SELECTABLE_TOPICAL_PRECISION && (entry.relevanceScore ?? 0) >= 18
