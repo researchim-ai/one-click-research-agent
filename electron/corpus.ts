@@ -632,8 +632,16 @@ function hasDayWindow(opts: CorpusScreenOptions): boolean {
   const to = opts.toDate && /^\d{4}-\d{2}-\d{2}$/.test(opts.toDate) ? opts.toDate : null
   if (!from && !to) return false
   const fromWholeYear = !from || /^\d{4}-01-01$/.test(from)
-  const toWholeYear = !to || /^\d{4}-12-31$/.test(to)
-  // Both edges land on year boundaries → coarse year range, not a day-precise window.
+  const today = new Date().toISOString().slice(0, 10)
+  // A toDate at/after today is an OPEN "…up to the present" bound, not a mid-year cutoff: nothing
+  // can be published after today, so a year-only date IS enough to confirm the source falls in the
+  // window. Treat it like a whole-year upper edge (same as Dec-31). This is what makes a request
+  // like "статьи за 2026" — which intake expresses as from=2026-01-01, to=<today> — a COARSE year
+  // range rather than a strict day window. Without this, every year-only 2026 survey was demoted to
+  // needs_review ("No day-precise date"), dropped from the selectable pool, and the run could not
+  // select enough sources — it then looped on duplicate searches/screens and hung.
+  const toWholeYear = !to || /^\d{4}-12-31$/.test(to) || to >= today
+  // Both edges land on year boundaries (or an open "to present" upper edge) → coarse year range.
   if (fromWholeYear && toWholeYear) return false
   return true
 }
@@ -720,6 +728,26 @@ function authorityFor(entry: CorpusEntry): number {
   if (/benchmark|nature|neurips|iclr|icml|acl|emnlp|naacl|science/i.test(`${entry.title} ${entry.snippet ?? ''} ${entry.venue ?? ''}`)) score += 20
   if (/openalex|semantic|crossref|pubmed|arxiv/i.test(entry.sourceTool ?? '')) score += 10
   return Math.min(100, score)
+}
+
+/**
+ * Lightweight LEXICAL relevance for a single entry, used only to PRIORITIZE which corpus items the
+ * budget-limited LLM semantic screener should score first. Ranking by this puts the candidates most
+ * likely to be selected at the front, so the top of the final ranking is always LLM-validated —
+ * unlike the old "count shared query words" heuristic, which was near-random for a cross-language
+ * query (Russian question vs English titles) and spent the budget on tangential items.
+ * Mirrors the screener's own term/relevance logic; no semantic/recency input (that's the point).
+ */
+export function lexicalRelevancePreScore(
+  entry: CorpusEntry,
+  question: string,
+  subQuestions?: string[],
+  researchKind?: string,
+): number {
+  const queryText = [question, ...(subQuestions || [])].join(' ')
+  const terms = tokenizeQuery(queryText)
+  const rel = relevanceFor(entry, terms, subQuestions || [], queryText, researchKind, undefined, question, undefined)
+  return rel.score
 }
 
 export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outputDir?: string): string {
@@ -844,7 +872,21 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
     // pages, blogs). Half of an over-expanded selection was failing full-text read and showing
     // as "unavailable"; keep the expansion to open, retrievable surveys (arXiv/OA).
     && !likelyUnreadable(e)
-  const strongCount = pool.filter(isStrongSurvey).length
+  // A source the LLM judged highly on-topic (language-agnostic) must not be stranded in
+  // needs_review just because it is a closed-publisher/DOI hit (isStrongSurvey excludes those as
+  // "likely unreadable"). That stranding was the root of a run doing 61 searches and never
+  // converging: excellent reasoning surveys (sem 85–95) sat unselected, coverage gates stayed
+  // <100, and the agent kept searching instead of using what it already had. OA resolution
+  // (OpenAlex best_oa_location) now makes many DOI hits readable, so admit them by semantic score
+  // alone. Ceiling still bounds total reading effort.
+  // No plan-subtopic requirement here: a high LLM relevance score already means "on-topic for the
+  // research question". Requiring subQuestion coverage on top of it strands items whenever the plan
+  // has no sub-questions or the lexical sub-topic matcher missed (cross-language) — which is exactly
+  // how the excellent surveys got stuck in needs_review.
+  const HIGH_SEMANTIC_SELECT = 75
+  const isHighSemanticSurvey = (e: CorpusEntry) => (semanticFor(e) ?? -1) >= HIGH_SEMANTIC_SELECT
+  const isExpandable = (e: CorpusEntry) => isStrongSurvey(e) || isHighSemanticSurvey(e)
+  const strongCount = pool.filter(isExpandable).length
   const effectiveMax = Math.min(STRONG_SELECT_CEILING, Math.max(maxSelected, Math.min(strongCount, STRONG_SELECT_CEILING)))
   const keep = new Set<string>()
   // Manually pinned selections always survive the cap.
@@ -860,10 +902,12 @@ export function screenCorpus(workspace: string, opts: CorpusScreenOptions, outpu
       covered++
     }
   }
-  // Phase 2: admit strong on-topic surveys, then fill remaining slots by global score.
+  // Phase 2: admit strong on-topic surveys (incl. LLM-judged high-semantic hits), then fill
+  // remaining slots by global score. `pool` is best-first, so the highest-scoring surveys win
+  // the expanded slots.
   for (const e of pool) {
     if (keep.size >= effectiveMax) break
-    if (isStrongSurvey(e) && !keep.has(e.id)) keep.add(e.id)
+    if (isExpandable(e) && !keep.has(e.id)) keep.add(e.id)
   }
   for (const e of pool) {
     if (keep.size >= effectiveMax) break

@@ -184,7 +184,7 @@ export async function indexFile(workspacePath: string, filePath: string): Promis
   let text = ''
   try {
     if (isDocumentExtension(ext)) {
-      const parsed = parseDocument(filePath)
+      const parsed = await parseDocument(filePath)
       text = parsed.text
     } else {
       text = fs.readFileSync(filePath, 'utf-8')
@@ -226,7 +226,7 @@ export async function rebuildIndex(workspacePath: string, onProgress?: (done: nu
     const ext = path.extname(filePath).toLowerCase()
     let text = ''
     try {
-      if (isDocumentExtension(ext)) text = parseDocument(filePath).text
+      if (isDocumentExtension(ext)) text = (await parseDocument(filePath)).text
       else text = fs.readFileSync(filePath, 'utf-8')
     } catch {}
     if (!text.trim()) continue

@@ -22,7 +22,7 @@ import { renderPrompt } from './prompts'
 import {
   addSourcesToCorpus, assignCorpusToPlan, fullTextStatus, listCorpus, listSelectedCorpus, loadCorpus, markCorpusItemRead,
   queueFullText, rankCorpus, rejectCorpusItems, screenCorpus, selectFullTextBatch, corpusStats, saveCorpus,
-  semanticQueryKey,
+  semanticQueryKey, lexicalRelevancePreScore,
   type CorpusEntry,
 } from './corpus'
 import { evidenceCoverageByPlan, evidenceMatrix, evidenceStats, listEvidence, loadEvidence, recordEvidence, reconcileSelectedFromEvidence, repairEvidenceQuotes, verifyClaims } from './evidence'
@@ -1032,10 +1032,6 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return assignCorpusToPlan(workspace, args.ids, args.plan_item_id, args.output_dir)
       case 'select_full_text_batch':
         return selectFullTextBatchTool(workspace, args.limit, args.output_dir)
-      case 'read_corpus_item':
-        return readCorpusItemTool(workspace, args.id, args.output_dir)
-      case 'read_full_text_batch':
-        return readFullTextBatchTool(workspace, args.limit, args.output_dir)
       case 'full_text_status':
         return fullTextStatus(workspace, args.output_dir)
       case 'get_references':
@@ -1080,8 +1076,6 @@ export function executeTool(name: string, args: Record<string, any>, workspace: 
         return downloadArxivHtml(args.arxiv_id, args.output_path, workspace)
       case 'download_arxiv_pdf':
         return downloadArxivPdf(args.arxiv_id, args.output_path, workspace)
-      case 'parse_document':
-        return parseDocumentTool(args.path, workspace, args.max_pages)
       case 'verify_sources':
         return verifySources(args.session_id, args.max_sources)
       case 'plan_research':
@@ -1126,6 +1120,12 @@ const ASYNC_ONLY_TOOLS = new Set([
   'screenshot_page',
   'export_report',
   'recall_findings',
+  // Full-text reading / document parsing now runs the heavy libraries (jsdom, unpdf, mammoth)
+  // in-process so they resolve from the packaged node_modules (a spawned `node -e` subprocess
+  // cannot read app.asar). That makes these tools async.
+  'read_corpus_item',
+  'read_full_text_batch',
+  'parse_document',
 ])
 
 // screen_corpus has BOTH a sync path (executeTool: pure lexical fallback, used by tests and
@@ -1151,6 +1151,12 @@ export async function executeToolAsync(name: string, args: Record<string, any>, 
         return await exportReportTool(args.markdown_path, args.format, args.output_path, args.session_id, workspace)
       case 'recall_findings':
         return await recallFindingsAsync(workspace, args.query, args.max_results)
+      case 'read_corpus_item':
+        return await readCorpusItemTool(workspace, args.id, args.output_dir)
+      case 'read_full_text_batch':
+        return await readFullTextBatchTool(workspace, args.limit, args.output_dir)
+      case 'parse_document':
+        return await parseDocumentTool(args.path, workspace, args.max_pages)
       case 'screen_corpus': {
         // Language-agnostic relevance: let the LLM score sources against the query (any
         // language) and cache it on the corpus BEFORE the deterministic screening consumes it.
@@ -1175,21 +1181,30 @@ export async function executeToolAsync(name: string, args: Record<string, any>, 
         // screen_corpus) selects on lexical scores alone and lets recent-but-tangential papers in.
         const pre = buildCorpusMergeSources(args.session_id, args.tags, workspace, args.output_dir)
         if (typeof pre === 'string') return pre
+        let semanticNote = ''
         if (args.output_dir) {
           try {
             const spec = ensureResearchRunSpec(workspace, String(args.output_dir))
             const sp = spec.screenParams
             if (sp?.question) {
-              await annotateSemanticRelevance(
+              const scored = await annotateSemanticRelevance(
                 workspace,
                 String(args.output_dir),
                 { question: sp.question, subQuestions: sp.subQuestions },
                 ctx?.apiUrl,
               )
+              semanticNote = scored > 0
+                ? `Semantic screening: scored ${scored} source(s) for language-agnostic relevance.`
+                : 'Semantic screening: no scores produced (model returned no parseable output); selection uses the lexical fallback.'
             }
-          } catch {}
+          } catch (e: any) {
+            // Surface (do not swallow) so a packaged-build regression in the semantic pass is
+            // visible in the run trace instead of silently degrading selection precision.
+            semanticNote = `Semantic screening unavailable (${String(e?.message || e).slice(0, 120)}); selection uses the lexical fallback.`
+          }
         }
-        return buildCorpusScreenAndReport(pre.merged, args.queue_full_text, workspace, args.output_dir)
+        const report = buildCorpusScreenAndReport(pre.merged, args.queue_full_text, workspace, args.output_dir)
+        return semanticNote ? `${semanticNote}\n${report}` : report
       }
       default:
         // Fallback to synchronous executor
@@ -1454,7 +1469,7 @@ function selectFullTextBatchTool(workspace: string, limit: number | undefined, o
   ].filter(Boolean).join('\n')).join('\n\n')
 }
 
-function readCorpusItemTool(workspace: string, id: string | undefined, outputDir?: string): string {
+async function readCorpusItemTool(workspace: string, id: string | undefined, outputDir?: string): Promise<string> {
   const corpusId = String(id ?? '').trim()
   if (!corpusId) return 'Error: id is required.'
   const entry = loadCorpus(workspace, outputDir).find((e) => e.id === corpusId)
@@ -1550,7 +1565,7 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   const oaPdfUrls = [...new Set([scholarly?.pdfUrl, ...(scholarly?.pdfUrls ?? [])].filter(Boolean) as string[])]
   for (const [index, pdfUrl] of oaPdfUrls.entries()) {
     const pdfPath = resolvePath(path.join(fullTextDir, `${safeId}${index ? `-${index + 1}` : ''}.pdf`), workspace)
-    const parsed = downloadAndParseOaPdf(pdfUrl, pdfPath, target, entry.title, entry.url, workspace)
+    const parsed = await downloadAndParseOaPdf(pdfUrl, pdfPath, target, entry.title, entry.url, workspace)
     if (!parsed.startsWith('Error:')) {
       const rel = path.relative(workspace, target)
       markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access PDF recovered and parsed via OpenAlex/Semantic Scholar/OpenReview', outputDir)
@@ -1580,14 +1595,14 @@ function readCorpusItemTool(workspace: string, id: string | undefined, outputDir
   return `Error: could not retrieve readable full text for ${entry.url} — ${why}. Treat this source as unavailable (do not retry the same id); its abstract/snippet is still in the corpus. Run full_text_status, then run_quality_gates so the limitation is recorded.\nUpdated corpus ${corpusId}: failed.`
 }
 
-function readFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): string {
+async function readFullTextBatchTool(workspace: string, limit: number | undefined, outputDir?: string): Promise<string> {
   const batch = selectFullTextBatch(workspace, limit, outputDir)
   if (batch.length === 0) {
     return 'Error: no selected corpus items are queued for full-text batch reading. Do not call read_full_text_batch again with the same arguments. Call full_text_status to inspect failed/unread items; if a high-priority item failed, call read_corpus_item with that specific id once, then run_quality_gates.'
   }
   const lines = [`Reading ${batch.length} selected corpus item(s):`, '']
   for (const item of batch) {
-    const result = readCorpusItemTool(workspace, item.id, outputDir)
+    const result = await readCorpusItemTool(workspace, item.id, outputDir)
     lines.push(`## ${item.id}: ${item.title}`, result, '')
   }
   lines.push(fullTextStatus(workspace, outputDir))
@@ -1934,13 +1949,36 @@ async function annotateSemanticRelevance(
   if (todo.length === 0) return 0
 
   const subQ = (opts.subQuestions || []).filter((s) => String(s).trim()).slice(0, 8)
+
+  // Priority ordering: a slow/unstable local model often only completes a few batches before the
+  // budget runs out, so the FEW items we can afford to score must be the ones where an LLM judgment
+  // is most likely to change the selection. Scoring in arbitrary corpus order wasted the budget on
+  // tangential items and left genuinely on-topic candidates unscored at borderline lexical precision,
+  // so they never got selected.
+  //
+  // Rank by the LEXICAL PRE-SCORE (the screener's own relevance heuristic) so we validate exactly the
+  // candidates most likely to be selected — making the TOP of the final ranking LLM-checked. The old
+  // "count shared query words" heuristic was near-random for cross-language queries (Russian question
+  // vs English titles) and burned the budget on tangential items while the clearest on-topic surveys
+  // went unscored.
+  const priById = new Map(todo.map((e) => [e.id, lexicalRelevancePreScore(e, question, subQ)]))
+  todo.sort((a, b) => (priById.get(b.id) ?? 0) - (priById.get(a.id) ?? 0))
+
   const header = [
     `Research question: ${question}`,
     subQ.length ? `Sub-questions:\n${subQ.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : '',
   ].filter(Boolean).join('\n')
 
-  const BATCH = 20
-  const DEADLINE = Date.now() + 240000
+  // Small batches: a local model reliably returns well-formed JSON for ~8 candidates, but larger
+  // batches often truncate/malform the output — and a single unparseable batch silently drops ALL
+  // its items (they stay unscored). Smaller batches trade a little overhead for far better coverage.
+  const BATCH = 8
+  // User-configurable wall-clock budget for the whole LLM screening pass (Settings → advanced).
+  // Clamp to a sane floor so it can always do at least one batch. Per-batch timeout tracks the
+  // budget too (a tiny budget shouldn't wait 60s on a single batch).
+  const budgetSec = Math.max(30, Number(cfg.get('semanticScreeningBudgetSec')) || 240)
+  const DEADLINE = Date.now() + budgetSec * 1000
+  const perBatchTimeoutMs = Math.min(60000, budgetSec * 1000)
   const byId = new Map(corpus.map((e) => [e.id, e]))
   let scored = 0
 
@@ -1953,17 +1991,26 @@ async function annotateSemanticRelevance(
       return `id=${e.id} | title: ${title}${snip ? ` | snippet: ${snip}` : ''}`
     }).join('\n')
     const user = `${header}\n\nCandidates:\n${lines}`
-    const out = await callLocalChatAsync(base, renderPrompt('screening.semantic'), user, {
-      maxTokens: Math.min(2000, 120 + batch.length * 40),
-      timeoutMs: 60000,
-    })
-    if (!out) continue
-    const start = out.indexOf('{')
-    const end = out.lastIndexOf('}')
-    if (start < 0 || end <= start) continue
-    let parsed: any
-    try { parsed = JSON.parse(out.slice(start, end + 1)) } catch { continue }
-    const rows = Array.isArray(parsed?.scores) ? parsed.scores : []
+    // One retry per batch: a slow/verbose local model occasionally returns empty or truncated
+    // (unparseable) JSON, which would silently drop this ENTIRE batch — leaving ~8 items unscored
+    // and creating the "only a fraction got scored" coverage holes. Retry once before giving up.
+    let rows: any[] | null = null
+    for (let attempt = 0; attempt < 2 && rows === null; attempt++) {
+      if (Date.now() > DEADLINE) break
+      const out = await callLocalChatAsync(base, renderPrompt('screening.semantic'), user, {
+        maxTokens: Math.min(2000, 200 + batch.length * 45),
+        timeoutMs: perBatchTimeoutMs,
+      })
+      if (!out) continue
+      const start = out.indexOf('{')
+      const end = out.lastIndexOf('}')
+      if (start < 0 || end <= start) continue
+      try {
+        const parsed = JSON.parse(out.slice(start, end + 1))
+        rows = Array.isArray(parsed?.scores) ? parsed.scores : []
+      } catch { rows = null }
+    }
+    if (!rows) continue
     for (const row of rows) {
       const entry = byId.get(String(row?.id))
       if (!entry) continue
@@ -3695,14 +3742,14 @@ fetch(url, {
   return `Downloaded arXiv PDF ${normalizedId} to ${path.relative(workspace, targetPath) || targetPath} (${byteCount} bytes)`
 }
 
-function downloadAndParseOaPdf(
+async function downloadAndParseOaPdf(
   pdfUrl: string,
   pdfPath: string,
   markdownPath: string,
   title: string,
   sourceUrl: string,
   workspace: string,
-): string {
+): Promise<string> {
   if (!/^https?:\/\//i.test(pdfUrl)) return 'Error: invalid open-access PDF URL.'
   assertInWorkspace(pdfPath, workspace)
   assertInWorkspace(markdownPath, workspace)
@@ -3724,7 +3771,7 @@ ${fetchWithTimeoutSnippet(60000)}
   let byteCount = 0
   try {
     byteCount = Number(runNodeScript(script, [pdfUrl, pdfPath], 70000).trim()) || fs.statSync(pdfPath).size
-    const parsed = parseDocument(pdfPath)
+    const parsed = await parseDocument(pdfPath)
     if (parsed.text.trim().length < MIN_FULLTEXT_CHARS) throw new Error(`PDF text extraction returned only ${parsed.text.trim().length} chars`)
     const document = [
       `# ${title}`,
@@ -3932,7 +3979,7 @@ function deleteFile(filePath: string, workspace: string): string {
 // New research tools (Wave 1-6)
 // ---------------------------------------------------------------------------
 
-function parseDocumentTool(filePath: string, workspace: string, maxPages?: number): string {
+async function parseDocumentTool(filePath: string, workspace: string, maxPages?: number): Promise<string> {
   if (!filePath) return 'Error: path is required.'
   const p = resolvePath(filePath, workspace)
   assertInWorkspace(p, workspace)
@@ -3940,7 +3987,7 @@ function parseDocumentTool(filePath: string, workspace: string, maxPages?: numbe
   const ext = path.extname(p).toLowerCase()
   if (!isDocumentExtension(ext)) return `parse_document supports .pdf/.docx/.doc only. For ${ext} use read_file.`
   try {
-    const parsed = parseDocument(p, maxPages)
+    const parsed = await parseDocument(p, maxPages)
     const header = parsed.pages ? `Parsed ${filePath} — ${parsed.pages} pages, ${parsed.text.length} chars.\n\n` : `Parsed ${filePath} — ${parsed.text.length} chars.\n\n`
     const body = summarizeParsedForPrompt(parsed, 24000)
     return header + body

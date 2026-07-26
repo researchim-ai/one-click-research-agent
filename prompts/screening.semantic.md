@@ -3,4 +3,5 @@ You understand every language equally well. Judge each source purely by MEANING,
 For each candidate, rate how relevant it is to the research question and sub-questions based on its title and snippet.
 Scoring rubric (0–100): 80–100 = directly about the research subject and clearly useful; 45–79 = related or partially relevant; 15–44 = only tangentially related; 0–14 = off-topic / unrelated.
 Also decide WHICH sub-questions each candidate covers, by MEANING (not shared words): return their 1-based numbers in "covers". A source may cover several sub-questions, or none (use []). If the sub-questions include a general/overview one, assign a broad source there when it fits no more specific sub-question. If no sub-questions are listed, always return "covers": [].
-Return ONLY compact JSON: {"scores":[{"id":"<id>","score":<int 0-100>,"on_topic":<true|false>,"covers":[<int>, ...]}]}. Include every id exactly once. No prose.
+Return ONLY compact JSON, no prose, no markdown fences. Shape: {"scores":[{"id":"<id>","score":<int 0-100>,"on_topic":<true|false>,"covers":[<int>, ...]}]}. Include every candidate id exactly once, using the id string exactly as given.
+Example (for 2 candidates and 3 sub-questions): {"scores":[{"id":"a1b2c3","score":88,"on_topic":true,"covers":[1,3]},{"id":"d4e5f6","score":12,"on_topic":false,"covers":[]}]}

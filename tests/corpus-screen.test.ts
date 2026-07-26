@@ -311,6 +311,51 @@ describe('screen_corpus day-precise window + source preference', () => {
     expect(e.screeningStatus).toBe('selected')
   })
 
+  it('treats "whole year to present" (from=Jan-1, to=today) as a coarse year range — does NOT demote year-only sources', () => {
+    // Reproduces the hung run 2026-07-24: the user asked for papers "за 2026". Intake expressed it
+    // as strictDateRange from=YYYY-01-01 to=<today>. That is NOT a sub-year cutoff — nothing can be
+    // published after today — so a year-only 2026 survey must NOT be demoted to needs_review. The
+    // old logic demoted every such source, leaving only 1 of 51 selected and the agent looping on
+    // duplicate searches until it hung.
+    const today = new Date().toISOString().slice(0, 10)
+    const question = 'Обзорные статьи по reasoning в LLM'
+    const key = semanticQueryKey(question, [])
+    writeCorpus([
+      mk('y1', 'A Survey of Inductive Reasoning for Large Language Models', { arxivId: 'y1', date: undefined, year: YEAR, semanticRelevanceScore: 95, semanticOnTopic: true, semanticQueryKey: key }),
+      mk('y2', 'Toward large reasoning models: A survey of reinforced reasoning', { arxivId: 'y2', date: undefined, year: YEAR, semanticRelevanceScore: 90, semanticOnTopic: true, semanticQueryKey: key }),
+    ])
+    screenCorpus(ws, {
+      question,
+      researchKind: 'academic',
+      strictDateRange: true, fromDate: `${YEAR}-01-01`, toDate: today, yearFrom: YEAR, yearTo: YEAR,
+      minSelected: 2,
+    }, OUT)
+    const corpus = loadCorpus(ws, OUT)
+    for (const id of ['y1', 'y2']) {
+      const e = corpus.find((c) => c.id === id)!
+      expect(e.screeningReason ?? '').not.toMatch(/No day-precise date/)
+      expect(e.screeningStatus).toBe('selected')
+    }
+  })
+
+  it('still enforces DAY precision for a genuine sub-year window that ends BEFORE today (e.g. Q1 of a past year)', () => {
+    // Contrast with the "to present" case: a window whose upper edge is a past mid-year cutoff
+    // (Jan-1 .. Mar-31 of LAST year) genuinely cannot confirm a year-only source, so demotion must
+    // still apply. Using last year keeps the upper edge unambiguously < today whenever tests run.
+    const LY = YEAR - 1
+    writeCorpus([
+      mk('u1', 'A Survey of Inductive Reasoning for Large Language Models', { arxivId: 'u1', date: undefined, year: LY }),
+    ])
+    screenCorpus(ws, {
+      question: 'Обзорные статьи по reasoning в LLM',
+      researchKind: 'academic',
+      strictDateRange: true, fromDate: `${LY}-01-01`, toDate: `${LY}-03-31`, yearFrom: LY, yearTo: LY,
+    }, OUT)
+    const e = loadCorpus(ws, OUT).find((c) => c.id === 'u1')!
+    expect(e.screeningReason ?? '').toMatch(/No day-precise date/)
+    expect(e.screeningStatus).toBe('needs_review')
+  })
+
   it('prefers open arXiv/OpenAlex over a closed, undated publisher landing page for academic runs', () => {
     writeCorpus([
       mk('open1', 'Reinforcement learning for robotics control policy and value methods'),
@@ -390,6 +435,36 @@ describe('screen_corpus day-precise window + source preference', () => {
       maxSelected: 2,
     }, OUT)
     const sel = loadCorpus(ws, OUT).filter((e) => e.screeningStatus === 'selected')
+    expect(sel.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('selects LLM-judged high-semantic surveys beyond a low cap even when they are closed-publisher/DOI (not "strong survey")', () => {
+    // Reproduces run 2026-07-23_19-40-54: excellent reasoning surveys scored 85–95 by the LLM sat
+    // stranded in needs_review because they are closed-publisher/DOI hits (isStrongSurvey excludes
+    // them as likely-unreadable), and max_selected=2 kept the cap tiny. The agent then over-searched
+    // (61 searches) and never converged. High semantic relevance must promote them past the cap.
+    const question = 'Обзорные статьи по reasoning в больших языковых моделях (LLM)'
+    const key = semanticQueryKey(question, [])
+    const closed = (id: string, title: string, sem: number) => ({
+      ...raw(id, title),
+      arxivId: undefined,
+      openAccessUrl: undefined,
+      doi: `10.1000/${id}`,
+      url: `https://link.springer.com/article/${id}`,
+      semanticRelevanceScore: sem,
+      semanticOnTopic: true,
+      semanticQueryKey: key,
+    })
+    writeCorpus([
+      closed('h1', 'A Survey of Inductive Reasoning for Large Language Models', 95),
+      closed('h2', 'A Survey on Chain-of-Thought Reasoning Evaluation in LLMs', 92),
+      closed('h3', 'Toward large reasoning models: A survey of reinforced reasoning', 90),
+      closed('h4', 'A survey of long chain-of-thought for reasoning large language models', 85),
+      closed('h5', 'A Survey on LLM Symbolic Reasoning', 80),
+    ])
+    screenCorpus(ws, { question, researchKind: 'academic', maxSelected: 2 }, OUT)
+    const sel = loadCorpus(ws, OUT).filter((e) => e.screeningStatus === 'selected')
+    // All five high-semantic surveys should be selected despite max_selected=2.
     expect(sel.length).toBeGreaterThanOrEqual(5)
   })
 

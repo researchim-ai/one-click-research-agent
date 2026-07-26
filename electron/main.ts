@@ -47,10 +47,20 @@ if (process.platform === 'win32') {
   app.commandLine.appendSwitch('force-dark-mode')
 }
 
+// Disable Chromium GPU compositing/acceleration for the whole app. We ship a plain
+// (non-3D, non-video) research UI that gains nothing from GPU rendering, but we run a
+// local llama.cpp inference server on the very same machine — often on the same card
+// that also drives the display. When Electron's GPU process and llama.cpp both hammer
+// that GPU, the NVIDIA driver can trip its display watchdog and log
+// "nvidia-modeset: Error while waiting for GPU progress" (a TDR-style hang). Freeing the
+// GPU from UI compositing removes that contention and keeps all VRAM/compute for the model.
+// Must be called before app is ready.
+app.disableHardwareAcceleration()
+app.commandLine.appendSwitch('disable-gpu-compositing')
+
 if (process.env.ELECTRON_NO_SANDBOX || process.argv.includes('--no-sandbox')) {
   app.commandLine.appendSwitch('no-sandbox')
   app.commandLine.appendSwitch('disable-gpu-sandbox')
-  app.disableHardwareAcceleration()
 }
 import { detect, evaluateVariants, loadModelArch, getArch, applyGpuPreferences, MODEL_FAMILIES } from './resources'
 import * as modelManager from './model-manager'
@@ -554,7 +564,13 @@ function registerIpcHandlers() {
   ipcMain.handle('get-config', () => config.load())
 
   ipcMain.handle('save-config', (_e, partial: Partial<config.AppConfig>) => {
-    return config.save(partial)
+    const saved = config.save(partial)
+    // Apply the GPU keep-warm toggle live so the user doesn't have to restart the server.
+    if (Object.prototype.hasOwnProperty.call(partial, 'gpuKeepWarm') && serverManager.isRunning()) {
+      if (saved.gpuKeepWarm) serverManager.startKeepWarm()
+      else serverManager.stopKeepWarm()
+    }
+    return saved
   })
 
   ipcMain.handle('get-tools', (): ToolInfo[] => {

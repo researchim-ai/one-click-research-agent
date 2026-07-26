@@ -215,15 +215,30 @@ export function runQualityGates(workspace: string, sessionId?: string, opts?: { 
     : fail('evidence_to_corpus_linkage', [`Only ${corpusLinked}/${claims.length} evidence claim(s) link to stable corpus IDs.`], Math.round(corpusLinked / Math.max(1, claims.length) * 100)))
 
   if (plan.length > 0) {
-    const missingPlan = plan.filter((item) => {
+    const missingPlan = plan.map((item) => {
       const assigned = selected.filter((e) => e.subQuestions?.includes(item.id))
       const readForPlan = assigned.filter((e) => e.readStatus === 'read' || e.status === 'read')
       const evidenceForPlan = claims.filter((c) => c.planItemId === item.id || c.topic === item.id)
-      return assigned.length === 0 || readForPlan.length === 0 || evidenceForPlan.length < evidencePerSection
-    })
+      const short = assigned.length === 0 || readForPlan.length === 0 || evidenceForPlan.length < evidencePerSection
+      return { item, assigned, readForPlan, have: evidenceForPlan.length, short }
+    }).filter((d) => d.short)
+    // Precise, actionable blockers: the recurring failure mode is NOT missing sources but
+    // under-extraction — the model reads N sources for a subtopic then never mines evidence from
+    // them. So when read sources exist for a short section, name their IDs and say exactly how many
+    // more claims to extract, instead of the misleading "needs selected+read sources".
     results.push(missingPlan.length === 0
       ? pass('plan_section_coverage', 100)
-      : fail('plan_section_coverage', missingPlan.slice(0, 8).map((i) => `${i.id}: needs selected+read sources and ${evidencePerSection} evidence row(s).`), Math.max(0, 100 - missingPlan.length * 15)))
+      : fail('plan_section_coverage', missingPlan.slice(0, 8).map(({ item, assigned, readForPlan, have }) => {
+          if (readForPlan.length > 0) {
+            const ids = readForPlan.slice(0, 5).map((e) => e.id).join(', ')
+            return `${item.id}: only ${have}/${evidencePerSection} evidence — extract ${Math.max(1, evidencePerSection - have)} more via extract_evidence_from_corpus_item from ALREADY-READ source(s): ${ids}.`
+          }
+          if (assigned.length > 0) {
+            const ids = assigned.slice(0, 5).map((e) => e.id).join(', ')
+            return `${item.id}: ${assigned.length} assigned source(s) not read yet — read_full_text_batch (${ids}), then extract evidence.`
+          }
+          return `${item.id}: no selected source assigned — assign_corpus_to_plan a relevant read source then extract evidence; if none genuinely fits, leave it thin (it will be downgraded, do NOT fake it).`
+        }), Math.max(0, 100 - missingPlan.length * 15)))
   }
 
   const dateViolations = selected.filter((e) => e.screeningReason?.toLowerCase().includes('outside strict date range')).length

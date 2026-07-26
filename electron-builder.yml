@@ -27,11 +27,15 @@ extraResources:
 
 asar: true
 asarUnpack:
-  - "node_modules/node-pty/**"
-  # worker_threads runs in vanilla Node without Electron's ASAR-aware module
-  # loader. Keep the worker entry on the real filesystem and resolve it from
-  # app.asar.unpacked in production; otherwise packaged builds silently lose
-  # the agent worker before the first request.
+  # The agent worker runs as a worker_thread loaded from app.asar.unpacked. Its module
+  # resolution walks the REAL filesystem and never descends into app.asar, so any package it
+  # require()s in-process (jsdom, mammoth, turndown, @mozilla/readability, node-pty) must live
+  # on disk under app.asar.unpacked/node_modules — otherwise "Cannot find module 'mammoth'".
+  # Unpacking all production node_modules is the robust fix (covers full transitive closure and
+  # survives dependency changes); Electron still resolves them for the main process too.
+  - "node_modules/**"
+  # worker_threads use a vanilla Node module loader, so keep the worker entry on the real
+  # filesystem; otherwise packaged builds silently lose the agent worker before the first request.
   - "dist-electron/agent-worker.js"
 
 # Wrap the Linux executable so AppImage launches with --no-sandbox from process

@@ -225,8 +225,8 @@ export function primaryNextAction(a: {
     if (/quote|citation|цит/i.test(a.blockers)) {
       return 'Repair missing evidence quotes/citations with repair_evidence_quotes, then run_quality_gates once.'
     }
-    if (/evidence row|needs selected\+read|per section|plan item|Q\d+:/i.test(a.blockers)) {
-      return 'A plan subtopic is short on evidence: assign a selected+read source to it (assign_corpus_to_plan) and extract ONE more grounded claim for it (extract_evidence_from_corpus_item / record_evidence). If no read source can support that subtopic, do NOT pad or fake it — and never call update_plan_status to satisfy this gate. Just call run_quality_gates again: a genuinely thin subtopic is downgraded to a documented limitation so the run finishes.'
+    if (/evidence row|needs selected\+read|per section|plan item|only \d+\/|Q\d+:/i.test(a.blockers)) {
+      return 'Some plan subtopics are short on evidence. The blocker below lists EACH short subtopic with the exact source IDs to use — go through them ALL: for each, call extract_evidence_from_corpus_item on the already-read source(s) named for it (read them first if it says "not read"). Extract the missing claim(s) for every listed subtopic, not just one, then run_quality_gates once. If a subtopic genuinely has no source that supports it, do NOT pad or fake it, and never call update_plan_status to satisfy this gate — just run_quality_gates and it will be downgraded to a documented limitation.'
     }
     return 'Fix the failing quality-gate blocker(s) listed below with the recommended repair tool, then run_quality_gates once.'
   }

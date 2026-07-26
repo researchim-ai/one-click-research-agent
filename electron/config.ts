@@ -53,6 +53,20 @@ export interface AppConfig {
   crossrefMailto: string | null
   /** Optional API key for Semantic Scholar. */
   semanticScholarApiKey: string | null
+  /**
+   * Wall-clock budget (seconds) for the language-agnostic LLM relevance/screening pass over the
+   * corpus. Higher = more sources scored by the LLM (better cross-language precision) but slower
+   * research runs on a slow GPU; lower = faster but more items fall back to the lexical heuristic.
+   */
+  semanticScreeningBudgetSec: number
+  /**
+   * Keep the inference GPU "warm" while llama-server is up: a tiny periodic 1-token completion
+   * during idle gaps plus a best-effort persistence-mode enable on start. This prevents the NVIDIA
+   * driver from deep power-gating the GPU between the agent's bursty requests, which on some 5xx
+   * drivers triggers a GSP timeout ("nvidia-modeset: Error while waiting for GPU progress") that
+   * hangs the GPU until reboot. Disable if you prefer minimal idle power draw and don't hit the bug.
+   */
+  gpuKeepWarm: boolean
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -81,6 +95,8 @@ const DEFAULT_CONFIG: AppConfig = {
   embedModelPath: null,
   crossrefMailto: null,
   semanticScholarApiKey: null,
+  semanticScreeningBudgetSec: 240,
+  gpuKeepWarm: true,
 }
 
 export function resetToDefaults(): AppConfig {
@@ -135,6 +151,18 @@ export function save(partial: Partial<AppConfig>): AppConfig {
 
 export function get<K extends keyof AppConfig>(key: K): AppConfig[K] {
   return load()[key]
+}
+
+/**
+ * Replace the in-memory config cache with a known-fresh snapshot WITHOUT touching disk.
+ * The agent runs in a long-lived worker thread that caches config on first load and reuses it
+ * across runs; a setting changed mid-session (e.g. semanticScreeningBudgetSec) never reached the
+ * worker's module-level `cfg.*` reads. main.ts already ships the current config in each run's
+ * payload — calling this with that snapshot at run start makes every `cfg.get()`/`cfg.load()` in
+ * the worker (semantic budget, mailto, language, …) reflect the user's latest settings.
+ */
+export function hydrateCache(next: AppConfig): void {
+  cached = { ...DEFAULT_CONFIG, ...next }
 }
 
 export function set<K extends keyof AppConfig>(key: K, value: AppConfig[K]): void {

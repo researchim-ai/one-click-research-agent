@@ -1,6 +1,7 @@
 import { getBuiltinToolDefinitions, executeTool, executeToolAsync, executeCustomTool, isAsyncTool } from './tools'
 import type { AgentEvent, AgentActivity } from './types'
 import type { AppConfig } from './config'
+import * as config from './config'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -2614,6 +2615,10 @@ function loopBreakDirective(toolName: string): string {
 
 export async function runAgent(userMessage: string, ws: string, bridge: AgentBridge): Promise<string> {
   currentBridge = bridge
+  // Sync the module-level config cache to this run's fresh snapshot. The worker is long-lived and
+  // caches config on first load; without this, settings changed mid-session (e.g. the semantic
+  // screening budget) never reach the `cfg.*` reads inside tools.ts.
+  try { config.hydrateCache(bridge.getConfig()) } catch {}
   try {
   emitActivity('starting', 'Запуск агента…')
   workspace = ws

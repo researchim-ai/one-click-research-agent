@@ -1,5 +1,17 @@
 import { execFileSync } from 'child_process'
 
+// These libraries are imported at module scope so the Vite/Rollup electron bundler INLINES
+// them into the bundled main/worker output. Packaged builds ship no node_modules on disk, so
+// they can only be reached in-process from the bundle — a spawned `node -e` subprocess cannot
+// require them (that produced "Cannot find module 'jsdom'" for every HTML read in the AppImage).
+// require() (not import) keeps this working without @types for jsdom/turndown.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { JSDOM } = require('jsdom') as { JSDOM: any }
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { Readability, isProbablyReaderable } = require('@mozilla/readability') as { Readability: any; isProbablyReaderable: (doc: any) => boolean }
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const TurndownService = require('turndown') as any
+
 export interface FetchedPage {
   url: string
   finalUrl: string
@@ -23,9 +35,12 @@ function runScript(source: string, args: string[], timeoutMs = 30000): string {
   })
 }
 
-const FETCH_SCRIPT = `
+// Network fetch ONLY. This runs in a spawned `node -e` process for timeout/crash isolation and
+// uses just the global `fetch` + built-ins — NO external module require — so it works in packaged
+// builds where node_modules are not on disk. Readability/jsdom/turndown parsing happens in-process
+// afterwards (see fetchUrl) against the bundled libraries.
+const FETCH_HTML_SCRIPT = `
 const url = process.argv[1]
-const format = process.argv[2] || 'markdown'
 ;(async () => {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 25000)
@@ -50,46 +65,52 @@ const format = process.argv[2] || 'markdown'
       process.stdout.write(JSON.stringify({ finalUrl, contentType, isBinary: true, contentTypeHint: 'pdf' }))
       return
     }
-    const html = await res.text()
-    const { JSDOM } = require('jsdom')
-    const { Readability, isProbablyReaderable } = require('@mozilla/readability')
-    const dom = new JSDOM(html, { url: finalUrl })
-    const readable = isProbablyReaderable(dom.window.document)
-    let article = null
-    try {
-      const reader = new Readability(dom.window.document)
-      article = reader.parse()
-    } catch {}
-    const title = article?.title || dom.window.document.title || ''
-    const byline = article?.byline || ''
-    const excerpt = article?.excerpt || ''
-    const siteName = article?.siteName || ''
-    const publishedTime = article?.publishedTime || ''
-    let content
-    if (format === 'html') {
-      content = article?.content || dom.window.document.body.innerHTML || ''
-    } else if (format === 'text') {
-      content = article?.textContent || dom.window.document.body.textContent || ''
-    } else {
-      const TurndownService = require('turndown')
-      const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
-      const innerHtml = article?.content || dom.window.document.body.innerHTML || ''
-      content = td.turndown(innerHtml)
-    }
-    process.stdout.write(JSON.stringify({
-      finalUrl, contentType, readable, title, byline, excerpt, siteName, publishedTime,
-      content, length: (content || '').length,
-    }))
+    let html = await res.text()
+    // Cap so JSON.stringify stays under the parent's maxBuffer; full articles fit comfortably.
+    if (html.length > 8000000) html = html.slice(0, 8000000)
+    process.stdout.write(JSON.stringify({ finalUrl, contentType, html }))
   } catch (e) {
     process.stdout.write(JSON.stringify({ error: String(e && e.message || e) }))
   } finally { clearTimeout(timer) }
 })()
 `
 
+// Parse fetched HTML into a readable page in-process using the bundled Readability/jsdom/turndown.
+function htmlToPage(html: string, finalUrl: string, contentType: string, format: 'markdown' | 'text' | 'html', originalUrl: string): FetchedPage {
+  const dom = new JSDOM(html, { url: finalUrl })
+  const doc = dom.window.document
+  const readable = isProbablyReaderable(doc)
+  let article: any = null
+  try { article = new Readability(doc).parse() } catch {}
+  const body = doc.body
+  let content: string
+  if (format === 'html') {
+    content = article?.content || body?.innerHTML || ''
+  } else if (format === 'text') {
+    content = article?.textContent || body?.textContent || ''
+  } else {
+    const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
+    content = td.turndown(article?.content || body?.innerHTML || '')
+  }
+  return {
+    url: originalUrl,
+    finalUrl,
+    title: String(article?.title || doc.title || ''),
+    byline: article?.byline || undefined,
+    excerpt: article?.excerpt || undefined,
+    publishedTime: article?.publishedTime || undefined,
+    siteName: article?.siteName || undefined,
+    content: String(content || ''),
+    contentType,
+    length: (content || '').length,
+    format,
+  }
+}
+
 export function fetchUrl(url: string, format: 'markdown' | 'text' | 'html' = 'markdown'): FetchedPage | { error: string; contentTypeHint?: string; finalUrl?: string; contentType?: string; isBinary?: boolean } {
-  const out = runScript(FETCH_SCRIPT, [url, format])
+  const out = runScript(FETCH_HTML_SCRIPT, [url])
   let parsed: any
-  try { parsed = JSON.parse(out) } catch (e: any) { return { error: 'fetch_url: failed to parse worker output' } }
+  try { parsed = JSON.parse(out) } catch (e: any) { return { error: 'fetch_url: failed to parse fetch output' } }
   if (parsed?.error && !parsed?.isBinary) return { error: parsed.error, finalUrl: parsed.finalUrl, contentType: parsed.contentType }
   if (parsed?.isBinary) {
     return {
@@ -100,18 +121,10 @@ export function fetchUrl(url: string, format: 'markdown' | 'text' | 'html' = 'ma
       isBinary: true,
     }
   }
-  return {
-    url,
-    finalUrl: String(parsed.finalUrl || url),
-    title: String(parsed.title || ''),
-    byline: parsed.byline || undefined,
-    excerpt: parsed.excerpt || undefined,
-    publishedTime: parsed.publishedTime || undefined,
-    siteName: parsed.siteName || undefined,
-    content: String(parsed.content || ''),
-    contentType: String(parsed.contentType || ''),
-    length: Number(parsed.length || (parsed.content || '').length || 0),
-    format,
+  try {
+    return htmlToPage(String(parsed.html || ''), String(parsed.finalUrl || url), String(parsed.contentType || ''), format, url)
+  } catch (e: any) {
+    return { error: `fetch_url: HTML parse failed — ${String(e?.message || e)}`, finalUrl: parsed.finalUrl, contentType: parsed.contentType }
   }
 }
 

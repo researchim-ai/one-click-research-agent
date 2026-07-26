@@ -504,11 +504,13 @@ export function start(
     if (win && code !== null && code !== 0) {
       emitBuild(win, `llama-server завершился с кодом ${code}`)
     }
+    stopKeepWarm()
     serverProcess = null
   })
 }
 
 export function stop(): void {
+  stopKeepWarm()
   if (serverProcess && serverProcess.exitCode === null) {
     serverProcess.kill('SIGTERM')
     setTimeout(() => {
@@ -560,6 +562,7 @@ export async function waitReady(timeoutSecs = 300, win?: BrowserWindow): Promise
       const body = await r.json() as any
       if (body.status === 'ok') {
         await queryActualCtxSize()
+        startKeepWarm()
         return true
       }
       if (body.status === 'loading model' && win) {
@@ -585,5 +588,69 @@ export async function health(): Promise<{ status: string }> {
     return await r.json() as { status: string }
   } catch {
     return { status: 'unreachable' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GPU keep-warm: prevent the NVIDIA driver from deep power-gating the inference
+// GPU during the agent's idle gaps. On some 5xx drivers a "cold -> hot" transition
+// after the GPU has power-gated makes the GSP time out ("nvidia-modeset: Error
+// while waiting for GPU progress"), wedging the GPU until reboot. Two measures:
+//   1. Best-effort persistence mode on start (keeps the driver context resident).
+//   2. A tiny 1-token completion every few seconds so the GPU never fully idles.
+// Both are gated behind the gpuKeepWarm config flag.
+// ---------------------------------------------------------------------------
+
+const KEEP_WARM_INTERVAL_MS = 5000
+let keepWarmTimer: NodeJS.Timeout | null = null
+let keepWarmInFlight = false
+
+async function keepWarmPing(): Promise<void> {
+  if (keepWarmInFlight) return // never stack pings; a busy/queued server keeps itself warm
+  if (!serverProcess || serverProcess.exitCode !== null) return
+  keepWarmInFlight = true
+  try {
+    await fetch(`${llamaApiUrl()}/completion`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Minimal 1-token decode. cache_prompt:false so we never disturb the slot
+      // prompt-reuse cache that real agent requests rely on.
+      body: JSON.stringify({ prompt: ' ', n_predict: 1, temperature: 0, cache_prompt: false }),
+      signal: AbortSignal.timeout(4000),
+    })
+  } catch {
+    // Idle heartbeat; transient failures (busy, timeout) are expected and harmless.
+  } finally {
+    keepWarmInFlight = false
+  }
+}
+
+/** Best-effort: enable NVIDIA persistence mode so the GPU keeps its driver context between bursts. */
+function tryEnablePersistenceMode(): void {
+  if (process.platform === 'win32') return
+  const idx = config.get('gpuIndex')
+  const target = typeof idx === 'number' ? `-i ${idx} ` : ''
+  try {
+    execSync(`nvidia-smi ${target}-pm 1`, { timeout: 5000, stdio: 'pipe' })
+    appendServerDebug(`keep-warm: persistence mode enabled (${target || 'all GPUs'})`)
+  } catch (e: any) {
+    // Requires root on most desktops; failure is non-fatal — the heartbeat still covers idle gaps.
+    appendServerDebug(`keep-warm: persistence mode not set (${String(e?.message || e).split('\n')[0]})`)
+  }
+}
+
+export function startKeepWarm(): void {
+  if (keepWarmTimer) return
+  if (!config.get('gpuKeepWarm')) return
+  tryEnablePersistenceMode()
+  appendServerDebug(`keep-warm: heartbeat every ${KEEP_WARM_INTERVAL_MS}ms`)
+  keepWarmTimer = setInterval(() => { void keepWarmPing() }, KEEP_WARM_INTERVAL_MS)
+  if (typeof keepWarmTimer.unref === 'function') keepWarmTimer.unref()
+}
+
+export function stopKeepWarm(): void {
+  if (keepWarmTimer) {
+    clearInterval(keepWarmTimer)
+    keepWarmTimer = null
   }
 }

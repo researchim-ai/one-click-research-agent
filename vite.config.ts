@@ -25,7 +25,12 @@ export default defineConfig({
           build: {
             rollupOptions: {
               external: ['node-pty'],
-              output: { format: 'cjs' },
+              // The worker entry is asarUnpack'd (worker_threads use a vanilla Node module
+              // loader). Inline every dynamic import into this single file so the unpacked
+              // agent-worker.js is self-contained: otherwise Rollup emits sibling chunks
+              // (e.g. the unpdf lazy chunk) that stay inside app.asar and the unpacked worker's
+              // relative require("./index-*.js") cannot resolve them in packaged builds.
+              output: { format: 'cjs', inlineDynamicImports: true },
             },
           },
         },

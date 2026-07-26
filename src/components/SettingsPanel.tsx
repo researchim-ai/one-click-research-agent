@@ -708,6 +708,51 @@ function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
 }
 
 // ---------------------------------------------------------------------------
+// GPU keep-warm toggle (self-contained: loads/saves its own config, applies live)
+// ---------------------------------------------------------------------------
+
+function GpuKeepWarmSection({ appLanguage }: { appLanguage: AppLanguage }) {
+  const [enabled, setEnabled] = useState(true)
+  const ru = appLanguage === 'ru'
+
+  useEffect(() => {
+    window.api.getConfig().then((c) => setEnabled(c.gpuKeepWarm ?? true)).catch(() => {})
+  }, [])
+
+  const toggle = async () => {
+    const next = !enabled
+    setEnabled(next)
+    try { await window.api.saveConfig({ gpuKeepWarm: next }) } catch {}
+  }
+
+  return (
+    <SettingsSection
+      title={ru ? 'Прогрев GPU (стабильность)' : 'GPU keep-warm (stability)'}
+      description={ru
+        ? 'Не даёт видеокарте засыпать в паузах между запросами агента. Предотвращает залипание драйвера NVIDIA (ошибка «nvidia-modeset: Error while waiting for GPU progress»), из-за которого GPU зависает до перезагрузки.'
+        : 'Keeps the GPU active during idle gaps between agent requests. Prevents the NVIDIA driver hang ("nvidia-modeset: Error while waiting for GPU progress") that wedges the GPU until reboot.'}
+    >
+      <div className="flex items-center justify-between py-2">
+        <div>
+          <div className="text-sm text-zinc-300">{ru ? 'Держать GPU в тонусе' : 'Keep GPU warm'}</div>
+          <div className="text-[11px] text-zinc-600 mt-0.5">
+            {ru
+              ? 'Лёгкий фоновый пинг раз в 5 сек + persistence mode. Отключи, если хочешь минимум энергопотребления в простое.'
+              : 'A light background ping every 5s + persistence mode. Disable for minimal idle power draw.'}
+          </div>
+        </div>
+        <button
+          onClick={toggle}
+          className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer shrink-0 ${enabled ? 'bg-blue-600' : 'bg-zinc-700'}`}
+        >
+          <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${enabled ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
+        </button>
+      </div>
+    </SettingsSection>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Model & Context tab
 // ---------------------------------------------------------------------------
 
@@ -741,6 +786,7 @@ function ModelTab({
   return (
     <div className="space-y-6">
       <LlamaUpdateSection appLanguage={appLanguage} />
+      <GpuKeepWarmSection appLanguage={appLanguage} />
       {hasMultipleGpus && (
         <SettingsSection
           title={appLanguage === 'ru' ? 'GPU и размещение модели' : 'GPU & model placement'}
@@ -1804,6 +1850,30 @@ function ResearchTab({
             />
             <p className="text-[11px] text-zinc-500 mt-1">{L ? 'Без ключа работает публичный rate-limit.' : 'Without a key, the public rate limit applies.'}</p>
           </div>
+        </div>
+      </SettingsSection>
+
+      {/* Semantic screening budget */}
+      <SettingsSection
+        title={L ? 'Бюджет ИИ-отбора источников' : 'AI source-screening budget'}
+        description={L
+          ? 'Сколько времени давать локальной модели на языко-независимую оценку релевантности источников при сборке корпуса. Больше — точнее отбор (особенно для разноязычных источников), но дольше ран; меньше — быстрее, но часть источников отбирается лексической эвристикой.'
+          : 'How long the local model may spend judging source relevance (language-agnostic) during corpus build. Higher = more accurate selection (esp. cross-language) but slower runs; lower = faster but more sources fall back to the lexical heuristic.'}
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={30}
+              max={1200}
+              step={30}
+              value={cfg.semanticScreeningBudgetSec ?? 240}
+              onChange={(e) => saveCfg({ semanticScreeningBudgetSec: Math.max(30, Math.min(1200, Number(e.target.value) || 240)) })}
+              className="w-28 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+            <span className="text-sm text-zinc-400">{L ? 'секунд на прогон' : 'seconds per pass'}</span>
+          </div>
+          <span className="text-[11px] text-zinc-500">{L ? 'по умолчанию 240' : 'default 240'}</span>
         </div>
       </SettingsSection>
 
