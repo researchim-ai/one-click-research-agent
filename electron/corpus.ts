@@ -674,7 +674,11 @@ const OPEN_SCHOLARLY_TOOL_RE = /arxiv|openalex|semantic|crossref|pubmed|biorxiv/
 // Non-scholarly hosts (blogs/aggregators): even when a post is titled "… survey", it is not a
 // citable review AND typically not cleanly readable full text. Never worth a selection slot in
 // an academic run.
-const NON_SCHOLARLY_HOST_RE = /(?:medium\.com|towardsdatascience|substack|blogspot|wordpress|dev\.to|kaggle\.com|reddit\.com|quora\.com)/i
+const NON_SCHOLARLY_HOST_RE = /(?:medium\.com|towardsdatascience|substack|blogspot|wordpress|dev\.to|kaggle\.com|reddit\.com|quora\.com|linkedin\.com|x\.com|twitter\.com|facebook\.com|youtube\.com|youtu\.be|t\.me|telegram|siliconflow|sebastianraschka|analyticsvidhya|kdnuggets|geeksforgeeks|freecodecamp|hackernoon|marktechpost)/i
+// SEO / listicle / blog-note titles ("Ultimate Guide", "The 2026 List", "Top 10 …",
+// "Reading Notes", "Best … in 2026"): not citable scholarly work. Only treated as
+// non-scholarly for UNDATED web pages (a real dated paper with such a title is rare and kept).
+const NON_SCHOLARLY_TITLE_RE = /\b(ultimate guide|cheat ?sheet|reading notes|the (?:19|20)\d{2} list|best\b[^.]{0,50}\b(?:19|20)\d{2}\b|top\s+\d+\b|tutorial)\b/i
 
 /** Open, readable, well-dated scholarly source (arXiv id, an OA URL, or an open index tool). */
 function isOpenScholarly(entry: CorpusEntry): boolean {
@@ -695,6 +699,22 @@ function likelyUnreadable(entry: CorpusEntry): boolean {
 }
 
 /**
+ * Heuristic: a blog / social / SEO / listicle page that is rarely a citable scholarly source.
+ * The LLM screener rates topical relevance only (it never judges authority), so a LinkedIn post
+ * or an "Ultimate Guide … 2026" can score 90+. This flag lets the academic pipeline RANK such
+ * pages below real reviews (a soft nudge, `sourcePreferenceDelta`) — it never excludes them.
+ * The user stays in control of which sources are used via the New Research dialog. Real papers
+ * (arXiv id or a resolved open-access URL) are never flagged; only clearly non-academic web pages.
+ */
+function isNonScholarlySource(entry: CorpusEntry): boolean {
+  if (entry.arxivId || entry.openAccessUrl) return false
+  const url = entry.url ?? ''
+  if (NON_SCHOLARLY_HOST_RE.test(url)) return true
+  if (NON_SCHOLARLY_TITLE_RE.test(entry.title ?? '') && !entryIsoDate(entry)) return true
+  return false
+}
+
+/**
  * Score nudge for the ACADEMIC pipeline: prefer open, dated sources (arXiv/OpenAlex) and
  * down-rank closed publisher landing pages that we cannot read and that are usually undated
  * (Springer/Elsevier/IEEE/ACM/Wiley…). No effect on general (web) research.
@@ -704,9 +724,11 @@ function sourcePreferenceDelta(entry: CorpusEntry, researchKind?: string): numbe
   let d = 0
   if (isOpenScholarly(entry)) d += 8
   else if (isClosedPublisher(entry)) d -= 12
-  // Blog/aggregator "surveys" are neither citable nor readable — push them well down so they
-  // don't consume selection slots ahead of real, retrievable scholarly reviews.
-  if (NON_SCHOLARLY_HOST_RE.test(entry.url ?? '')) d -= 16
+  // Blog/social/SEO-listicle pages ("Ultimate Guide 2026", LinkedIn notes) are rarely citable
+  // scholarly work. We do NOT exclude them — the user controls sources explicitly in the New
+  // Research dialog — but in an academic run we rank them below real, retrievable reviews so
+  // arXiv/OA surveys win selection slots when both are available.
+  if (isNonScholarlySource(entry)) d -= 16
   return d
 }
 

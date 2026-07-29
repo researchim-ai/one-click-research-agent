@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { RESEARCH_PROFILES, type ResearchProfileId } from '../../research-profiles'
+import { SEARCH_SOURCES, SEARCH_SOURCE_IDS } from '../../search-sources'
 import {
   applyResearchIntakePatch,
   defaultResearchRequest,
@@ -35,6 +36,9 @@ export interface NewResearchRequest {
   outputs: ResearchOutput[]
   checkpoints: ResearchCheckpoint[]
   extraDirections: string
+  /** Discovery sources the run may use. All ids = no restriction; a subset limits the
+   *  agent to exactly those engines (hard-enforced by filtering its tool list). */
+  allowedSearchTools: string[]
 }
 
 interface Props {
@@ -87,6 +91,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
   const [outputs, setOutputs] = useState<ResearchOutput[]>(['brief', 'report', 'evidence-matrix'])
   const [checkpoints, setCheckpoints] = useState<ResearchCheckpoint[]>(['plan'])
   const [extraDirections, setExtraDirections] = useState('')
+  const [allowedSearchTools, setAllowedSearchTools] = useState<string[]>([...SEARCH_SOURCE_IDS])
   const [draft, setDraft] = useState<NewResearchRequest>(() => defaultResearchRequest(appLanguage))
   const [intakeInput, setIntakeInput] = useState('')
   const [intakeBusy, setIntakeBusy] = useState(false)
@@ -106,6 +111,56 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
 
   const toggle = <T extends string>(items: T[], value: T, setter: (items: T[]) => void) => {
     setter(items.includes(value) ? items.filter((x) => x !== value) : [...items, value])
+  }
+
+  // Never let the user end up with zero search sources — that would leave the run unable to
+  // discover anything. Toggling off the last remaining source is a no-op.
+  const toggleSource = (id: string, selected: string[], setter: (v: string[]) => void) => {
+    const on = selected.includes(id)
+    if (on && selected.length === 1) return
+    setter(on ? selected.filter((x) => x !== id) : [...selected, id])
+  }
+
+  const draftSources = draft.allowedSearchTools?.length ? draft.allowedSearchTools : [...SEARCH_SOURCE_IDS]
+  const toggleDraftSource = (id: string) => {
+    toggleSource(id, draftSources, (next) => setDraft({ ...draft, allowedSearchTools: next }))
+  }
+
+  const renderSourcePicker = (selected: string[], onToggle: (id: string) => void) => {
+    const restricted = selected.length < SEARCH_SOURCE_IDS.length
+    return (
+      <div className="space-y-2">
+        <div className="flex flex-wrap gap-2">
+          {SEARCH_SOURCES.map((s) => {
+            const on = selected.includes(s.id)
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => onToggle(s.id)}
+                title={L ? s.descriptionRu : s.descriptionEn}
+                className={`px-3 py-1.5 rounded-lg border text-xs cursor-pointer transition-colors ${
+                  on
+                    ? 'border-blue-500/50 bg-blue-500/10 text-blue-300'
+                    : 'border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 line-through'
+                }`}
+              >
+                {s.label}
+              </button>
+            )
+          })}
+        </div>
+        <div className="text-[11px] text-zinc-500">
+          {restricted
+            ? (L
+              ? '🔒 Поиск ограничен выбранными источниками — агент не сможет использовать другие движки.'
+              : '🔒 Discovery is restricted to the selected sources — the agent cannot use any other engine.')
+            : (L
+              ? 'Все источники включены (без ограничений). Отключи лишние, чтобы искать, например, только на arXiv.'
+              : 'All sources enabled (no restriction). Turn some off to search e.g. arXiv only.')}
+        </div>
+      </div>
+    )
   }
 
   // The only requirement is that the user actually typed a topic — take it verbatim,
@@ -133,6 +188,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
       outputs,
       checkpoints,
       extraDirections: extraDirections.trim(),
+      allowedSearchTools,
     })
   }
 
@@ -154,6 +210,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     outputs,
     checkpoints,
     extraDirections: extraDirections.trim(),
+    allowedSearchTools,
   })
 
   const applyDraftToManualForm = (next: NewResearchRequest) => {
@@ -174,6 +231,7 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
     setOutputs(next.outputs)
     setCheckpoints(next.checkpoints)
     setExtraDirections(next.extraDirections)
+    setAllowedSearchTools(next.allowedSearchTools?.length ? next.allowedSearchTools : [...SEARCH_SOURCE_IDS])
   }
 
   const mergeDraft = (patch: ResearchIntakePatch, userText?: string, assistantOverride?: string): NewResearchRequest => {
@@ -363,6 +421,10 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
                       <span className="text-xs text-zinc-200 text-right">{value}</span>
                     </div>
                   ))}
+                </div>
+                <div className="mt-3 border-t border-zinc-800/60 pt-3">
+                  <div className="text-xs font-medium text-zinc-400 mb-2">{L ? 'Источники поиска' : 'Search sources'}</div>
+                  {renderSourcePicker(draftSources, toggleDraftSource)}
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
@@ -601,6 +663,11 @@ export function NewResearchDialog({ open, busy, appLanguage = 'ru', onClose, onS
                 ))}
               </div>
             </div>
+          </section>
+
+          <section>
+            <label className="block text-xs font-medium text-zinc-400 mb-2">{L ? 'Источники поиска' : 'Search sources'}</label>
+            {renderSourcePicker(allowedSearchTools, (id) => toggleSource(id, allowedSearchTools, setAllowedSearchTools))}
           </section>
 
           <section>

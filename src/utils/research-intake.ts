@@ -1,4 +1,5 @@
 import { RESEARCH_PROFILES } from '../../research-profiles'
+import { SEARCH_SOURCE_IDS, normalizeAllowedSearchTools, searchSourceLabel } from '../../search-sources'
 import type { NewResearchRequest } from '../components/NewResearchDialog'
 
 export type ResearchIntakePatch = Partial<NewResearchRequest>
@@ -32,6 +33,9 @@ export function defaultResearchRequest(appLanguage: 'ru' | 'en' = 'ru'): NewRese
     // via manual mode for users who want to review those phases.
     checkpoints: ['plan'],
     extraDirections: '',
+    // All discovery sources enabled by default = no restriction. A user can narrow this
+    // (e.g. only arXiv) in the dialog or via the intake model.
+    allowedSearchTools: [...SEARCH_SOURCE_IDS],
   }
 }
 
@@ -50,6 +54,12 @@ export function applyResearchIntakePatch(base: NewResearchRequest, patch: Resear
   next.evidencePerSection = clampInt(next.evidencePerSection, 1, 20, base.evidencePerSection)
   next.outputs = Array.isArray(next.outputs) && next.outputs.length ? next.outputs : base.outputs
   next.checkpoints = Array.isArray(next.checkpoints) && next.checkpoints.length ? next.checkpoints : base.checkpoints
+  // allowedSearchTools: keep only known ids. If the patch/base leaves it empty, fall back to
+  // "all sources" so a run never ends up with zero search engines.
+  next.allowedSearchTools = Array.isArray(next.allowedSearchTools)
+    ? next.allowedSearchTools.filter((id) => SEARCH_SOURCE_IDS.includes(id))
+    : [...SEARCH_SOURCE_IDS]
+  if (!next.allowedSearchTools.length) next.allowedSearchTools = [...SEARCH_SOURCE_IDS]
   return next
 }
 
@@ -89,7 +99,14 @@ export function summarizeResearchRequest(request: NewResearchRequest, appLanguag
     [L ? 'Evidence' : 'Evidence', `${request.evidencePerSection}/${L ? 'секция' : 'section'}`],
     [L ? 'Артефакты' : 'Outputs', request.outputs.join(', ')],
     [L ? 'Checkpoint’ы' : 'Checkpoints', request.checkpoints.join(', ')],
+    [L ? 'Источники поиска' : 'Search sources', describeSearchSources(request.allowedSearchTools, L)],
   ]
+}
+
+function describeSearchSources(list: string[] | undefined, ru: boolean): string {
+  const restricted = normalizeAllowedSearchTools(list)
+  if (!restricted) return ru ? 'все доступные' : 'all available'
+  return restricted.map((id) => searchSourceLabel(id)).join(', ')
 }
 
 function clampInt(value: number, min: number, max: number, fallback: number): number {

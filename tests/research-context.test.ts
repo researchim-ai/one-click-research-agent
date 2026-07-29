@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import * as os from 'os'
+import * as fs from 'fs'
 import * as path from 'path'
-import { buildResumeMessageWindow, buildResearchTailMessage, primaryNextAction } from '../electron/research-context'
+import { buildResumeMessageWindow, buildResearchTailMessage, primaryNextAction, resolveResearchOutputDir, resolveResearchContextMode } from '../electron/research-context'
 import { decideResearchCommandIntent, extractResearchOutputDirFromText } from '../electron/research-resume'
 
 describe('primaryNextAction (single authoritative next step)', () => {
@@ -135,5 +136,58 @@ describe('extractResearchOutputDirFromText', () => {
   it('normalizes artifact file paths back to the run directory', () => {
     expect(extractResearchOutputDirFromText('Plan saved to .research/2026-06-12_16-44-28_rl-b-llm/plan.md')).toBe('.research/2026-06-12_16-44-28_rl-b-llm')
     expect(extractResearchOutputDirFromText('output_dir: ".research/2026-06-12_16-44-28_rl-b-llm/run.json"')).toBe('.research/2026-06-12_16-44-28_rl-b-llm')
+  })
+})
+
+describe('resolveResearchOutputDir does not leak a previous run into a fresh chat', () => {
+  // Reproduces the "напиши проект по RL" bug: a brand-new chat in a workspace that already had a
+  // deep-research run must NOT auto-attach that run via the workspace-global fallbacks.
+  function seedWorkspaceWithRun(): { ws: string; runDir: string } {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'res-ctx-'))
+    const runDir = '.research/2026-07-28_20-59-31_reasoning-i-rl-b-llm'
+    fs.mkdirSync(path.join(ws, runDir), { recursive: true })
+    fs.writeFileSync(path.join(ws, '.research', 'run-state.json'), JSON.stringify({ outputDir: runDir, phase: 'report_generated', updatedAt: Date.now() }))
+    return { ws, runDir }
+  }
+
+  it('returns null for an unrelated new-chat message even when a prior run exists', () => {
+    const { ws } = seedWorkspaceWithRun()
+    expect(resolveResearchOutputDir(ws, [], 'напиши проект по RL')).toBeNull()
+    fs.rmSync(ws, { recursive: true, force: true })
+  })
+
+  it('still resumes the last run on an explicit resume message', () => {
+    const { ws, runDir } = seedWorkspaceWithRun()
+    expect(resolveResearchOutputDir(ws, [], 'continue')).toBe(runDir)
+    fs.rmSync(ws, { recursive: true, force: true })
+  })
+
+  it('honors an explicit run dir in the current message (New Research kickoff)', () => {
+    const { ws, runDir } = seedWorkspaceWithRun()
+    const kickoff = `Run this as a managed deep-research.\nResearch artifact directory: ${runDir}`
+    expect(resolveResearchOutputDir(ws, [], kickoff)).toBe(runDir)
+    fs.rmSync(ws, { recursive: true, force: true })
+  })
+
+  it('honors a run dir found in the current session history', () => {
+    const { ws, runDir } = seedWorkspaceWithRun()
+    const history = [{ role: 'user', content: `output_dir: "${runDir}/run.json"` }]
+    expect(resolveResearchOutputDir(ws, history, 'дай ещё источников')).toBe(runDir)
+    fs.rmSync(ws, { recursive: true, force: true })
+  })
+})
+
+describe('resolveResearchContextMode requires an explicit trigger', () => {
+  it('is off for a normal chat message with no run dir', () => {
+    expect(resolveResearchContextMode({ userMessage: 'напиши проект по RL', outputDir: null })).toBe('off')
+  })
+  it('a globally-saved deep-research preset alone does NOT activate managed mode', () => {
+    expect(resolveResearchContextMode({ userMessage: 'напиши проект по RL', presetId: 'deep-research', outputDir: null })).toBe('off')
+  })
+  it('activates when a run dir is in play', () => {
+    expect(resolveResearchContextMode({ userMessage: 'go', outputDir: '.research/2026-07-28_20-59-31_x' })).toBe('active')
+  })
+  it('is resume for an explicit continue message', () => {
+    expect(resolveResearchContextMode({ userMessage: 'continue', outputDir: null })).toBe('resume')
   })
 })

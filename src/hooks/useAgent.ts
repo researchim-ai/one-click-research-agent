@@ -28,6 +28,11 @@ export interface ChatMessage {
   corpusSelection?: CorpusSelectionPayload
 }
 
+export interface QueuedMessage {
+  id: string
+  text: string
+}
+
 function isInternalStatus(content: string): boolean {
   return /Supervisor: автоматическая пауза|^\[Supervisor pause @ iteration/i.test(content)
 }
@@ -59,6 +64,14 @@ export function useAgent() {
   const idCounter = useRef(0)
 
   const nextId = () => String(++idCounter.current)
+
+  // Queued user messages: typed while the agent is busy, dispatched one-by-one
+  // as each run finishes (like "stacked" tasks in modern agents).
+  const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
+  const queueRef = useRef<QueuedMessage[]>([])
+  const busyRef = useRef(false)
+  const queueIdRef = useRef(0)
+  const runMessageRef = useRef<(text: string) => Promise<void>>(async () => {})
 
   function saveCurrentToMap() {
     if (activeSessionId && workspace) {
@@ -394,15 +407,21 @@ export function useAgent() {
     )
   }, [])
 
-  const sendMessage = useCallback(async (text: string) => {
+  // Pop the next queued message (if any) and run it. Called after each run
+  // finishes so stacked tasks are dispatched serially.
+  const processQueue = useCallback(() => {
+    if (busyRef.current) return
+    const next = queueRef.current[0]
+    if (!next) return
+    queueRef.current = queueRef.current.slice(1)
+    setQueuedMessages([...queueRef.current])
+    void runMessageRef.current(next.text)
+  }, [])
+
+  // The actual dispatch of a single message to the agent. Does NOT consult the
+  // busy state — callers must ensure the agent is idle (sendMessage/processQueue).
+  const runMessage = useCallback(async (text: string) => {
     if (!text.trim()) return
-    if (busy) {
-      setMessages((prev) => [
-        ...prev,
-        { id: nextId(), role: 'status', content: '⚠ Агент ещё выполняет предыдущий запрос. Дождитесь завершения или нажмите «Стоп».' },
-      ])
-      return
-    }
     setMessages((prev) => {
       const userMsg: ChatMessage = { id: nextId(), role: 'user', content: text }
       const assistantMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '', toolCalls: [] }
@@ -410,6 +429,7 @@ export function useAgent() {
       return [...prev, userMsg, assistantMsg]
     })
     setBusy(true)
+    busyRef.current = true
     setAgentActivity({ phase: 'starting', label: 'Отправляю запрос…' })
     try {
       const result = await window.api.sendMessage(text, workspace)
@@ -420,11 +440,48 @@ export function useAgent() {
       setMessages((prev) => [...prev, { id: nextId(), role: 'status', content: `⚠ ${e.message ?? e}` }])
     } finally {
       setBusy(false)
+      busyRef.current = false
       setAgentActivity(null)
       assistantRef.current = null
     }
     refreshSessions()
-  }, [busy, workspace, refreshSessions])
+    // Drain the next stacked task (if the user queued more while we ran).
+    processQueue()
+  }, [workspace, refreshSessions, processQueue])
+
+  useEffect(() => {
+    runMessageRef.current = runMessage
+  }, [runMessage])
+
+  // Queued tasks belong to the active conversation — drop them when switching.
+  useEffect(() => {
+    queueRef.current = []
+    setQueuedMessages([])
+  }, [activeSessionId])
+
+  // Mirror busy into a ref so enqueue decisions stay correct even for runs
+  // started outside runMessage (e.g. startResearchRun).
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
+
+  const sendMessage = useCallback(async (text: string) => {
+    if (!text.trim()) return
+    // If the agent is busy (or messages are already stacked), enqueue instead of
+    // dropping the message — it will be dispatched when the current run finishes.
+    if (busyRef.current || queueRef.current.length > 0) {
+      const item: QueuedMessage = { id: `q${++queueIdRef.current}`, text }
+      queueRef.current = [...queueRef.current, item]
+      setQueuedMessages([...queueRef.current])
+      return
+    }
+    await runMessage(text)
+  }, [runMessage])
+
+  const removeQueuedMessage = useCallback((id: string) => {
+    queueRef.current = queueRef.current.filter((q) => q.id !== id)
+    setQueuedMessages([...queueRef.current])
+  }, [])
 
   const startResearchRun = useCallback(async (text: string, title?: string) => {
     if (!text.trim() || busy || !workspace) return false
@@ -569,6 +626,7 @@ export function useAgent() {
     workspace, setWorkspace, contextUsage, tokensPerSecond, autoOpenFile,
     agentActivity, busyElapsedSec, gpuResources,
     sendMessage, startResearchRun, resetChat, pollStatus, respondApproval, cancel,
+    queuedMessages, removeQueuedMessage,
     sessions, activeSessionId,
     newSession, switchToSession, removeSession, renameActiveSession,
   }

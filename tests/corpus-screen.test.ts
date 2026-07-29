@@ -468,6 +468,52 @@ describe('screen_corpus day-precise window + source preference', () => {
     expect(sel.length).toBeGreaterThanOrEqual(5)
   })
 
+  it('ranks non-scholarly web pages below a real scholarly review in academic runs (soft preference, never excludes)', () => {
+    // Reproduces run 2026-07-28: a LinkedIn post and an "Ultimate Guide … 2026" blog scored 90+ by
+    // the LLM (which rates TOPIC, not authority). We do NOT forcibly exclude them (the user controls
+    // sources in the New Research dialog) — but in an academic run an equally-relevant arXiv survey
+    // must rank ABOVE them so it wins selection slots first. General (web) runs apply no preference.
+    const question = 'Reinforcement learning reasoning in large language models'
+    const key = semanticQueryKey(question, [])
+    const web = (id: string, title: string, url: string) => ({
+      ...raw(id, title),
+      arxivId: undefined,
+      openAccessUrl: undefined,
+      url,
+      semanticRelevanceScore: 92,
+      semanticOnTopic: true,
+      semanticQueryKey: key,
+    })
+    const arxivPaper = {
+      ...raw('a1', 'A Survey of Reinforcement Learning for Reasoning in Large Language Models'),
+      semanticRelevanceScore: 90,
+      semanticOnTopic: true,
+      semanticQueryKey: key,
+    }
+    const entries = [
+      arxivPaper,
+      web('li', 'Reinforcement Learning for LLM Reasoning — my reading notes', 'https://www.linkedin.com/posts/someone_llm-reasoning'),
+      web('sf', 'The Ultimate Guide to the Best Open Source Reasoning LLMs in 2026', 'https://siliconflow.com/blog/ultimate-guide-reasoning-llms'),
+    ]
+
+    // Academic: the arXiv survey outranks the blog/social pages, but nothing is rejected/excluded.
+    writeCorpus(entries)
+    screenCorpus(ws, { question, researchKind: 'academic' }, OUT)
+    const acad = loadCorpus(ws, OUT)
+    const arxivScore = acad.find((e) => e.id === 'a1')!.score
+    for (const id of ['li', 'sf']) {
+      const e = acad.find((c) => c.id === id)!
+      expect(arxivScore).toBeGreaterThan(e.score)
+      expect(e.screeningStatus).not.toBe('rejected')
+    }
+
+    // General (web): no academic source preference — the blog is not down-ranked for being a blog.
+    writeCorpus(entries)
+    screenCorpus(ws, { question, researchKind: 'general' }, OUT)
+    const gen = loadCorpus(ws, OUT)
+    expect(gen.find((e) => e.id === 'li')!.screeningStatus).not.toBe('rejected')
+  })
+
   it('does not demand an RL+LLM intersection when only ONE sub-topic mentions LLM (broad-RL run)', () => {
     // Reproduces run 2026-07-19: main question is "RL surveys", but sub-topics include an
     // RLHF/LLM item. Intent must come from the MAIN question, so RL-only surveys (quantum,

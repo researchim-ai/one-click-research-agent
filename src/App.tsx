@@ -25,6 +25,7 @@ import { normalizeExternalHttpUrl } from './utils/external-links'
 import { RESEARCH_PROFILES } from '../research-profiles'
 import type { ResearchPresetId } from '../research-presets'
 import { makeResearchRunDirFromTopic } from '../research-slug'
+import { normalizeAllowedSearchTools, searchSourceLabel } from '../search-sources'
 
 export function App() {
   const {
@@ -32,6 +33,7 @@ export function App() {
     workspace, setWorkspace, contextUsage, tokensPerSecond, autoOpenFile,
     agentActivity, busyElapsedSec, gpuResources,
     sendMessage, startResearchRun, resetChat, pollStatus, respondApproval, cancel,
+    queuedMessages, removeQueuedMessage,
     sessions, activeSessionId,
     newSession, switchToSession, removeSession,
   } = useAgent()
@@ -173,6 +175,10 @@ export function App() {
       ? request.researchKind
       : (profile.domain === 'general' ? 'general' : 'academic')
     const isGeneral = researchKind === 'general'
+    const restrictedSources = normalizeAllowedSearchTools(request.allowedSearchTools)
+    const restrictedSourcesLabel = restrictedSources
+      ? restrictedSources.map((id) => `${id} (${searchSourceLabel(id)})`).join(', ')
+      : ''
     return [
       '# Start managed research run',
       '',
@@ -205,6 +211,9 @@ export function App() {
       '',
       'Run parameters:',
       `- Store all artifacts in \`${runDir}\` (not the shared \`.research/\` root). Treat the directory as an opaque id: copy it exactly into \`output_dir\` for every tool that supports it. Never translate or re-slugify it.`,
+      restrictedSources
+        ? `- Allowed search sources: ${restrictedSources.join(', ')}. HARD restriction — use ONLY these discovery tools; do NOT call any other search_* engine or smart_search. If coverage is thin, broaden queries and shift the date window WITHIN these sources instead of switching engines.`
+        : '',
       hasBounds
         ? (isDayWindow
           ? `- Date period is a SUB-YEAR window ${fromDate}..${toDate}. ENFORCE it at DAY precision: pass \`from_date: ${fromDate}\`, \`to_date: ${toDate}\` to search_arxiv/search tools AND the same \`from_date\`/\`to_date\` to screen_corpus (do NOT collapse it to a whole year — year_from/year_to alone would wrongly admit older ${yearBounds.from ?? nowYear} papers). ${request.strictDateRange ? 'strict_date_range is true — sources outside this window must be rejected, not just down-ranked; sources with no determinable date are kept for review but not auto-selected.' : 'strict_date_range is false — prefer in-window sources but older seminal works are allowed.'}`
@@ -214,8 +223,12 @@ export function App() {
       `- screen_corpus: \`min_selected: ${request.minSelectedSources}\` (FLOOR — at least this many on-topic selected so the report can present ${request.minSelectedSources}), \`max_selected: ${Math.min(request.maxSources, Math.max(request.minSelectedSources + 5, Math.round(request.minSelectedSources * 1.4)))}\` (select a bit more than the report needs), ${screenDateArgs}\`strict_date_range: ${request.strictDateRange ? 'true' : 'false'}\`, \`research_kind: '${researchKind}'\`. To get the freshest work, pass \`sub_questions\` and prefer recent items; when discovering via search_arxiv use \`sort_by: 'submittedDate'\` for "latest/новые" requests.`,
       `- run_quality_gates: \`min_selected: ${request.minSelectedSources}\`, \`min_full_text_reads: ${request.minFullTextReads}\`, \`evidence_per_section: ${request.evidencePerSection}\`, \`research_kind: '${researchKind}'\`.`,
       isGeneral
-        ? '- GENERAL (non-academic) research: prioritize web sources. Use `smart_search`/`search_web` to discover pages and `fetch_url` to read them; arXiv/OpenAlex/PubMed are optional and only when actually relevant. Survey/review coverage and recency are NOT required for this kind — do not waste turns hunting for academic surveys or recent-year papers; rank by topical relevance and source authority/credibility instead. Still ground every claim in a read source with a quote/passage.'
-        : '- ACADEMIC research: PREFER open, well-dated scholarly indexes — lead discovery with `search_arxiv` and `search_openalex` (then `search_semantic_scholar`/`search_crossref`/`search_pubmed`). These carry reliable dates and readable full text. Closed publisher landing pages (Springer/Elsevier/IEEE/ACM/Wiley) are usually paywalled and often undated, so they are down-ranked in screening and hard to read — do not rely on them: when a relevant paper is only a closed DOI, look up its arXiv/OpenAlex open-access version and read that instead.',
+        ? (restrictedSources
+          ? `- GENERAL research, but discovery is HARD-restricted to: ${restrictedSourcesLabel}. Use ONLY these engines (no other search_* / smart_search). Survey/review coverage and recency are NOT required for this kind; rank by topical relevance and authority. Ground every claim in a read source with a quote/passage.`
+          : '- GENERAL (non-academic) research: prioritize web sources. Use `smart_search`/`search_web` to discover pages and `fetch_url` to read them; arXiv/OpenAlex/PubMed are optional and only when actually relevant. Survey/review coverage and recency are NOT required for this kind — do not waste turns hunting for academic surveys or recent-year papers; rank by topical relevance and source authority/credibility instead. Still ground every claim in a read source with a quote/passage.')
+        : (restrictedSources
+          ? `- ACADEMIC research, HARD-restricted to: ${restrictedSourcesLabel}. Lead discovery with these sources ONLY — do NOT call any other engine or smart_search. When a relevant paper is only a closed DOI, look up its open-access version reachable via an allowed source and read that instead.`
+          : '- ACADEMIC research: PREFER open, well-dated scholarly indexes — lead discovery with `search_arxiv` and `search_openalex` (then `search_semantic_scholar`/`search_crossref`/`search_pubmed`). These carry reliable dates and readable full text. Closed publisher landing pages (Springer/Elsevier/IEEE/ACM/Wiley) are usually paywalled and often undated, so they are down-ranked in screening and hard to read — do not rely on them: when a relevant paper is only a closed DOI, look up its arXiv/OpenAlex open-access version and read that instead.'),
       `- maxSources (${request.maxSources}) is the raw search/corpus cap, NOT the number of sources presented in the report (${request.minSelectedSources}). Report found/selected/read/evidence counts separately.`,
       request.requireQualityPass
         ? '- A quality pass is required before the report: data/evidence gates must pass before `generate_evidence_report`.'
@@ -783,6 +796,8 @@ export function App() {
                   onOpenExternalLink={requestOpenExternalLink}
                   appLanguage={appLanguage}
                   onCitationClick={handleCitationClick}
+                  queuedMessages={queuedMessages}
+                  onRemoveQueued={removeQueuedMessage}
                 />
                 <ResearchArtifacts
                   workspace={workspace}

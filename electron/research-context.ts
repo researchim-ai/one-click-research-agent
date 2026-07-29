@@ -24,6 +24,7 @@ import {
 } from './research-resume'
 import { ensureResearchRunSpec, formatWorkflowGuidance, detectDataGatheringStall, formatDataStallDirective } from './research-workflow'
 import { resolveResearchDir } from '../research-paths'
+import { normalizeAllowedSearchTools, filterToolNamesByPolicy, searchSourceLabel } from '../search-sources'
 
 export type ResearchContextMode = 'off' | 'active' | 'resume'
 
@@ -72,7 +73,10 @@ export function resolveResearchContextMode(opts: {
   outputDir?: string | null
 }): ResearchContextMode {
   if (isResearchResumeMessage(opts.userMessage)) return 'resume'
-  if (opts.presetId === 'deep-research') return 'active'
+  // Managed deep-research turns on ONLY when a concrete run directory is in play (kickoff from the
+  // New Research dialog, an explicit `.research/` reference, or an active session's history). A
+  // globally-saved `deep-research` preset must NOT flip unrelated chats into a managed run — that
+  // (together with the run-dir fallback) is what hijacked plain requests like "напиши проект по RL".
   if (opts.outputDir) return 'active'
   return 'off'
 }
@@ -82,10 +86,19 @@ export function resolveResearchOutputDir(
   messages: Array<{ role?: string; content?: string }>,
   currentMessage?: string,
 ): string | null {
-  return extractResearchOutputDirFromText(currentMessage ?? '')
+  // Explicit, session-scoped signals only: a run dir named in THIS turn (the New Research kickoff
+  // message, or a pasted `.research/...` path) or anywhere in THIS session's history.
+  const explicit = extractResearchOutputDirFromText(currentMessage ?? '')
     || extractResearchOutputDirFromMessages(messages)
-    || readResearchRunState(workspace)?.outputDir
-    || findLatestResearchRunDir(workspace)
+  if (explicit) return explicit
+  // The workspace-global "last run" pointers (run-state.json / newest .research dir) are NOT
+  // session-scoped. Using them unconditionally made every brand-new, unrelated chat (e.g.
+  // "напиши проект по RL") silently inherit the previous deep-research run and try to "finish" it.
+  // Only consult them when the user EXPLICITLY asks to continue/resume research.
+  if (isResearchResumeMessage(currentMessage ?? '')) {
+    return readResearchRunState(workspace)?.outputDir || findLatestResearchRunDir(workspace)
+  }
+  return null
 }
 
 function runStatePath(workspace: string): string {
@@ -303,9 +316,13 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     evidenceTotal: evidence.total,
     target,
   })
-  const allowedForDisplay = stall.stalled
+  const allowedForDisplayRaw = stall.stalled
     ? [...new Set([...spec.allowedActions, ...stall.recoveryActions])]
     : spec.allowedActions
+  // Honor an active source restriction: never suggest a search engine the run is not
+  // allowed to use (the model can't call it anyway — this keeps guidance consistent).
+  const searchPolicy = normalizeAllowedSearchTools(spec.allowedSearchTools)
+  const allowedForDisplay = filterToolNamesByPolicy(allowedForDisplayRaw, searchPolicy)
 
   // ONE authoritative next action, elevated to the very top. The state block has many
   // sections and (on a stall) a long allowed-tools list, which caused decision paralysis:
@@ -337,6 +354,12 @@ export function buildResearchWorkingSet(workspace: string, outputDir: string, ma
     `**Allowed next tools:** ${allowedForDisplay.join(', ') || 'none'}`,
     `**Plan:** ${progress.done}/${progress.total} complete (${progress.pct}%)`,
   ]
+
+  if (searchPolicy) {
+    lines.push(
+      `**🔒 Source restriction:** this run may ONLY discover sources via ${searchPolicy.map((id) => `\`${id}\` (${searchSourceLabel(id)})`).join(', ')}. Do NOT use any other search engine. If coverage is thin, broaden queries and shift the date window WITHIN these sources.`,
+    )
+  }
 
   // Discovery → corpus handoff: search hits live in the session tracker, not on disk,
   // so corpus.jsonl stays empty (and the state stays PLANNED) until build_corpus runs.

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useCallback, type KeyboardEvent } from 'react'
 import { MessageBubble } from './MessageBubble'
 import { SourceSelectionCard } from './SourceSelectionCard'
-import type { ChatMessage } from '../hooks/useAgent'
+import type { ChatMessage, QueuedMessage } from '../hooks/useAgent'
 
 interface AttachedFile {
   path: string
@@ -44,6 +44,8 @@ interface Props {
   onOpenExternalLink?: (url: string) => void
   appLanguage?: 'ru' | 'en'
   onCitationClick?: (n: number) => void
+  queuedMessages?: QueuedMessage[]
+  onRemoveQueued?: (id: string) => void
 }
 
 export function Chat({
@@ -64,6 +66,8 @@ export function Chat({
   onOpenExternalLink,
   appLanguage = 'ru',
   onCitationClick,
+  queuedMessages = [],
+  onRemoveQueued,
 }: Props) {
   const L = appLanguage === 'ru'
   const [input, setInput] = useState('')
@@ -91,7 +95,8 @@ export function Chat({
 
   const handleSend = useCallback(async () => {
     if (!input.trim() && attachedFiles.length === 0 && codeRefs.length === 0) return
-    if (busy) return
+    // NOTE: no early-return on `busy` — onSend queues the message when the agent
+    // is working, so users can stack up follow-up tasks.
 
     let fullMessage = ''
 
@@ -385,6 +390,34 @@ export function Chat({
 
       {/* Input area */}
       <div className="border-t border-zinc-800/60 bg-[#0d1117]">
+        {/* Queued messages (stacked while the agent is busy) */}
+        {queuedMessages.length > 0 && (
+          <div className="flex flex-col gap-1 px-3 pt-2.5 pb-1">
+            <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">
+              <span className="text-amber-400/80">⏳</span>
+              {L ? `В очереди · ${queuedMessages.length}` : `Queued · ${queuedMessages.length}`}
+            </div>
+            {queuedMessages.map((q, i) => (
+              <div
+                key={q.id}
+                className="group flex items-start gap-1.5 px-2.5 py-1.5 bg-amber-500/8 border border-amber-500/20 rounded text-[12px]"
+              >
+                <span className="text-amber-400/60 text-[10px] tabular-nums mt-0.5 shrink-0">{i + 1}.</span>
+                <span className="flex-1 min-w-0 text-zinc-300 whitespace-pre-wrap break-words line-clamp-3">{q.text}</span>
+                {onRemoveQueued && (
+                  <button
+                    onClick={() => onRemoveQueued(q.id)}
+                    title={L ? 'Убрать из очереди' : 'Remove from queue'}
+                    className="w-5 h-5 flex items-center justify-center rounded text-zinc-600 hover:text-red-400 hover:bg-red-500/10 cursor-pointer text-[10px] shrink-0 transition-colors"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Attached code references */}
         {codeRefs.length > 0 && (
           <div className="flex flex-col gap-1.5 px-3 pt-2.5 pb-1">
@@ -482,21 +515,24 @@ export function Chat({
               value={input}
               onChange={(e) => handleInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={busy || noWorkspace}
+              disabled={noWorkspace}
               placeholder={noWorkspace
                 ? (L ? 'Сначала выбери проект ←' : 'Select a project first ←')
-                : hasAttachments
-                  ? (L ? 'Добавь описание задачи…' : 'Describe the task…')
-                  : (L ? 'Опиши задачу… @ — прикрепить файл' : 'Describe a task… @ — attach file')}
+                : busy
+                  ? (L ? 'Агент занят — сообщение встанет в очередь…' : 'Agent busy — message will be queued…')
+                  : hasAttachments
+                    ? (L ? 'Добавь описание задачи…' : 'Describe the task…')
+                    : (L ? 'Опиши задачу… @ — прикрепить файл' : 'Describe a task… @ — attach file')}
               rows={1}
               className="flex-1 bg-transparent px-3 py-2.5 text-[13px] text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none disabled:opacity-50"
             />
             <button
               onClick={handleSend}
-              disabled={busy || (!input.trim() && !hasAttachments) || noWorkspace}
+              disabled={(!input.trim() && !hasAttachments) || noWorkspace}
+              title={busy ? (L ? 'Добавить в очередь' : 'Add to queue') : undefined}
               className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-blue-400 disabled:opacity-20 disabled:cursor-not-allowed transition-colors shrink-0 cursor-pointer text-sm mr-1.5 mb-1"
             >
-              ➤
+              {busy ? '＋' : '➤'}
             </button>
           </div>
         </div>

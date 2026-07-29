@@ -1,221 +1,138 @@
 # One-Click Research Agent
 
-`one-click-research-agent` is a local-first research agent built on open-source models and packaged as an Electron app.
+Russian version: [`README.md`](README.md)
 
-The project started from the `one-click-coding-agent` foundation, but is being refocused into a private research workspace that can inspect files, analyze repositories, search papers, run tools, and synthesize findings without sending user data to external AI APIs.
+`one-click-research-agent` is a desktop app (Electron + React) with an autonomous AI agent and a local LLM (via `llama.cpp`) for research work. It is a general-purpose agent: it works with your files, runs commands, searches the web and scholarly indexes, reads documents, and helps you dig into a topic — entirely on your machine, without sending data to external AI APIs.
 
-## Core Idea
+One of its key functions is a **managed deep-research workflow**: the agent plans, searches for sources, reads full texts, extracts quote-backed evidence, runs quality gates, and assembles a final report end to end.
 
-The goal is not to build "just another chat UI".
+![One-Click Research Agent — launch screen: set up llama.cpp, the model, and the server in one click](docs/images/starting.png)
 
-The goal is to build a local research runtime that can:
+## What it is
 
-- investigate topics and source material;
-- inspect local files and repositories;
-- run commands and collect artifacts;
-- compare findings across sources;
-- support domain presets such as paper analysis or open-source app analysis;
-- keep data on the user's machine.
+This is not "just another chat UI" — it is a local agentic runtime. Beyond regular agent work (reading and editing files, running commands, searching), its flagship function is a managed **deep-research** workflow that can:
 
-## Product Direction
+- run a topic investigation as a managed pipeline, not a single model answer;
+- search scholarly indexes (arXiv, OpenAlex, PubMed, and more) and the web;
+- read full paper texts (HTML/PDF) and extract evidence with exact quotes;
+- verify output quality through a set of quality gates;
+- assemble a structured report with an evidence matrix and links;
+- keep every artifact local inside a `.research/` folder.
 
-This app is built around three product principles:
+Three product principles:
 
-- `Local-first`: files, notes, outputs, and research artifacts stay on the user's machine.
-- `Open-source-only`: the agent is intended to run on open-source models via `llama.cpp`, not proprietary hosted APIs.
-- `Agentic workflows`: the system can read, run, inspect, and synthesize instead of only generating text.
+- **Local-first** — files, sources, evidence, and reports stay on your machine.
+- **Open-source-only** — runs on a local `llama.cpp`, no dependency on proprietary APIs.
+- **Agentic workflows** — the system reads, runs, verifies, and synthesizes instead of only generating text.
 
-## Current State
+## Screenshots
 
-The project already includes:
+| New research | Research in progress |
+|---|---|
+| ![New research dialog: LLM intake, run parameters, and the search-source picker](docs/images/new-research-dialog.png) | ![Live run progress: stages, metrics, quality gates, and reasoning trace](docs/images/deep-research-progress.png) |
 
-- Electron desktop shell
-- React renderer
-- local model/server setup via `llama.cpp`
-- agent runtime with tool execution
-- file tree, editor, terminal, chat, and session management
-- configurable agent settings and prompts
-- preset selection for specialized research modes
+| Final report | Research library |
+|---|---|
+| ![report.md: summary, key findings, evidence matrix](docs/images/report.png) | !["My research": list of past runs with open-report and delete](docs/images/research-library.png) |
 
-Current research-oriented presets include:
+## Key features
 
-- `Universal Research`
-- `Arxiv Papers`
-- `Open Source App Analysis`
-- `Biology Research`
-- `Math Research`
-- `Finance Research`
-- `Paper Reproduction`
+- **Managed deep-research workflow** (`managed-deep-v1`): a state machine with `INIT → PLANNED → CORPUS_READY → READING → EVIDENCE → GATES → REPORT_READY`.
+- **New-research dialog with LLM intake**: describe the task in plain text (topic, date range, language, depth, constraints) and the model fills the run parameters; a manual form is also available.
+- **Quality gates**: before the report the run checks plan/source coverage, recency, date-range compliance, topical precision, review coverage, evidence-to-corpus linkage, citation coverage, and more.
+- **Evidence-grounded report**: every claim is backed by a read source and a quote; evidence strength is labeled (`strong` / `quote-backed` / `limited`).
+- **Source selection & restriction**: allow only the engines you want (e.g. "arXiv only") — the restriction is hard-enforced at the level of tools the agent can even call.
+- **Full-text reading**: HTML/PDF parsed to markdown, with fallback to open-access versions (arXiv/OpenAlex OA) for closed DOIs.
+- **Language-agnostic**: the agent reads sources in any language and writes the report in the language you choose.
+- **Research library**: browse past runs, open reports, delete them from disk.
+- **Message queue**: while the agent is working you can keep typing follow-up tasks — they stack up and run one by one.
+- **Editable prompts**: all system prompts live in `prompts/*.md` and can be overridden by the user.
+- **Local server management**: model setup, one-click `llama.cpp` update, and an optional GPU keep-warm to avoid idle-related driver issues.
 
-## What Works Right Now
+## How the managed research runs
 
-Already implemented:
+1. **Plan** — the agent states the main question and sub-questions, saves `plan.md`, and (by default) stops for approval.
+2. **Search & corpus** — runs several targeted queries over the allowed sources, builds `corpus.jsonl`, and ranks candidates.
+3. **Screening** — semantic (LLM) + deterministic selection by relevance, dates, and source type; strict date windows are enforced at day precision.
+4. **Reading** — downloads full texts of selected papers (into `fulltext/`).
+5. **Evidence** — extracts quote-backed claims into `evidence.jsonl` and links them to plan items.
+6. **Quality gates** — runs the checks and repairs targeted gaps (gather more sources, read more, extract more evidence). A loop guard downgrades genuinely unreachable coverage gates to warnings so a run always terminates.
+7. **Report** — generates `report.md`: executive summary, key findings, a coverage/evidence-strength matrix, and the evidence base with links.
 
-- default `Universal Research` mode
-- selectable research presets in the settings panel
-- research-oriented system prompts instead of coding-only defaults
-- web search through `SearXNG` (`search_web`) with `disabled`, `managed local`, and `custom URL` modes
-- arXiv search through `search_arxiv`
-- Hugging Face Papers search through `search_huggingface_papers`
-- academic paper search through `search_openalex`
-- arXiv HTML download through `download_arxiv_html`
-- arXiv PDF download through `download_arxiv_pdf`
-- sidebar refresh after agent file tools, commands, and custom tools
+## Search sources
 
-Recommended arXiv flow is now:
+Scholarly indexes and the web:
 
-1. search papers
-2. prefer arXiv HTML when available
-3. use PDF as fallback
+- `search_arxiv`, `search_openalex`, `search_semantic_scholar`, `search_crossref`, `search_pubmed`, `search_biorxiv`, `search_huggingface_papers`, `search_web` (via SearXNG).
 
-## Project map
-
-Detailed architecture map with mermaid diagrams, modules, tools, IPC, `.research/` artifacts, and extension points:
-
-→ [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md)
-
-## Development
-
-Install dependencies:
-
-```bash
-npm install
-```
-
-Run in development mode:
-
-```bash
-npm run dev
-```
-
-Build the app:
-
-```bash
-npm run build
-```
-
-Package for Linux:
-
-```bash
-npm run package:linux
-```
-
-## First Run
-
-Typical first-run flow:
-
-1. Start the app with `npm run dev`
-2. Let the setup wizard prepare the local model/server
-3. Open a workspace folder
-4. Open `Settings -> Agent`
-5. Keep `Universal Research` or switch to a preset like `Arxiv Papers`
-6. Start working from the chat panel
-
-## Example Prompts
-
-### Universal Research
-
-- `Study the project and describe its architecture`
-- `Create a short research brief about browser agents`
-- `Compare several approaches and highlight risks`
-
-### Arxiv Papers
-
-- `Find the best arXiv papers about reinforcement learning`
-- `Compare 5 papers about small language models for agents`
-- `Download HTML versions of the best papers and extract the main claims`
-- `Find a paper, then use web search to locate its GitHub repo and dataset`
-
-## Web Search via SearXNG
-
-The project supports web search through `SearXNG` in two working modes:
-
-- `Managed local SearXNG`: the app auto-starts a local Docker container on first search
-- `Existing SearXNG URL`: use an already running compatible instance
-
-How to enable it:
-
-1. Open `Settings -> Agent`
-2. Find the `Web search via SearXNG` section
-3. Choose one of the modes:
-4. `Managed local SearXNG` for an automatic local Docker-backed backend
-5. or `Existing SearXNG URL` and enter a base URL such as `http://127.0.0.1:8080`
-6. After saving, the agent gets the built-in `search_web` tool when the backend is available
-
-This is useful for:
-
-- finding GitHub / Hugging Face / Papers With Code links
-- locating docs and benchmark pages
-- finding code / dataset links around a paper
-- broad web research outside arXiv
-
-### Open Source App Analysis
-
-- `Run the project and explain how it works`
-- `Analyze this app's extension points`
-- `Compare the app behavior with its documentation`
-
-## arXiv Notes
-
-The project currently uses arXiv in an `HTML-first, PDF-fallback` way.
-
-Why:
-
-- HTML is easier to parse and analyze than PDF
-- HTML is better for section-aware extraction
-- not every paper has a usable HTML version
-- PDF remains the reliable fallback
-
-Implemented arXiv tools:
-
-- `search_arxiv`
-- `download_arxiv_html`
-- `download_arxiv_pdf`
-
-Additional research tools:
-
-- `search_huggingface_papers`
-- `search_openalex`
-- `search_web`
-
-## Architecture Overview
-
-High-level structure:
-
-- `electron/`: main process, agent runtime, tools, model/server integration
-- `src/`: React renderer UI
-- `research-presets.ts`: preset registry and preset prompt add-ons
-- `dist/`: built renderer output
-- `dist-electron/`: built Electron output
-
-Conceptually the app is organized as:
-
-- shared runtime
-- default universal agent
-- optional domain presets
-- toolpacks and reproducible workflows
+In the new-research dialog you can choose which sources to use. If you leave out some, the agent physically cannot reach the others (hard restriction) and will broaden queries / shift the date window within the allowed sources instead.
 
 ## Privacy
 
-This project is intentionally being shaped around privacy-sensitive use cases.
+- local files are the default source of truth;
+- research artifacts stay local until you export them;
+- inference runs on a local open-source model via `llama.cpp`;
+- no cloud AI API dependency in the core design.
 
-That means:
+## Install & run
 
-- local files are the default source of truth
-- research artifacts stay local unless the user exports them
-- the app is designed around open-source local model execution
-- no ChatGPT-only product dependency is assumed in the core design
+Prebuilt Linux binaries (AppImage / .deb) are on the [Releases](../../releases) page.
 
-## Near-Term Roadmap
+From source:
 
-Planned near-term improvements:
+```bash
+npm install      # install dependencies
+npm run dev      # run in development mode
+npm run build    # build renderer + electron
+npm run package:linux  # package for Linux (AppImage + deb)
+```
 
-- richer arXiv workflow with metadata artifacts and saved paper sessions
-- HTML-first paper ingestion and structured extraction
-- better research artifact storage inside `.research/`
-- stronger preset-specific toolpacks
-- improved "paper -> code -> reproduction" flow
+## First run
+
+1. Start the app (`npm run dev` or a prebuilt binary).
+2. Let the setup wizard prepare the local model and `llama.cpp` server.
+3. Open a workspace folder.
+4. Click "New research" and describe the task in plain text — the model fills the parameters.
+5. Review the summary (topic, date range, language, sources), optionally restrict the sources, and click "Start research".
+6. Approve the plan — the agent then runs autonomously through to `report.md`.
+
+## Settings
+
+The settings panel includes:
+
+- model and GPU mode selection, `llama.cpp` update and server restart;
+- **GPU keep-warm** — periodic pings that keep the GPU active (working around some idle driver bugs);
+- **AI source-screening budget** — how long to give the LLM for semantic screening;
+- web search via `SearXNG`: `disabled` / `managed local` (Docker) / `custom URL`;
+- research presets and profiles (`Universal`, `ML/AI`, `Biology`, `Math`, `Finance`, `Paper Reproduction`, etc.);
+- editing of system prompts.
+
+## `.research/` artifacts
+
+Each run is its own folder under `.research/<timestamp>_<slug>/`:
+
+- `plan.md` — the research plan;
+- `corpus.jsonl` — discovered sources and their screening;
+- `fulltext/` — saved full texts;
+- `evidence.jsonl`, `claims.jsonl` — evidence and claims;
+- `quality-gates.json` — gate results;
+- `report.md` — the final report;
+- `run.json` — managed-run state;
+- `reasoning-trace.jsonl` — the agent's reasoning/action trace.
+
+## Project map
+
+Detailed architecture map (mermaid diagrams, modules, tools, IPC, `.research/` artifacts, extension points):
+
+→ [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md)
+
+High-level structure:
+
+- `electron/` — main process, agent runtime, tools, model/server integration;
+- `src/` — React renderer UI;
+- `prompts/` — editable prompts;
+- `research-presets.ts`, `research-profiles.ts`, `search-sources.ts` — registries of presets, profiles, and search sources.
 
 ## Status
 
-This project is under active development and the README will evolve alongside the research runtime.
+The project is under active development. The README evolves alongside the research runtime.

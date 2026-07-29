@@ -2,6 +2,7 @@
 // Kept separate from main.ts (which pulls in Electron) so it can be unit-tested.
 
 import { renderPrompt } from './prompts'
+import { SEARCH_SOURCE_IDS } from '../search-sources'
 
 export function lastBalancedJsonObject(s: string): string | null {
   let depth = 0
@@ -62,6 +63,11 @@ export function sanitizeResearchPatch(raw: Record<string, any> | null | undefine
   }
   if (Array.isArray(raw.outputs)) out.outputs = raw.outputs.map(String).filter(Boolean)
   if (Array.isArray(raw.checkpoints)) out.checkpoints = raw.checkpoints.map(String).filter(Boolean)
+  // allowedSearchTools is a whitelist of known search-engine ids; drop anything unknown.
+  if (Array.isArray(raw.allowedSearchTools)) {
+    const ids = [...new Set(raw.allowedSearchTools.map(String))].filter((x) => SEARCH_SOURCE_IDS.includes(x))
+    if (ids.length) out.allowedSearchTools = ids
+  }
   // researchKind is an enum, not a free string — only accept the two known values.
   if (raw.researchKind === 'general' || raw.researchKind === 'academic') out.researchKind = raw.researchKind
   return out

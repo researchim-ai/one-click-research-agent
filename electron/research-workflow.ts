@@ -44,6 +44,10 @@ export interface ResearchRunSpec {
     strictDateRange?: boolean
     researchKind?: string
   }
+  /** Whitelist of discovery/search tool ids this run is restricted to (e.g. only
+   *  ['search_arxiv']). Undefined/empty means no restriction. Enforced by filtering the
+   *  tool list the model receives, not just via prompt guidance. */
+  allowedSearchTools?: string[]
   lastTool?: string
   lastGateFailures?: Array<{ gate: string; blockers: string[]; repairTools: string[] }>
   allowedActions: string[]
@@ -351,6 +355,7 @@ export function ensureResearchRunSpec(workspace: string, outputDir: string, patc
     topic: patch.topic ?? prev?.topic,
     thresholds: patch.thresholds ?? prev?.thresholds,
     screenParams: patch.screenParams ?? prev?.screenParams,
+    allowedSearchTools: patch.allowedSearchTools ?? prev?.allowedSearchTools,
     lastTool: patch.lastTool ?? prev?.lastTool,
     lastGateFailures,
     allowedActions: allowedActionsForState(inferredState, lastGateFailures),

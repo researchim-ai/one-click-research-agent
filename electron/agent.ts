@@ -43,8 +43,15 @@ import {
   formatDataStallDirective,
   nextSearchBudgetNudge,
   registerResearchSearch,
+  readResearchRunSpec,
 } from './research-workflow'
 import { extractTextToolCalls } from './tool-call-parser'
+import {
+  SEARCH_SOURCE_IDS,
+  ROUTER_SEARCH_TOOL,
+  isSearchSourceTool,
+  normalizeAllowedSearchTools,
+} from '../search-sources'
 
 // Bridge: main process implements with Electron/win; worker implements with postMessage.
 export interface AgentBridge {
@@ -112,8 +119,50 @@ let researchContextMode: ResearchContextMode = 'off'
 let activeResearchOutputDir: string | null = null
 let activeWorkspace: string | null = null
 let activeSessionId: string | null = null
+/** Discovery-source whitelist for the current run (null = no restriction). Recomputed per
+ *  runAgent from the kickoff message or the persisted run spec so it never leaks between runs. */
+let activeSearchPolicy: string[] | null = null
 
 let currentBridge: AgentBridge | null = null
+
+/** Extract a source whitelist from the managed-run kickoff message (deterministic — the
+ *  UI writes an "Allowed search sources: ..." line listing exact tool ids). */
+function parseAllowedSearchToolsFromMessage(msg: string): string[] | null {
+  if (!msg) return null
+  const m = /allowed search sources[^\n:]*:\s*([^\n]+)/i.exec(msg)
+  if (!m) return null
+  const line = m[1]
+  const ids = SEARCH_SOURCE_IDS.filter((id) => line.includes(id))
+  return normalizeAllowedSearchTools(ids)
+}
+
+/** Backticked list of the search tools the model should lead with, honoring any active
+ *  source restriction. Falls back to the common academic set when unrestricted. */
+function searchToolHint(policy: string[] | null): string {
+  const p = normalizeAllowedSearchTools(policy)
+  const ids = p ?? ['search_arxiv', 'search_openalex', 'search_huggingface_papers', 'search_web']
+  return ids.map((id) => `\`${id}\``).join(', ')
+}
+
+/** Resolve the active run's source policy: prefer the whitelist stated in the kickoff
+ *  message (and persist it), otherwise load the one already saved in run.json (so the
+ *  restriction survives plan-approval continues, resumes and worker restarts). */
+function resolveActiveSearchPolicy(ws: string, outputDir: string | null, userMessage: string): string[] | null {
+  const fromMsg = parseAllowedSearchToolsFromMessage(userMessage)
+  if (fromMsg) {
+    if (outputDir) {
+      try { ensureResearchRunSpec(ws, outputDir, { allowedSearchTools: fromMsg }) } catch {}
+    }
+    return fromMsg
+  }
+  if (outputDir) {
+    try {
+      const spec = readResearchRunSpec(ws, outputDir)
+      return normalizeAllowedSearchTools(spec?.allowedSearchTools)
+    } catch {}
+  }
+  return null
+}
 
 // Per-run durable trace of the model's reasoning chain + actions. The live UI only
 // streams 'thinking' transiently and the debug log keeps short previews, so a failed or
@@ -516,8 +565,20 @@ function getAllTools(): any[] {
     },
   }))
   const all = [...getBuiltinToolDefinitions(doGetConfig()), ...customDefs]
+  // Hard source restriction: if the run is limited to a subset of search engines, drop the
+  // disallowed search tools (and the multi-engine router) from what the model can even call.
+  // This is the only reliable enforcement — prompt guidance alone is routinely ignored.
+  const policy = normalizeAllowedSearchTools(activeSearchPolicy)
+  const scoped = policy
+    ? all.filter((t) => {
+        const name = t?.function?.name
+        if (name === ROUTER_SEARCH_TOOL) return false
+        if (isSearchSourceTool(name)) return policy.includes(name)
+        return true
+      })
+    : all
   // On small contexts, use compact descriptions to save ~40% tool overhead
-  return ctxTokens() < 16384 ? compactToolDefs(all) : all
+  return ctxTokens() < 16384 ? compactToolDefs(scoped) : scoped
 }
 
 interface Message {
@@ -2654,6 +2715,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
   activeResearchOutputDir = resolveResearchOutputDir(ws, messages, userMessage)
   activeWorkspace = ws
   activeSessionId = session.id
+  activeSearchPolicy = resolveActiveSearchPolicy(ws, activeResearchOutputDir, userMessage)
   researchContextMode = resolveResearchContextMode({
     userMessage,
     presetId: (doGetConfig() as any).selectedPreset,
@@ -2690,7 +2752,7 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         `The user approved the saved plan for output_dir: "${activeResearchOutputDir}".`,
         formatWorkflowGuidance(spec),
         'Do not restate the plan and do not ask for approval again.',
-        'Next action: call one focused search tool now (`search_arxiv`, `search_openalex`, `search_huggingface_papers`, or `search_web`) with a query derived from the approved plan and 2024-2026 date range. After search results, build_corpus and screen_corpus for the same output_dir.',
+        `Next action: call one focused search tool now (${searchToolHint(activeSearchPolicy)}) with a query derived from the approved plan and 2024-2026 date range. After search results, build_corpus and screen_corpus for the same output_dir.`,
       ].join('\n'),
     })
   }
