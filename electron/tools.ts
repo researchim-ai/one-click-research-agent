@@ -1498,20 +1498,14 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
   const fullTextDir = path.join(baseDir, 'fulltext')
 
   if (entry.arxivId) {
-    const htmlPath = path.join(fullTextDir, `${safeId}.html`)
-    const html = downloadArxivHtml(entry.arxivId, htmlPath, workspace)
-    if (!html.startsWith('Error:')) {
-      markCorpusItemRead(workspace, corpusId, htmlPath, 'read', 'arXiv HTML downloaded', outputDir)
-      return `${html}\nUpdated corpus ${corpusId}: read.`
+    const mdTarget = resolvePath(path.join(fullTextDir, `${safeId}.md`), workspace)
+    const res = await readArxivAsMarkdown(entry.arxivId, mdTarget, fullTextDir, safeId, entry.title, entry.url, workspace)
+    if ('error' in res) {
+      markCorpusItemRead(workspace, corpusId, undefined, 'failed', res.error.slice(0, 500), outputDir)
+      return `Error: could not read arXiv ${entry.arxivId} — ${res.error}\nUpdated corpus ${corpusId}: failed.`
     }
-    const pdfPath = path.join(fullTextDir, `${safeId}.pdf`)
-    const pdf = downloadArxivPdf(entry.arxivId, pdfPath, workspace)
-    if (!pdf.startsWith('Error:')) {
-      markCorpusItemRead(workspace, corpusId, pdfPath, 'read', 'arXiv PDF downloaded; parse_document recommended', outputDir)
-      return `${html}\n${pdf}\nUpdated corpus ${corpusId}: read via PDF fallback.`
-    }
-    markCorpusItemRead(workspace, corpusId, undefined, 'failed', `${html} ${pdf}`.slice(0, 500), outputDir)
-    return `${html}\n${pdf}\nUpdated corpus ${corpusId}: failed.`
+    markCorpusItemRead(workspace, corpusId, res.localPath, 'read', res.note, outputDir)
+    return `Read arXiv ${entry.arxivId} → ${res.localPath} (${res.note}).\n\n${res.excerpt}\nUpdated corpus ${corpusId}: read.`
   }
 
   const target = resolvePath(path.join(fullTextDir, `${safeId}.md`), workspace)
@@ -1526,7 +1520,7 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
     fs.writeFileSync(target, fetched, 'utf-8')
     const rel = path.relative(workspace, target)
     markCorpusItemRead(workspace, corpusId, rel, 'read', 'URL fetched as markdown', outputDir)
-    return `Fetched ${entry.url} to ${rel} (${directBody} chars).\nUpdated corpus ${corpusId}: read.`
+    return `Fetched ${entry.url} to ${rel} (${directBody} chars).\n\n${fullTextExcerpt(fetched)}\nUpdated corpus ${corpusId}: read.`
   }
 
   // Direct fetch was blocked or empty. Publishers (ACM/IEEE/MDPI/Frontiers/Cell) and
@@ -1540,17 +1534,11 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
   // of dragging down full_text_coverage / unread_top_sources.
   const scholarly = preResolvedScholarly ?? resolveScholarlyOaLocation(entry)
   if (scholarly?.arxivId) {
-    const htmlPath = path.join(fullTextDir, `${safeId}.html`)
-    const html = downloadArxivHtml(scholarly.arxivId, htmlPath, workspace)
-    if (!html.startsWith('Error:')) {
-      markCorpusItemRead(workspace, corpusId, path.relative(workspace, htmlPath), 'read', `full text recovered via arXiv (${scholarly.arxivId}); publisher landing page was not scrapeable`, outputDir)
-      return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv HTML (${scholarly.arxivId}).\n${html}\nUpdated corpus ${corpusId}: read.`
-    }
-    const pdfPath = path.join(fullTextDir, `${safeId}.pdf`)
-    const pdf = downloadArxivPdf(scholarly.arxivId, pdfPath, workspace)
-    if (!pdf.startsWith('Error:')) {
-      markCorpusItemRead(workspace, corpusId, path.relative(workspace, pdfPath), 'read', `arXiv PDF recovered (${scholarly.arxivId}); parse_document recommended`, outputDir)
-      return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv PDF (${scholarly.arxivId}).\n${pdf}\nUpdated corpus ${corpusId}: read via PDF fallback.`
+    const mdTarget = resolvePath(path.join(fullTextDir, `${safeId}.md`), workspace)
+    const res = await readArxivAsMarkdown(scholarly.arxivId, mdTarget, fullTextDir, safeId, entry.title, entry.url, workspace)
+    if (!('error' in res)) {
+      markCorpusItemRead(workspace, corpusId, res.localPath, 'read', `full text recovered via arXiv (${scholarly.arxivId}); publisher landing page was not scrapeable`, outputDir)
+      return `Direct fetch of ${entry.url} returned no readable content; recovered arXiv full text (${scholarly.arxivId}).\n\n${res.excerpt}\nUpdated corpus ${corpusId}: read.`
     }
   }
   if (scholarly?.textUrl) {
@@ -1559,7 +1547,7 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
       fs.writeFileSync(target, fetchedOa, 'utf-8')
       const rel = path.relative(workspace, target)
       markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access full text recovered via OpenAlex (publisher page was not scrapeable)', outputDir)
-      return `Direct fetch of ${entry.url} returned no readable content; recovered open-access copy to ${rel} (${fetchedContentLength(fetchedOa)} chars).\nUpdated corpus ${corpusId}: read.`
+      return `Direct fetch of ${entry.url} returned no readable content; recovered open-access copy to ${rel} (${fetchedContentLength(fetchedOa)} chars).\n\n${fullTextExcerpt(fetchedOa)}\nUpdated corpus ${corpusId}: read.`
     }
   }
   const oaPdfUrls = [...new Set([scholarly?.pdfUrl, ...(scholarly?.pdfUrls ?? [])].filter(Boolean) as string[])]
@@ -1569,7 +1557,9 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
     if (!parsed.startsWith('Error:')) {
       const rel = path.relative(workspace, target)
       markCorpusItemRead(workspace, corpusId, rel, 'read', 'open-access PDF recovered and parsed via OpenAlex/Semantic Scholar/OpenReview', outputDir)
-      return `Direct fetch of ${entry.url} returned no readable content; ${parsed}\nUpdated corpus ${corpusId}: read.`
+      let excerpt = ''
+      try { excerpt = fullTextExcerpt(fs.readFileSync(target, 'utf-8')) } catch {}
+      return `Direct fetch of ${entry.url} returned no readable content; ${parsed}\n\n${excerpt}\nUpdated corpus ${corpusId}: read.`
     }
   }
 
@@ -1583,7 +1573,7 @@ async function readCorpusItemTool(workspace: string, id: string | undefined, out
       ? `full text recovered via ${oa.source} (publisher page was not scrapeable)`
       : `abstract only via ${oa.source} (full text unavailable)`
     markCorpusItemRead(workspace, corpusId, rel, 'read', reason, outputDir)
-    return `Direct fetch of ${entry.url} returned no readable content; recovered ${oa.kind === 'fulltext' ? 'full text' : 'abstract'} via ${oa.source} to ${rel} (${oa.content.length} chars).\nUpdated corpus ${corpusId}: read.`
+    return `Direct fetch of ${entry.url} returned no readable content; recovered ${oa.kind === 'fulltext' ? 'full text' : 'abstract'} via ${oa.source} to ${rel} (${oa.content.length} chars).\n\n${fullTextExcerpt(doc)}\nUpdated corpus ${corpusId}: read.`
   }
 
   // Nothing usable. Mark failed WITHOUT a localPath so the post-rebuild reconcile logic
@@ -2051,6 +2041,22 @@ function parseJsonStringMap(text: string): Record<string, string> {
   }
 }
 
+/**
+ * Return a real, readable slice of parsed full text (after the `---` header divider) so the read
+ * tool actually delivers the article body into the model's context — not just a "downloaded N
+ * chars" status. Without this the model grounded quotes on the abstract only (and once leaked raw
+ * HTML markup into a quote). Bounded so a batch read stays within a sane context budget.
+ */
+function fullTextExcerpt(fetched: string, max = 4000): string {
+  const idx = fetched.indexOf('\n\n---\n\n')
+  const body = (idx >= 0 ? fetched.slice(idx + '\n\n---\n\n'.length) : fetched).trim()
+  if (!body) return ''
+  const clip = body.length > max
+    ? `${body.slice(0, max)}\n… [truncated — ${body.length} chars total; open the local file for the rest]`
+    : body
+  return `Full text (parsed):\n\n${clip}`
+}
+
 function readLocalExcerpt(localPath: string | undefined): string {
   if (!localPath) return ''
   try {
@@ -2202,9 +2208,32 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     const normalized = localPath.replace(/\\/g, '/')
     return normalized.startsWith(`${runDir}/`) ? normalized.slice(runDir.length + 1) : normalized
   }
+  // arXiv links in the report are always normalized to the canonical /abs/ page (never a
+  // /html/ or /pdf/ variant the fetcher happened to use), and we append a direct [PDF] link —
+  // requested because abs+pdf are the convenient entry points for a reader.
+  const arxivIdOf = (e: { arxivId?: string; url?: string }) => {
+    const raw = e.arxivId || extractArxivId(e.url || '')
+    return raw ? normalizeArxivId(raw) : null
+  }
+  const sourceHref = (e: { arxivId?: string; url?: string }) => {
+    const id = arxivIdOf(e)
+    return id ? `https://arxiv.org/abs/${id}` : (e.url || '')
+  }
+  // For arXiv sources, append explicit, separately-labelled abstract + PDF + alphaXiv links so a
+  // reader can jump straight to any entry point (requested). Every arXiv paper also has an
+  // alphaXiv overview page at the same id. The title link already points at /abs/.
+  const pdfSuffix = (e: { arxivId?: string; url?: string }) => {
+    const id = arxivIdOf(e)
+    if (!id) return ''
+    const bare = id.replace(/v\d+$/, '')
+    const abs = link('abstract', `https://arxiv.org/abs/${id}`)
+    const pdf = link('PDF', `https://arxiv.org/pdf/${bare}.pdf`)
+    const alpha = link('alphaXiv', `https://www.alphaxiv.org/overview/${bare}`)
+    return ` · ${abs} · ${pdf} · ${alpha}`
+  }
   const sourceTag = (id: string) => {
     const src = sourceById.get(id)
-    return src ? link(id, src.url) : `\`${id}\``
+    return src ? link(id, sourceHref(src)) : `\`${id}\``
   }
   const sourceLabel = (id: string) => {
     const src = sourceById.get(id)
@@ -2334,7 +2363,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
   // collapsing the title and summary onto one line).
   const annotationLines = reportSources.length
     ? reportSources.flatMap((e, i) => [
-      `**${i + 1}. ${link(cleanTitle(e.title), e.url)}**${e.year ? ` (${e.year})` : ''} · \`${e.id}\``,
+      `**${i + 1}. ${link(cleanTitle(e.title), sourceHref(e))}**${e.year ? ` (${e.year})` : ''}${pdfSuffix(e)} · \`${e.id}\``,
       '',
       sourceSummary(e),
       '',
@@ -2344,7 +2373,7 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
     const local = localHref(e.localPath)
     return [
       `| S${i + 1}`,
-      `${link(cleanTitle(e.title), e.url)}${e.year ? ` (${e.year})` : ''}`,
+      `${link(cleanTitle(e.title), sourceHref(e))}${e.year ? ` (${e.year})` : ''}${pdfSuffix(e)}`,
       sourceType(e),
       priorityLabel(e.readPriority),
       e.subQuestions?.join(', ') || '-',
@@ -2355,12 +2384,12 @@ export function composeSynthesisReport(workspace: string, title: string, outputD
   const reviewLines = reviews.length
     ? reviews.map((e) => {
       const covers = e.subQuestions?.length ? ` — ${ru ? 'покрывает' : 'covers'} ${e.subQuestions.join(', ')}` : ''
-      return `- ${link(cleanTitle(e.title), e.url)}${e.year ? ` (${e.year})` : ''} (${sourceTag(e.id)})${covers}`
+      return `- ${link(cleanTitle(e.title), sourceHref(e))}${e.year ? ` (${e.year})` : ''}${pdfSuffix(e)} (${sourceTag(e.id)})${covers}`
     })
     : [ru ? '- Обзорных источников среди прочитанных отобранных источников недостаточно; это ограничение.' : '- Review/survey coverage among read selected sources is insufficient; this is a limitation.']
   const unavailableLines = unavailable.length
     ? unavailable.flatMap((e) => [
-      `- **${link(cleanTitle(e.title), e.url)}** (${sourceTag(e.id)})`,
+      `- **${link(cleanTitle(e.title), sourceHref(e))}**${pdfSuffix(e)} (${sourceTag(e.id)})`,
       `  - ${cleanReadReason(e.readReason) ?? (ru ? 'полный текст недоступен' : 'full text unavailable')}`,
     ])
     : [ru ? '- Нет отобранных источников с недоступным полным текстом.' : '- No selected sources have failed full-text reads.']
@@ -3790,6 +3819,49 @@ ${fetchWithTimeoutSnippet(60000)}
     try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath) } catch {}
     return `Error: open-access PDF recovery failed. ${String(e?.stderr || e?.message || e).trim()}`
   }
+}
+
+/**
+ * Read an arXiv paper as CLEAN markdown for grounding. Preferred path: parse the HTML edition
+ * (arxiv.org/html/<id>) through the same Readability/Turndown pipeline as any other page. Fallback:
+ * download the PDF and parse it with unpdf. Always writes a single `.md` artifact — never a raw
+ * HTML/PDF blob presented as "full text" — and returns a body excerpt for the model. This replaces
+ * the old behaviour that saved multi-hundred-KB raw arXiv HTML (LaTeXML markup) and never fed the
+ * parsed body to the model, so quotes came from the abstract (and once leaked `</span>` markup).
+ */
+async function readArxivAsMarkdown(
+  arxivId: string,
+  mdTarget: string,
+  fullTextDir: string,
+  safeId: string,
+  title: string,
+  sourceUrl: string,
+  workspace: string,
+): Promise<{ localPath: string; note: string; excerpt: string } | { error: string }> {
+  const id = normalizeArxivId(arxivId)
+  fs.mkdirSync(path.dirname(mdTarget), { recursive: true })
+  // 1) HTML → markdown (fast, high-fidelity, no binary). classifyUrl treats arxiv.org/html/<id>
+  //    as a normal HTML page, so fetchUrlTool parses it via Readability/Turndown.
+  const htmlUrl = `https://arxiv.org/html/${id}`
+  const fetched = fetchUrlTool(htmlUrl, 'markdown', workspace)
+  if (!fetched.startsWith('Error:') && fetchedContentLength(fetched) >= MIN_FULLTEXT_CHARS) {
+    fs.writeFileSync(mdTarget, fetched, 'utf-8')
+    return {
+      localPath: path.relative(workspace, mdTarget),
+      note: `arXiv HTML parsed to markdown (${fetchedContentLength(fetched)} chars)`,
+      excerpt: fullTextExcerpt(fetched),
+    }
+  }
+  // 2) PDF → markdown (arXiv HTML is not published for every paper).
+  const pdfPath = resolvePath(path.join(fullTextDir, `${safeId}.pdf`), workspace)
+  const pdfUrl = `https://arxiv.org/pdf/${id.replace(/v\d+$/, '')}.pdf`
+  const parsed = await downloadAndParseOaPdf(pdfUrl, pdfPath, mdTarget, title, sourceUrl, workspace)
+  if (!parsed.startsWith('Error:')) {
+    let excerpt = ''
+    try { excerpt = fullTextExcerpt(fs.readFileSync(mdTarget, 'utf-8')) } catch {}
+    return { localPath: path.relative(workspace, mdTarget), note: 'arXiv PDF parsed to markdown', excerpt }
+  }
+  return { error: `arXiv HTML unavailable and PDF parse failed. ${parsed}` }
 }
 
 function editFile(filePath: string, oldStr: string, newStr: string, workspace: string): string {

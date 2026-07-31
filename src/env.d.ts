@@ -102,7 +102,9 @@ interface ElectronAPI {
       gates: Array<{ gate: string; score: number; downgraded: boolean; failing: boolean }>
     } | null
     plan: { total: number; done: number; pct: number }
+    planItems?: Array<{ id: string; text: string; done: boolean; level: number }>
     corpus: { total: number; primary: number; selected: number; rejected: number; needsReview: number; queuedFullText: number; read: number; failed: number; withDoi: number; withArxiv: number; selectedRead: number; highPriority: number; highPriorityRead: number }
+    selectedSources?: import('../electron/types').CorpusSelectionItem[]
     evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number; withCorpus?: number; withQuotes?: number }
     quality?: { blockers: string[] }
     ideas: number

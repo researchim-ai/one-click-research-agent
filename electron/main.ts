@@ -910,7 +910,9 @@ function registerIpcHandlers() {
       profile,
       run: null,
       plan: { total: 0, done: 0, pct: 0 },
+      planItems: [] as Array<{ id: string; text: string; done: boolean; level: number }>,
       corpus: emptyCorpus,
+      selectedSources: [] as any[],
       evidence: { total: 0, supported: 0, contested: 0, unsupported: 0, needsReview: 0 },
       quality: { blockers: [] as string[] },
       ideas: 0,
@@ -939,7 +941,21 @@ function registerIpcHandlers() {
     try {
       const items = planner.parsePlan(workspace, outputDir ?? undefined)
       base.plan = planner.planProgress(items)
+      // Flatten the plan tree so the dashboard can render the same Q1..Qn sub-questions the user
+      // sees in the chat, with their live done/pending status.
+      const flatPlan: Array<{ id: string; text: string; done: boolean; level: number }> = []
+      const walkPlan = (list: typeof items) => {
+        for (const it of list) {
+          flatPlan.push({ id: it.id, text: it.text, done: it.done, level: it.level })
+          if (it.children?.length) walkPlan(it.children)
+        }
+      }
+      walkPlan(items)
+      base.planItems = flatPlan
       base.corpus = corpusStats(workspace, outputDir ?? undefined)
+      // Selected sources with links so the user can open and read them in a browser while the run
+      // is still in progress (non-blocking review).
+      try { base.selectedSources = getCorpusSelection(workspace, outputDir ?? undefined, 60) } catch {}
       base.evidence = evidenceStats(workspace, outputDir ?? undefined)
       if (outputDir) {
         const runDir = path.join(workspace, outputDir)

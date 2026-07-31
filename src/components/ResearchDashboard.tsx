@@ -13,11 +13,16 @@ interface RunInfo {
   gates: Array<{ gate: string; score: number; downgraded: boolean; failing: boolean }>
 }
 
+interface PlanItemView { id: string; text: string; done: boolean; level: number }
+interface SelectedSourceView { id: string; title: string; year?: number; url: string; publicationType?: string; subQuestions?: string[]; included: boolean }
+
 interface DashboardData {
   profile: ResearchProfile
   run: RunInfo | null
   plan: { total: number; done: number; pct: number }
+  planItems?: PlanItemView[]
   corpus: { total: number; primary: number; selected: number; rejected: number; needsReview: number; queuedFullText: number; read: number; failed: number; withDoi: number; withArxiv: number; selectedRead: number; highPriority: number; highPriorityRead: number }
+  selectedSources?: SelectedSourceView[]
   evidence: { total: number; supported: number; contested: number; unsupported: number; needsReview: number; withCorpus?: number; withQuotes?: number }
   quality?: { blockers: string[] }
   ideas: number
@@ -92,8 +97,23 @@ export function ResearchDashboard({ workspace, appLanguage = 'ru', onOpenSetting
   const curPhase = run ? phaseIndex(run.state) : -1
   const blocked = run?.state === 'BLOCKED'
   const reportReady = Boolean(run?.reportReady) || run?.state === 'REPORT_READY'
-  const failingGates = (run?.gates ?? []).filter((g) => g.failing && !g.downgraded)
   const downgraded = run?.downgradedGates ?? []
+  const planItems = data.planItems ?? []
+  const selectedSources = data.selectedSources ?? []
+
+  const openUrl = (url?: string) => {
+    if (url && window.api?.openExternalUrl) window.api.openExternalUrl(url)
+  }
+  // Non-blocking source review from the dashboard: flip screeningStatus in corpus.jsonl without
+  // pausing the run, then refresh so counts/selection stay in sync.
+  const toggleSource = async (id: string, included: boolean) => {
+    if (!run || !window.api?.setResearchSourceIncluded) return
+    try {
+      await window.api.setResearchSourceIncluded(workspace, run.outputDir, id, included)
+      refresh()
+    } catch {}
+  }
+  const stripPlanId = (id: string, text: string) => text.replace(new RegExp(`^${id}[.)]?\\s*`), '').trim()
 
   return (
     <div className="flex-1 overflow-y-auto bg-[#0b0f15] p-6">
@@ -182,6 +202,64 @@ export function ResearchDashboard({ workspace, appLanguage = 'ru', onOpenSetting
           <Metric label={L ? 'Прочитано' : 'Read'} value={`${data.corpus.selectedRead}/${data.corpus.selected}`} hint={data.corpus.failed ? `${data.corpus.failed} ${L ? 'ошибок' : 'failed'}` : (L ? 'полный текст' : 'full text')} />
           <Metric label={L ? 'Доказательства' : 'Evidence'} value={`${data.evidence.supported}/${data.evidence.total}`} hint={L ? 'подтверждено' : 'supported'} />
         </div>
+
+        {/* Research plan — the same Q1..Qn sub-questions from chat, with live status */}
+        {run && planItems.length > 0 && (
+          <Panel title={`${L ? 'План исследования' : 'Research plan'} · ${data.plan.done}/${data.plan.total}`}>
+            <ul className="space-y-1.5">
+              {planItems.map((it) => (
+                <li key={it.id} className="flex items-start gap-2 text-sm" style={{ paddingLeft: it.level > 0 ? it.level * 14 : 0 }}>
+                  <span className={`mt-0.5 shrink-0 ${it.done ? 'text-emerald-400' : 'text-zinc-600'}`}>{it.done ? '✓' : '○'}</span>
+                  <span className="shrink-0 mt-0.5 font-mono text-[11px] text-zinc-500">{it.id}</span>
+                  <span className={it.done ? 'text-zinc-400' : 'text-zinc-200'}>{stripPlanId(it.id, it.text)}</span>
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        )}
+
+        {/* Selected sources — clickable links the user can open/prune while the run continues */}
+        {run && selectedSources.length > 0 && (
+          <Panel title={`${L ? 'Отобранные источники' : 'Selected sources'} · ${selectedSources.length}`}>
+            <ul className="space-y-2">
+              {selectedSources.map((s) => (
+                <li key={s.id} className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={s.included}
+                    onChange={(e) => toggleSource(s.id, e.target.checked)}
+                    className="mt-1 shrink-0 cursor-pointer"
+                    title={L ? 'Убрать из отбора / вернуть' : 'Exclude / include'}
+                  />
+                  <div className="min-w-0">
+                    {s.url ? (
+                      <button
+                        type="button"
+                        onClick={() => openUrl(s.url)}
+                        className="text-left text-blue-300 hover:text-blue-200 hover:underline cursor-pointer"
+                        title={s.url}
+                      >
+                        {s.title}
+                      </button>
+                    ) : (
+                      <span className="text-zinc-200">{s.title}</span>
+                    )}
+                    <div className="text-[11px] text-zinc-500 mt-0.5 flex flex-wrap gap-x-2">
+                      {s.year ? <span>{s.year}</span> : null}
+                      {s.publicationType ? <span>{s.publicationType}</span> : null}
+                      {s.subQuestions?.length ? <span className="text-zinc-600">{s.subQuestions.join(', ')}</span> : null}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <p className="text-[11px] text-zinc-600 mt-3">
+              {L
+                ? 'Открывайте ссылки и убирайте источники прямо во время работы агента — процесс не прерывается.'
+                : 'Open links and prune sources while the agent is running — the run is not interrupted.'}
+            </p>
+          </Panel>
+        )}
 
         {/* Quality gates status */}
         {run && run.gates.length > 0 && (
