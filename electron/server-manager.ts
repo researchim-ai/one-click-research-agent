@@ -22,6 +22,20 @@ export function llamaApiUrl(): string {
 
 let serverProcess: ChildProcess | null = null
 
+// --- crash / GPU device-loss recovery state ---------------------------------
+// True while we are deliberately tearing the server down (stop/restart), so the
+// exit handler and the fatal-error watcher don't fight our own kill.
+let intentionalStop = false
+// Params of the last start() so we can bring the server back up with the same model/ctx.
+let lastStartCtx: { modelPath: string; win?: BrowserWindow; quant?: string; userCtxSize?: number | null } | null = null
+// Epoch-ms of recent auto-restarts, to cap restart storms when the GPU is truly wedged.
+let recentAutoRestarts: number[] = []
+let recovering = false
+// Fatal, non-recoverable-in-place GPU faults. When llama.cpp prints one of these the device is
+// lost/limping and every subsequent decode fails — the only fix is to kill + relaunch the server.
+// (Deliberately excludes plain load-time "out of memory" so a too-big model can't restart-loop.)
+const FATAL_GPU_RE = /ErrorDeviceLost|device lost|an illegal memory access|CUDA error|ErrorOutOfDeviceMemory/i
+
 function binDir(): string {
   return path.join(dataDir(), 'llama-bin')
 }
@@ -43,6 +57,27 @@ function setInstalledVariant(variant: string): void {
   fs.writeFileSync(variantFile(), variant)
 }
 
+/**
+ * Which llama.cpp compute backend is installed, inferred from the variant tag
+ * (e.g. "ubuntu-vulkan-x64" → vulkan, "win-cuda-13.1-x64" → cuda, "ubuntu-x64" → cpu).
+ * Used to gate backend-specific behaviour like the GPU keep-warm heartbeat.
+ */
+function serverBackend(): 'cuda' | 'vulkan' | 'cpu' {
+  return backendOf(getInstalledVariant())
+}
+
+function backendOf(variant: string | null): 'cuda' | 'vulkan' | 'cpu' {
+  const v = (variant || '').toLowerCase()
+  if (v.includes('cuda')) return 'cuda'
+  if (v.includes('vulkan')) return 'vulkan'
+  return 'cpu'
+}
+
+/** A CPU-only llama.cpp build (win-cpu-*, ubuntu-x64 without vulkan, etc). */
+function isCpuVariant(variant: string | null): boolean {
+  return backendOf(variant) === 'cpu'
+}
+
 /** Release tag (e.g. "b4321") of the currently installed llama.cpp build, if known. */
 export function getInstalledTag(): string | null {
   try { return fs.readFileSync(tagFile(), 'utf-8').trim() || null } catch { return null }
@@ -53,9 +88,29 @@ function setInstalledTag(tag: string): void {
   fs.writeFileSync(tagFile(), tag)
 }
 
-/** Installed variant + release tag, for display in Settings. */
-export function getInstalledInfo(): { variant: string | null; tag: string | null; installed: boolean } {
-  return { variant: getInstalledVariant(), tag: getInstalledTag(), installed: findServerBin() !== null }
+/** Installed variant + release tag + backend info, for display in Settings. */
+export function getInstalledInfo(): {
+  variant: string | null
+  tag: string | null
+  installed: boolean
+  backend: 'cuda' | 'vulkan' | 'cpu'
+  cpuFallbackDespiteGpu: boolean
+} {
+  const variant = getInstalledVariant()
+  const backend = backendOf(variant)
+  let gpuPresent = false
+  try {
+    const res = detect()
+    gpuPresent = res.gpus.length > 0 || res.hasAmdGpu
+  } catch {}
+  return {
+    variant,
+    tag: getInstalledTag(),
+    installed: findServerBin() !== null,
+    backend,
+    // True when a GPU exists but only the CPU build is installed → generation runs on CPU.
+    cpuFallbackDespiteGpu: backend === 'cpu' && gpuPresent,
+  }
 }
 
 /** Latest available llama.cpp release tag on GitHub (null if the check fails). */
@@ -311,9 +366,11 @@ async function downloadAndInstallLatest(win: BrowserWindow): Promise<string> {
       continue
     }
 
-    // On Windows+CUDA, also download cudart DLLs
-    if (selection.needsCudart && variant === selection.primary && selection.cudartAsset) {
-      const cudart = matchCudartAsset(release.assets, selection.cudartAsset)
+    // On Windows+CUDA, also download the matching cudart DLLs. Do this for whichever CUDA variant
+    // we're currently attempting (not just the primary) — otherwise a fallback CUDA build would
+    // fail verification for lack of its runtime and cascade all the way down to the CPU build.
+    if (selection.needsCudart && variant.includes('cuda')) {
+      const cudart = matchCudartAsset(release.assets, `cudart-llama-bin-${variant}`)
       if (cudart) {
         emitBuild(win, 'Скачивание CUDA runtime…')
         const cudartPath = path.join(dir, cudart.name)
@@ -343,6 +400,17 @@ async function downloadAndInstallLatest(win: BrowserWindow): Promise<string> {
       setInstalledVariant(variant)
       setInstalledTag(release.tag)
       emitBuild(win, `llama-server (${variant} ${release.tag}) готов!`)
+      // If we landed on the CPU build even though a GPU is present, the CUDA/Vulkan builds all
+      // failed to verify (missing runtime, incompatible driver, etc). Generation will run on the
+      // CPU and be slow — make that explicit instead of failing silently (which is exactly what
+      // the user hit: GPU detected, but win-cpu-x64 installed with no warning).
+      const gpuPresent = res.gpus.length > 0 || res.hasAmdGpu
+      if (isCpuVariant(variant) && gpuPresent) {
+        const gpuNames = res.gpus.map((g) => g.name).join(', ') || (res.hasAmdGpu ? 'AMD GPU' : 'GPU')
+        emitBuild(win, `⚠️ Установлена CPU-сборка llama-server, хотя обнаружен ${gpuNames}. ` +
+          `GPU-сборки (CUDA/Vulkan) не запустились — генерация пойдёт на CPU и будет медленной. ` +
+          `Проверьте драйвер NVIDIA/CUDA (или Vulkan runtime) и переустановите llama.cpp в настройках.`)
+      }
       return bin
     }
 
@@ -428,6 +496,18 @@ export function start(
   const selectedGpu = effectiveResources.gpus[0] ?? null
   const la = args ?? computeOptimalArgs(effectiveResources, quant, userCtxSize)
   activeCtxSize = la.ctxSize
+  // Remember how to bring this exact server back up if the GPU device is lost mid-run.
+  intentionalStop = false
+  lastStartCtx = { modelPath, win, quant, userCtxSize }
+  // Loud warning if we're about to run on a CPU-only build while a GPU is present: `--n-gpu-layers`
+  // is silently ignored by CPU builds, so the app would otherwise look like it's using the GPU
+  // (GPU selected in UI, layers=999) while actually running on CPU at a few tok/s.
+  if (isCpuVariant(getInstalledVariant()) && (detected.gpus.length > 0 || detected.hasAmdGpu)) {
+    const names = detected.gpus.map((g) => g.name).join(', ') || 'GPU'
+    const warn = `⚠️ llama-server — CPU-сборка, но обнаружен ${names}. Работа пойдёт на CPU (медленно). Переустановите llama.cpp в настройках после проверки драйвера GPU.`
+    appendServerDebug(`[warn] ${warn}`)
+    if (win) emitBuild(win, warn)
+  }
   const cmdArgs = [
     '--model', modelPath,
     '--host', LLAMA_HOST,
@@ -491,6 +571,9 @@ export function start(
       if (lastServerLog.length > 200) lastServerLog.shift()
       appendServerDebug(`[server] ${line}`)
       if (win) emitBuild(win, `[server] ${line}`)
+      // A lost GPU device never recovers in place — llama.cpp keeps failing every decode. Kill &
+      // relaunch so the app self-heals instead of appearing to "crash" (all requests error out).
+      if (FATAL_GPU_RE.test(line)) scheduleGpuRecovery(win, line)
     }
   }
 
@@ -506,10 +589,15 @@ export function start(
     }
     stopKeepWarm()
     serverProcess = null
+    // Abnormal, unrequested exit (crash / killed by driver) → try to self-heal. Intentional
+    // stops/restarts set `intentionalStop`, so this only fires on genuine crashes.
+    const abnormal = intentionalStop ? false : (code === null ? signal !== 'SIGTERM' : code !== 0)
+    if (abnormal && !recovering) scheduleGpuRecovery(win, `exit code=${code ?? 'null'} signal=${signal ?? 'null'}`)
   })
 }
 
 export function stop(): void {
+  intentionalStop = true
   stopKeepWarm()
   if (serverProcess && serverProcess.exitCode === null) {
     serverProcess.kill('SIGTERM')
@@ -543,6 +631,45 @@ function killOrphanServers(): void {
       }
     }
   } catch {}
+}
+
+/**
+ * Recover from a fatal GPU fault (Vulkan `ErrorDeviceLost`, CUDA illegal access, or an abnormal
+ * crash): kill the wedged server and relaunch it with the same model/ctx so the app self-heals
+ * instead of silently dying on the user. Capped at 3 attempts / 5 min — if the GPU stays wedged
+ * (often needs a driver/system reboot) we stop and surface a clear message rather than loop.
+ */
+function scheduleGpuRecovery(win: BrowserWindow | undefined, reason: string): void {
+  if (recovering) return
+  recovering = true
+  const now = Date.now()
+  recentAutoRestarts = recentAutoRestarts.filter((t) => now - t < 5 * 60_000)
+  if (recentAutoRestarts.length >= 3) {
+    appendServerDebug(`[gpu-recovery] giving up after repeated restarts (${reason}) — GPU likely wedged`)
+    if (win) emitBuild(win, 'GPU повторно теряет устройство. Похоже, драйвер завис — помогает перезагрузка системы/драйвера.')
+    recovering = false
+    return
+  }
+  recentAutoRestarts.push(now)
+  appendServerDebug(`[gpu-recovery] fatal GPU fault (${reason}) — restarting llama-server`)
+  if (win) emitBuild(win, 'GPU device lost — автоматически перезапускаю модельный сервер…')
+
+  const ctx = lastStartCtx
+  intentionalStop = true
+  try { serverProcess?.kill('SIGKILL') } catch {}
+  setTimeout(() => {
+    try { killOrphanServers() } catch {}
+    intentionalStop = false
+    recovering = false
+    if (!ctx) return
+    try {
+      start(ctx.modelPath, ctx.win ?? win, undefined, ctx.quant, ctx.userCtxSize)
+      void waitReady(300, ctx.win ?? win).catch((e) =>
+        appendServerDebug(`[gpu-recovery] waitReady after restart failed: ${String(e?.message || e)}`))
+    } catch (e: any) {
+      appendServerDebug(`[gpu-recovery] restart failed: ${String(e?.message || e)}`)
+    }
+  }, 2500)
 }
 
 export async function waitReady(timeoutSecs = 300, win?: BrowserWindow): Promise<boolean> {
@@ -643,6 +770,17 @@ export function startKeepWarm(): void {
   if (keepWarmTimer) return
   if (!config.get('gpuKeepWarm')) return
   tryEnablePersistenceMode()
+  // The compute heartbeat (a periodic 1-token decode) exists for the NVIDIA *CUDA* backend, whose
+  // 5xx-driver GSP can power-gate the idle GPU and then time out on the next request
+  // ("nvidia-modeset: … waiting for GPU progress"). On the *Vulkan* backend the very same idle
+  // submits do the opposite — they eventually wedge the queue with `vk::Queue::submit:
+  // ErrorDeviceLost`, killing llama-server. So the decode ping only runs on CUDA; persistence mode
+  // (attempted above) is the safe, sufficient measure on Vulkan/CPU.
+  const backend = serverBackend()
+  if (backend !== 'cuda') {
+    appendServerDebug(`keep-warm: decode heartbeat disabled on ${backend} backend (persistence mode only)`)
+    return
+  }
   appendServerDebug(`keep-warm: heartbeat every ${KEEP_WARM_INTERVAL_MS}ms`)
   keepWarmTimer = setInterval(() => { void keepWarmPing() }, KEEP_WARM_INTERVAL_MS)
   if (typeof keepWarmTimer.unref === 'function') keepWarmTimer.unref()

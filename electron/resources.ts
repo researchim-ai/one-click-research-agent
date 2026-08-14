@@ -106,21 +106,21 @@ export function pickBinaryVariant(res: SystemResources): BinarySelection {
   }
 
   if (platform === 'win32') {
-    if (hasNvidia && cudaVersion) {
-      const major = parseFloat(cudaVersion)
-      if (major >= 13) {
-        return {
-          primary: 'win-cuda-13.1-x64',
-          fallbacks: ['win-cuda-12.4-x64', 'win-vulkan-x64', 'win-cpu-x64'],
-          needsCudart: true,
-          cudartAsset: 'cudart-llama-bin-win-cuda-13.1-x64',
-        }
-      }
+    if (hasNvidia) {
+      // An NVIDIA GPU was detected via `nvidia-smi --query-gpu`. Do NOT require a parsed
+      // "CUDA Version:" here — on some laptop/driver combos the plain `nvidia-smi` header parse
+      // fails and cudaVersion comes back null, which previously dropped the whole selection to the
+      // CPU build (win-cpu-x64) with no fallback, silently running on CPU. Instead always pick a
+      // CUDA build (default to the broadly-compatible 12.4 when the version is unknown) and only
+      // fall back to the other CUDA build → Vulkan → CPU as a last resort.
+      const major = cudaVersion ? parseFloat(cudaVersion) : 0
+      const primary = major >= 13 ? 'win-cuda-13.1-x64' : 'win-cuda-12.4-x64'
+      const cudaFallback = major >= 13 ? 'win-cuda-12.4-x64' : 'win-cuda-13.1-x64'
       return {
-        primary: 'win-cuda-12.4-x64',
-        fallbacks: ['win-vulkan-x64', 'win-cpu-x64'],
+        primary,
+        fallbacks: [cudaFallback, 'win-vulkan-x64', 'win-cpu-x64'],
         needsCudart: true,
-        cudartAsset: 'cudart-llama-bin-win-cuda-12.4-x64',
+        cudartAsset: `cudart-llama-bin-${primary}`,
       }
     }
     if (hasAmdGpu) {
@@ -165,10 +165,12 @@ export function getArch(): ModelArchInfo {
 // ---------------------------------------------------------------------------
 
 const REPO_9B   = 'unsloth/Qwen3.5-9B-GGUF'
+const REPO_27B  = 'unsloth/Qwen3.8-27B-GGUF'
 const REPO_35B  = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 const REPO_36B  = 'unsloth/Qwen3.6-35B-A3B-GGUF'
 
 export const FAMILY_QWEN35_9B  = 'qwen3.5-9b'
+export const FAMILY_QWEN38_27B = 'qwen3.8-27b'
 export const FAMILY_QWEN35_35B = 'qwen3.5-35b'
 export const FAMILY_QWEN36_35B = 'qwen3.6-35b'
 
@@ -188,7 +190,6 @@ export const MODEL_FAMILIES: ModelFamily[] = [
     repoId: REPO_35B,
     defaultQuant: 'UD-Q3_K_XL',
     filenameTag: '3.5-35b',
-    recommended: true,
   },
   {
     id: FAMILY_QWEN36_35B,
@@ -197,6 +198,18 @@ export const MODEL_FAMILIES: ModelFamily[] = [
     repoId: REPO_36B,
     defaultQuant: '36-UD-Q3_K_XL',
     filenameTag: '3.6-35b',
+  },
+  // Listed last on purpose: it's the newest / most powerful model, so it sits at the bottom of
+  // the family list even though it's the recommended default (recommended flag drives selection,
+  // not list position).
+  {
+    id: FAMILY_QWEN38_27B,
+    label: 'Qwen3.8-27B',
+    description: 'Dense 27B — рекомендуется по умолчанию для нормальных систем',
+    repoId: REPO_27B,
+    defaultQuant: '27-UD-Q4_K_XL',
+    filenameTag: '3.8-27b',
+    recommended: true,
   },
 ]
 
@@ -247,6 +260,18 @@ export const MODEL_VARIANTS: ModelVariant[] = [
   { family: FAMILY_QWEN36_35B, quant: '36-UD-Q5_K_XL',  bits: 5, label: '35B 3.6 Q5_K_XL — высокое',     sizeMb: 25498, quality: 19, repoId: REPO_36B },
   { family: FAMILY_QWEN36_35B, quant: '36-UD-Q6_K_XL',  bits: 6, label: '35B 3.6 Q6_K_XL',              sizeMb: 31027, quality: 20, repoId: REPO_36B },
   { family: FAMILY_QWEN36_35B, quant: '36-UD-Q8_K_XL',  bits: 8, label: '35B 3.6 Q8_K_XL — максимум',    sizeMb: 39629, quality: 21, repoId: REPO_36B },
+
+  // --- Qwen3.8-27B (dense, рекомендуемая по умолчанию для нормальных систем) ---
+  // Highest quality tier so the auto-selector defaults capable systems to this family.
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_XXS',  bits: 2, label: '27B IQ2_XXS — минимальный',    sizeMb: 8593,  quality: 22, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_M',    bits: 2, label: '27B IQ2_M',                    sizeMb: 9842,  quality: 23, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q2_K_XL',  bits: 2, label: '27B Q2_K_XL',                  sizeMb: 10182, quality: 24, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ3_XXS',  bits: 3, label: '27B IQ3_XXS',                  sizeMb: 11362, quality: 25, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q3_K_XL',  bits: 3, label: '27B Q3_K_XL',                  sizeMb: 12818, quality: 26, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q4_K_XL',  bits: 4, label: '27B Q4_K_XL — рекоменд.',      sizeMb: 17093, quality: 27, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q5_K_XL',  bits: 5, label: '27B Q5_K_XL — высокое',        sizeMb: 19282, quality: 28, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q6_K_XL',  bits: 6, label: '27B Q6_K_XL',                  sizeMb: 24723, quality: 29, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-Q8_K_XL',  bits: 8, label: '27B Q8_K_XL — максимум',       sizeMb: 30001, quality: 30, repoId: REPO_27B },
 ]
 
 // Per-layer VRAM for weight offloading (scales with model file size).
@@ -254,6 +279,8 @@ export const MODEL_VARIANTS: ModelVariant[] = [
 // 9B dense: Q4_K_XL ≈ 6 GB, 36 layers → ~150 MB/layer
 const LAYER_REFS_BY_FAMILY: Record<string, { modelMb: number; layerMb: number }> = {
   [FAMILY_QWEN35_9B]:  { modelMb: 6113,  layerMb: 150 },
+  // 27B dense: Q4_K_XL ≈ 17 GB, ~48 blocks → ~350 MB/layer (until the real GGUF arch is read).
+  [FAMILY_QWEN38_27B]: { modelMb: 17093, layerMb: 350 },
   [FAMILY_QWEN35_35B]: { modelMb: 21094, layerMb: 500 },
   [FAMILY_QWEN36_35B]: { modelMb: 21094, layerMb: 500 },
 }
@@ -316,6 +343,17 @@ export function evaluateVariants(res: SystemResources): ModelVariantInfo[] {
   if (smallSystem) {
     const idx9b = results.findIndex((r) => r.quant === '9B-UD-Q3_K_XL' && r.fits)
     if (idx9b >= 0) { bestFittingIdx = idx9b }
+  }
+
+  // Capable ("normal") systems default to Qwen3.8-27B — the recommended model.
+  // Pick the best 27B quant that still gives a usable (>= 16K) context.
+  if (bestFittingIdx === -1) {
+    for (let i = results.length - 1; i >= 0; i--) {
+      if (results[i].family === FAMILY_QWEN38_27B && results[i].fits && results[i].maxCtx >= 16384) {
+        bestFittingIdx = i
+        break
+      }
+    }
   }
 
   // Otherwise pick the highest quality that gives >= 16K context
@@ -557,7 +595,8 @@ function selectPresetForTargetCtx(
 
 function selectPreset(ramTotalMb: number, freeVramMb: number, isLaptop: boolean): Preset {
   const defaultVariant =
-    MODEL_VARIANTS.find((v) => v.family === FAMILY_QWEN35_35B && v.quant === 'UD-Q3_K_XL')
+    MODEL_VARIANTS.find((v) => v.family === FAMILY_QWEN38_27B && v.quant === '27-UD-Q4_K_XL')
+    ?? MODEL_VARIANTS.find((v) => v.family === FAMILY_QWEN35_35B && v.quant === 'UD-Q3_K_XL')
     ?? MODEL_VARIANTS[0]
   const memMb = modelMemoryMb(defaultVariant)
   const layMb = layerVramMb(defaultVariant)

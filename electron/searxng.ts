@@ -1,9 +1,16 @@
-import { execFileSync, execSync } from 'child_process'
+import { execFile, execFileSync, execSync } from 'child_process'
+import { promisify } from 'util'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import type { AppConfig } from './config'
 import type { WebSearchStatus } from './types'
+
+const execFileAsync = promisify(execFile)
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 const MANAGED_SEARXNG_PORT = 18080
 const MANAGED_SEARXNG_IMAGE = 'docker.io/searxng/searxng:latest'
@@ -116,8 +123,7 @@ function createManagedContainer(): void {
   ], 120000)
 }
 
-function ensureManagedJsonApiEnabled(): void {
-  const script = `
+const JSON_API_PATCH_SCRIPT = `
 from pathlib import Path
 
 path = Path('/etc/searxng/settings.yml')
@@ -162,7 +168,9 @@ elif any(line.strip() == '- json' for line in lines):
 else:
     raise SystemExit('failed to enable json format in settings.yml')
 `
-  const out = runDocker(['exec', MANAGED_SEARXNG_CONTAINER, 'python', '-c', script], 30000).trim()
+
+function ensureManagedJsonApiEnabled(): void {
+  const out = runDocker(['exec', MANAGED_SEARXNG_CONTAINER, 'python', '-c', JSON_API_PATCH_SCRIPT], 30000).trim()
   if (out === 'patched') {
     runDocker(['restart', MANAGED_SEARXNG_CONTAINER], 120000)
   }
@@ -245,6 +253,241 @@ export function ensureWebSearchBackend(cfg: Pick<AppConfig, 'webSearchProvider' 
 
   ensureManagedSearxng()
   return getWebSearchStatus(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Async (non-blocking) variants for the Electron MAIN process.
+//
+// The sync functions above spawn Docker via execFileSync and busy-wait with
+// execSync('sleep') — fine on the agent-worker (a separate process), but on the
+// main process a first-run `docker pull` (up to 5 min) froze the event loop, so
+// the OS showed "one-click-research-agent is not responding". These awaited
+// variants keep the main event loop free while the container is pulled/started.
+// ---------------------------------------------------------------------------
+
+async function runDockerAsync(args: string[], timeout = 120000): Promise<string> {
+  const { stdout } = await execFileAsync('docker', args, {
+    encoding: 'utf-8',
+    timeout,
+    maxBuffer: 1024 * 1024 * 10,
+  })
+  return stdout
+}
+
+async function dockerAvailableAsync(): Promise<boolean> {
+  try {
+    await execFileAsync('docker', ['--version'], { timeout: 5000 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function healthcheckAsync(baseUrl: string): Promise<boolean> {
+  return (await probeSearxngAsync(baseUrl)).jsonOk
+}
+
+type SearxngProbe = {
+  /** TCP/HTTP layer responded at all (even with an error status). */
+  reachable: boolean
+  /** The JSON search API returned parseable JSON — required for search_web to work. */
+  jsonOk: boolean
+  status?: number
+  error?: string
+}
+
+// Distinguishes the three states that all previously collapsed into "unreachable":
+//   1. jsonOk           — JSON API works, fully usable.
+//   2. reachable only   — host answers but the JSON API is blocked/disabled (very common:
+//                         `formats: [html]` only, or a limiter/bot-detection). The browser
+//                         still works because it uses the HTML UI, not the JSON API.
+//   3. neither          — genuinely unreachable (wrong URL/port, firewall, not running).
+async function probeSearxngAsync(baseUrl: string): Promise<SearxngProbe> {
+  try {
+    const res = await fetch(`${baseUrl}/search?q=healthcheck&format=json`, {
+      headers: { 'User-Agent': 'one-click-research-agent/0.1', Accept: 'application/json' },
+      signal: AbortSignal.timeout(6000),
+    })
+    if (!res.ok) return { reachable: true, jsonOk: false, status: res.status }
+    const text = await res.text()
+    try {
+      JSON.parse(text)
+      return { reachable: true, jsonOk: true, status: res.status }
+    } catch {
+      // 200 but not JSON (e.g. an HTML page/limiter interstitial) → JSON API not usable.
+      return { reachable: true, jsonOk: false, status: res.status }
+    }
+  } catch (jsonErr: any) {
+    // JSON request failed at the network layer — probe the HTML root to tell "host is up but
+    // JSON blocked" apart from "host is completely unreachable".
+    try {
+      const res2 = await fetch(baseUrl, {
+        headers: { 'User-Agent': 'one-click-research-agent/0.1' },
+        signal: AbortSignal.timeout(6000),
+      })
+      return { reachable: true, jsonOk: false, status: res2.status }
+    } catch (rootErr: any) {
+      return { reachable: false, jsonOk: false, error: String(rootErr?.message || jsonErr?.message || rootErr || jsonErr) }
+    }
+  }
+}
+
+async function inspectContainerStateAsync(): Promise<'missing' | 'running' | 'stopped'> {
+  try {
+    const out = (await runDockerAsync(['inspect', '-f', '{{.State.Running}}', MANAGED_SEARXNG_CONTAINER], 10000)).trim()
+    return out === 'true' ? 'running' : 'stopped'
+  } catch {
+    return 'missing'
+  }
+}
+
+async function managedLogsTailAsync(lines = 80): Promise<string> {
+  try {
+    return (await runDockerAsync(['logs', '--tail', String(lines), MANAGED_SEARXNG_CONTAINER], 15000)).trim()
+  } catch (e: any) {
+    return String(e?.stderr || e?.message || e).trim()
+  }
+}
+
+async function removeManagedContainerAsync(): Promise<void> {
+  try {
+    await runDockerAsync(['rm', '-f', MANAGED_SEARXNG_CONTAINER], 30000)
+  } catch {}
+}
+
+async function createManagedContainerAsync(): Promise<void> {
+  const cacheDir = ensureCacheDir()
+  await runDockerAsync(['pull', MANAGED_SEARXNG_IMAGE], 300000)
+  await runDockerAsync([
+    'run', '-d',
+    '--name', MANAGED_SEARXNG_CONTAINER,
+    '-p', `127.0.0.1:${MANAGED_SEARXNG_PORT}:8080`,
+    '-v', `${cacheDir}:/var/cache/searxng`,
+    MANAGED_SEARXNG_IMAGE,
+  ], 120000)
+}
+
+async function ensureManagedJsonApiEnabledAsync(): Promise<void> {
+  const out = (await runDockerAsync(['exec', MANAGED_SEARXNG_CONTAINER, 'python', '-c', JSON_API_PATCH_SCRIPT], 30000)).trim()
+  if (out === 'patched') {
+    await runDockerAsync(['restart', MANAGED_SEARXNG_CONTAINER], 120000)
+  }
+}
+
+async function waitForHealthyAsync(baseUrl: string, timeoutMs = 60000): Promise<void> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    if (await healthcheckAsync(baseUrl)) return
+    await delay(2000)
+  }
+  const logs = await managedLogsTailAsync(80)
+  throw new Error(`SearXNG did not become healthy in time.\nRecent container logs:\n${logs}`)
+}
+
+export async function ensureManagedSearxngAsync(): Promise<string> {
+  if (!(await dockerAvailableAsync())) {
+    throw new Error('Docker is not available. Switch web search mode to "Existing SearXNG URL" or install Docker.')
+  }
+  const cachedBaseUrl = managedBaseUrl()
+  if (Date.now() - managedVerifiedAt < MANAGED_VERIFY_TTL_MS) return cachedBaseUrl
+  if (await healthcheckAsync(cachedBaseUrl)) {
+    managedVerifiedAt = Date.now()
+    return cachedBaseUrl
+  }
+
+  const state = await inspectContainerStateAsync()
+  if (state === 'missing') {
+    await createManagedContainerAsync()
+  } else if (state === 'stopped') {
+    await removeManagedContainerAsync()
+    await createManagedContainerAsync()
+  }
+
+  try {
+    await ensureManagedJsonApiEnabledAsync()
+    const baseUrl = managedBaseUrl()
+    await waitForHealthyAsync(baseUrl)
+    managedVerifiedAt = Date.now()
+    return baseUrl
+  } catch {
+    await removeManagedContainerAsync()
+    await createManagedContainerAsync()
+    await ensureManagedJsonApiEnabledAsync()
+    const baseUrl = managedBaseUrl()
+    await waitForHealthyAsync(baseUrl)
+    managedVerifiedAt = Date.now()
+    return baseUrl
+  }
+}
+
+export async function ensureWebSearchBackendAsync(cfg: Pick<AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>): Promise<WebSearchStatus> {
+  if (cfg.webSearchProvider === 'disabled') {
+    return getWebSearchStatusAsync(cfg)
+  }
+  if (cfg.webSearchProvider === 'custom-searxng') {
+    const baseUrl = normalizeBaseUrl(cfg.searxngBaseUrl)
+    if (!baseUrl) throw new Error('Custom SearXNG URL is empty.')
+    const probe = await probeSearxngAsync(baseUrl)
+    if (probe.jsonOk) return getWebSearchStatusAsync(cfg)
+    if (probe.reachable) {
+      throw new Error(
+        `SearXNG at ${baseUrl} is reachable, but its JSON API is not usable${probe.status ? ` (HTTP ${probe.status})` : ''}. ` +
+        `The app needs the JSON format, but your browser only opens the HTML page. On that instance, in settings.yml enable:\n` +
+        `  search:\n    formats:\n      - html\n      - json\n` +
+        `then restart SearXNG. If a limiter/bot-detection is on, allow this client or disable the limiter.`,
+      )
+    }
+    throw new Error(
+      `Custom SearXNG is unreachable at ${baseUrl}${probe.error ? ` — ${probe.error}` : ''}. ` +
+      `Check the URL and port, that the instance is running, and that a firewall/LAN is not blocking the connection from this machine.`,
+    )
+  }
+  await ensureManagedSearxngAsync()
+  return getWebSearchStatusAsync(cfg)
+}
+
+export async function getWebSearchStatusAsync(cfg: Pick<AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>): Promise<WebSearchStatus> {
+  const dockerOk = await dockerAvailableAsync()
+  const customUrl = normalizeBaseUrl(cfg.searxngBaseUrl)
+
+  if (cfg.webSearchProvider === 'disabled') {
+    return { provider: 'disabled', dockerAvailable: dockerOk, customUrlConfigured: Boolean(customUrl), effectiveBaseUrl: null, healthy: false, detail: 'Web search disabled.' }
+  }
+
+  if (cfg.webSearchProvider === 'custom-searxng') {
+    const probe = customUrl ? await probeSearxngAsync(customUrl) : null
+    const healthy = Boolean(probe?.jsonOk)
+    return {
+      provider: 'custom-searxng',
+      dockerAvailable: dockerOk,
+      customUrlConfigured: Boolean(customUrl),
+      effectiveBaseUrl: customUrl,
+      healthy,
+      detail: !customUrl
+        ? 'Custom SearXNG mode selected but URL is empty.'
+        : healthy
+          ? 'Custom SearXNG URL is reachable and its JSON API works.'
+          : probe?.reachable
+            ? `Custom SearXNG at ${customUrl} is reachable, but its JSON API is disabled/blocked${probe.status ? ` (HTTP ${probe.status})` : ''}. Enable "search.formats: [html, json]" in settings.yml and restart it.`
+            : `Custom SearXNG URL is configured but not reachable right now${probe?.error ? ` — ${probe.error}` : ''}.`,
+    }
+  }
+
+  const running = (await inspectContainerStateAsync()) === 'running'
+  const baseUrl = running ? managedBaseUrl() : null
+  const healthy = baseUrl ? await healthcheckAsync(baseUrl) : false
+  return {
+    provider: 'managed-searxng',
+    dockerAvailable: dockerOk,
+    customUrlConfigured: Boolean(customUrl),
+    effectiveBaseUrl: baseUrl,
+    healthy,
+    detail: !dockerOk
+      ? 'Docker is not available for managed local SearXNG.'
+      : healthy ? 'Managed local SearXNG is running.'
+        : running ? 'Managed local SearXNG container is running but not healthy yet.'
+          : 'Managed local SearXNG will auto-start on first web search.',
+  }
 }
 
 export function resolveWebSearchBaseUrl(cfg: Pick<AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>, autoStartManaged = false): string | null {

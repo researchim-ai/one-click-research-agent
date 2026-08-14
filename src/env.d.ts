@@ -29,7 +29,7 @@ interface ElectronAPI {
   autoSetup(): Promise<void>
   downloadModel(): Promise<string>
   ensureLlama(): Promise<void>
-  getLlamaInfo(checkLatest?: boolean): Promise<{ variant: string | null; tag: string | null; installed: boolean; latestTag: string | null; updateAvailable: boolean }>
+  getLlamaInfo(checkLatest?: boolean): Promise<{ variant: string | null; tag: string | null; installed: boolean; backend: 'cuda' | 'vulkan' | 'cpu'; cpuFallbackDespiteGpu: boolean; latestTag: string | null; updateAvailable: boolean }>
   updateLlama(): Promise<{ previousTag: string | null; tag: string | null; updated: boolean; restarted: boolean; wasRunning: boolean }>
   startServer(): Promise<void>
   stopServer(): Promise<void>

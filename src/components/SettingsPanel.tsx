@@ -166,7 +166,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setFamilies(fams)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
-      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q3_K_XL')
+      const quant = pickQuantForVariants(v, c.lastQuant || '27-UD-Q4_K_XL')
       setSelectedQuant(quant)
       const activeVariant = v.find((vi: ModelVariantInfo) => vi.quant === quant)
       const familyId = activeVariant?.family
@@ -356,7 +356,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setTools(t)
       setSelectedGpuMode(gpuMode)
       setSelectedGpuIndex(gpuIndex)
-      const quant = pickQuantForVariants(v, c.lastQuant || 'UD-Q3_K_XL')
+      const quant = pickQuantForVariants(v, c.lastQuant || '27-UD-Q4_K_XL')
       setSelectedQuant(quant)
       const variant = v.find((entry) => entry.quant === quant)
       const famIdForReset = variant?.family
@@ -644,7 +644,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 
 function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
   const L = appLanguage === 'ru'
-  const [info, setInfo] = useState<{ tag: string | null; latestTag: string | null; updateAvailable: boolean; installed: boolean } | null>(null)
+  const [info, setInfo] = useState<{ tag: string | null; latestTag: string | null; updateAvailable: boolean; installed: boolean; variant: string | null; backend: 'cuda' | 'vulkan' | 'cpu'; cpuFallbackDespiteGpu: boolean } | null>(null)
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState('')
   const [done, setDone] = useState<string | null>(null)
@@ -692,6 +692,14 @@ function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
                 : (info.tag ? <span className="ml-2 text-emerald-500">{L ? '● актуально' : '● up to date'}</span> : null)}
             </div>
           )}
+          {info?.installed && info.variant && (
+            <div className="text-[11px] text-zinc-500 mt-0.5">
+              {L ? 'Сборка' : 'Build'}: <span className="font-mono">{info.variant}</span>
+              {info.backend === 'cpu'
+                ? <span className="ml-2 text-zinc-400">{L ? '● CPU' : '● CPU'}</span>
+                : <span className="ml-2 text-emerald-500">● {info.backend.toUpperCase()}</span>}
+            </div>
+          )}
         </div>
         <button
           onClick={handleUpdate}
@@ -701,6 +709,13 @@ function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
           {busy ? (L ? 'Обновление…' : 'Updating…') : (L ? 'Обновить до последней' : 'Update to latest')}
         </button>
       </div>
+      {info?.cpuFallbackDespiteGpu && (
+        <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-100/90">
+          {L
+            ? 'Обнаружен GPU, но установлена CPU-сборка llama.cpp — генерация идёт на процессоре (медленно). GPU-сборки (CUDA/Vulkan) не запустились: проверьте драйвер NVIDIA/CUDA (или Vulkan runtime) и нажмите «Обновить до последней», чтобы переустановить движок.'
+            : 'A GPU was detected but a CPU-only llama.cpp build is installed — generation runs on the CPU (slow). The CUDA/Vulkan builds failed to launch: check your NVIDIA/CUDA driver (or Vulkan runtime) and click “Update to latest” to reinstall the engine.'}
+        </div>
+      )}
       {busy && progress && <p className="text-xs text-zinc-500 mt-3 font-mono truncate">{progress}</p>}
       {done && <p className="text-xs mt-3 text-zinc-400">{done}</p>}
     </SettingsSection>

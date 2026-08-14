@@ -7,8 +7,8 @@ import type { DownloadProgress, ModelVariant } from './types'
 import * as config from './config'
 import { MODEL_VARIANTS, MODEL_FAMILIES, getModelFamily } from './resources'
 
-const DEFAULT_QUANT = 'UD-Q3_K_XL'
-const DEFAULT_REPO_ID = 'unsloth/Qwen3.5-35B-A3B-GGUF'
+const DEFAULT_QUANT = '27-UD-Q4_K_XL'
+const DEFAULT_REPO_ID = 'unsloth/Qwen3.8-27B-GGUF'
 
 function normalizeToken(value: string): string {
   return value.toLowerCase().replace(/-/g, '_')
@@ -19,8 +19,8 @@ function findVariant(quant: string): ModelVariant | null {
 }
 
 function rawQuantSegment(quant: string): string {
-  // Strip family-specific prefix (9B-, 36-) to get the canonical UD-* segment.
-  return quant.replace(/^9B-/, '').replace(/^36-/, '')
+  // Strip family-specific prefix (9B-, 27-, 36-) to get the canonical UD-* segment.
+  return quant.replace(/^9B-/, '').replace(/^27-/, '').replace(/^36-/, '')
 }
 
 function filenameTagForVariant(variant: ModelVariant | null): string | null {

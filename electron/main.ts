@@ -67,7 +67,7 @@ import * as modelManager from './model-manager'
 import * as serverManager from './server-manager'
 import * as config from './config'
 import { getBuiltinToolDefinitions } from './tools'
-import { ensureWebSearchBackend, getWebSearchStatus } from './searxng'
+import { ensureWebSearchBackendAsync, getWebSearchStatusAsync } from './searxng'
 import { getSourceTracker } from './sources'
 import * as embed from './embed'
 import * as planner from './planner'
@@ -543,7 +543,7 @@ function registerIpcHandlers() {
   ipcMain.handle(
     'get-web-search-status',
     (_e, override?: Pick<config.AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>) =>
-      getWebSearchStatus({
+      getWebSearchStatusAsync({
         webSearchProvider: override?.webSearchProvider ?? config.load().webSearchProvider,
         searxngBaseUrl: override?.searxngBaseUrl ?? config.load().searxngBaseUrl,
       }),
@@ -551,7 +551,7 @@ function registerIpcHandlers() {
   ipcMain.handle(
     'ensure-web-search',
     (_e, override?: Pick<config.AppConfig, 'webSearchProvider' | 'searxngBaseUrl'>) =>
-      ensureWebSearchBackend({
+      ensureWebSearchBackendAsync({
         webSearchProvider: override?.webSearchProvider ?? config.load().webSearchProvider,
         searxngBaseUrl: override?.searxngBaseUrl ?? config.load().searxngBaseUrl,
       }),
