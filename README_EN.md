@@ -47,7 +47,7 @@ Three product principles:
 - **Research library**: browse past runs, open reports, delete them from disk.
 - **Message queue**: while the agent is working you can keep typing follow-up tasks — they stack up and run one by one.
 - **Editable prompts**: all system prompts live in `prompts/*.md` and can be overridden by the user.
-- **Local server management**: model setup, one-click `llama.cpp` update, and an optional GPU keep-warm to avoid idle-related driver issues.
+- **Local server management**: model setup, one-click `llama.cpp` update, and server restart.
 
 ## How the managed research runs
 
@@ -101,7 +101,6 @@ npm run package:linux  # package for Linux (AppImage + deb)
 The settings panel includes:
 
 - model and GPU mode selection, `llama.cpp` update and server restart;
-- **GPU keep-warm** — periodic pings that keep the GPU active (working around some idle driver bugs);
 - **AI source-screening budget** — how long to give the LLM for semantic screening;
 - web search via `SearXNG`: `disabled` / `managed local` (Docker) / `custom URL`;
 - research presets and profiles (`Universal`, `ML/AI`, `Biology`, `Math`, `Finance`, `Paper Reproduction`, etc.);

@@ -44,6 +44,8 @@ interface ElectronAPI {
   getGitNumstat(workspace: string): Promise<import('../electron/git').GitNumstatEntry[]>
   getGitFileAtHead(workspace: string, relativePath: string): Promise<string | null>
   readFileContent(filePath: string): Promise<{ content: string; size: number; lines: number }>
+  readFileDataUrl(filePath: string): Promise<{ dataUrl: string | null; size: number; mime: string; tooLarge: boolean }>
+  openPath(targetPath: string): Promise<string>
   writeFile(filePath: string, content: string): Promise<void>
   tsGetDefinition(workspacePath: string, filePath: string, fileContent: string, line: number, column: number): Promise<{ path: string; startLine: number; startColumn: number; endLine: number; endColumn: number } | null>
   tsGetHover(workspacePath: string, filePath: string, fileContent: string, line: number, column: number): Promise<{ contents: string } | null>

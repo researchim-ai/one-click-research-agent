@@ -7,6 +7,12 @@ interface Props {
   onClose: () => void
   workspace: string
   appLanguage?: 'ru' | 'en'
+  /**
+   * Set only when the active chat was explicitly started/resumed as managed deep-research.
+   * When null the drawer shows a plain activity timeline (no research phase/gate overlay),
+   * so ordinary chats don't inherit a stale research run graph from the workspace.
+   */
+  researchOutputDir?: string | null
   steps: RunStep[]
   currentPhase: AgentActivityPhase | null
   activityLabel: string | null
@@ -58,21 +64,30 @@ const STATUS_DOT: Record<RunStep['status'], string> = {
   info: 'bg-zinc-500',
 }
 
-export function RunActivityDrawer({ open, onClose, workspace, appLanguage = 'ru', steps, currentPhase, activityLabel, running, failedCount, toolStats }: Props) {
+export function RunActivityDrawer({ open, onClose, workspace, appLanguage = 'ru', researchOutputDir, steps, currentPhase, activityLabel, running, failedCount, toolStats }: Props) {
   const L = appLanguage === 'ru'
+  const isResearch = !!researchOutputDir
   const [graph, setGraph] = useState<RunGraphData | null>(null)
 
   const refresh = useCallback(async () => {
     if (!workspace || !window.api?.getRunGraph) return
-    try { setGraph(await window.api.getRunGraph(workspace)) } catch { /* keep last */ }
-  }, [workspace])
+    // Only pull the research FSM/gate overlay for chats that are actually managed
+    // research runs, scoped to this chat's run dir. Ordinary chats stay graph-less
+    // so they never inherit another run's phases/gates/topic.
+    if (!isResearch) { setGraph(null); return }
+    try { setGraph(await window.api.getRunGraph(workspace, researchOutputDir ?? undefined)) } catch { /* keep last */ }
+  }, [workspace, isResearch, researchOutputDir])
 
   useEffect(() => {
     if (!open) return
     refresh()
+    if (!isResearch) return
     const id = window.setInterval(refresh, 3000)
     return () => window.clearInterval(id)
-  }, [open, refresh])
+  }, [open, refresh, isResearch])
+
+  // Fallback "last tool" for ordinary chats (no research graph): most recent tool step.
+  const lastTool = graph?.lastTool || [...steps].reverse().find((s) => s.kind === 'tool')?.name || null
 
   const label = (s: string) => (STATE_LABELS[s] ? (L ? STATE_LABELS[s].ru : STATE_LABELS[s].en) : s)
 
@@ -95,6 +110,9 @@ export function RunActivityDrawer({ open, onClose, workspace, appLanguage = 'ru'
           <div className="flex items-center gap-2">
             <span className={`inline-block w-2 h-2 rounded-full ${running ? 'bg-blue-400 animate-pulse' : 'bg-zinc-600'}`} />
             <span className="text-sm font-semibold text-zinc-100">{L ? 'Ход выполнения' : 'Run activity'}</span>
+            {isResearch && (
+              <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-500/15 border border-blue-500/40 text-blue-200">{L ? 'Исследование' : 'Research'}</span>
+            )}
           </div>
           <button
             onClick={onClose}
@@ -112,13 +130,13 @@ export function RunActivityDrawer({ open, onClose, workspace, appLanguage = 'ru'
                 ? (activityLabel || (currentPhase ? (L ? PHASE_LABELS[currentPhase].ru : PHASE_LABELS[currentPhase].en) : (L ? 'Работает…' : 'Working…')))
                 : (L ? 'Ожидание / простой' : 'Idle')}
             </div>
-            {graph?.lastTool && (
-              <div className="text-[11px] text-zinc-500 mt-0.5 font-mono">{L ? 'Последний инструмент' : 'Last tool'}: {graph.lastTool}</div>
+            {lastTool && (
+              <div className="text-[11px] text-zinc-500 mt-0.5 font-mono">{L ? 'Последний инструмент' : 'Last tool'}: {lastTool}</div>
             )}
           </div>
 
-          {/* Research phase graph (only for managed runs) */}
-          {graph && (
+          {/* Research phase graph (only for managed research chats) */}
+          {isResearch && graph && (
             <div>
               <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">{L ? 'Фаза исследования' : 'Research phase'}</div>
               <div className="flex flex-wrap gap-1.5">
@@ -151,7 +169,7 @@ export function RunActivityDrawer({ open, onClose, workspace, appLanguage = 'ru'
           )}
 
           {/* Gate health */}
-          {graph && failingGates.length > 0 && (
+          {isResearch && graph && failingGates.length > 0 && (
             <div>
               <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">{L ? 'Проблемные гейты' : 'Gate issues'}</div>
               <div className="space-y-1">

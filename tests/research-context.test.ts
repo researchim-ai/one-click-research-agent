@@ -175,6 +175,20 @@ describe('resolveResearchOutputDir does not leak a previous run into a fresh cha
     expect(resolveResearchOutputDir(ws, history, 'дай ещё источников')).toBe(runDir)
     fs.rmSync(ws, { recursive: true, force: true })
   })
+
+  it('does NOT activate managed mode from a run dir the model itself produced (tool/assistant messages)', () => {
+    // The MCTS-AlphaZero bug: a plain chat where the model spontaneously called build_corpus /
+    // search with an output_dir. The `.research/...` path then lived only in tool/assistant
+    // messages — it must NOT retro-activate the guarded deep-research workflow.
+    const { ws, runDir } = seedWorkspaceWithRun()
+    const history = [
+      { role: 'user', content: 'сделай mcts alphazero для шахмат' },
+      { role: 'assistant', content: `Собираю корпус в ${runDir}` },
+      { role: 'tool', content: `build_corpus ok\noutput_dir: "${runDir}"\n24 rows` },
+    ]
+    expect(resolveResearchOutputDir(ws, history, 'добавь функцию оценки позиции')).toBeNull()
+    fs.rmSync(ws, { recursive: true, force: true })
+  })
 })
 
 describe('resolveResearchContextMode requires an explicit trigger', () => {

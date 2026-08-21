@@ -87,9 +87,16 @@ export function resolveResearchOutputDir(
   currentMessage?: string,
 ): string | null {
   // Explicit, session-scoped signals only: a run dir named in THIS turn (the New Research kickoff
-  // message, or a pasted `.research/...` path) or anywhere in THIS session's history.
+  // message, or a pasted `.research/...` path) or in a USER-authored message of this session.
+  //
+  // Crucially we scan ONLY user-role messages. Scanning every role also matched `.research/...`
+  // paths that the model itself produced in tool calls/results, which silently promoted an
+  // ordinary chat (e.g. "build an MCTS AlphaZero") into the guarded deep-research workflow the
+  // moment the model called build_corpus/search with an output_dir. Managed mode must reflect the
+  // user's explicit intent, never the model's spontaneous tool use.
+  const userMessages = messages.filter((m) => m.role === 'user')
   const explicit = extractResearchOutputDirFromText(currentMessage ?? '')
-    || extractResearchOutputDirFromMessages(messages)
+    || extractResearchOutputDirFromMessages(userMessages)
   if (explicit) return explicit
   // The workspace-global "last run" pointers (run-state.json / newest .research dir) are NOT
   // session-scoped. Using them unconditionally made every brand-new, unrelated chat (e.g.

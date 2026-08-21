@@ -1,5 +1,7 @@
 import { useState, useCallback } from 'react'
 
+export type FileKind = 'text' | 'image' | 'pdf' | 'video' | 'audio' | 'binary'
+
 export interface OpenFile {
   path: string
   name: string
@@ -7,6 +9,36 @@ export interface OpenFile {
   language: string
   lines: number
   size: number
+  kind: FileKind
+  /** base64 data URL for previewable media (image/pdf/audio/video); null for binary/oversized. */
+  dataUrl?: string | null
+  mime?: string
+  tooLarge?: boolean
+}
+
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'jfif', 'gif', 'webp', 'bmp', 'ico', 'svg', 'avif', 'apng'])
+const PDF_EXT = new Set(['pdf'])
+const VIDEO_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mkv', 'ogv', 'avi'])
+const AUDIO_EXT = new Set(['mp3', 'wav', 'ogg', 'oga', 'flac', 'm4a', 'aac', 'opus'])
+// Common opaque binary formats — shown as a metadata placeholder, never as text.
+const BINARY_EXT = new Set([
+  'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar',
+  'exe', 'dll', 'so', 'dylib', 'bin', 'o', 'a', 'node', 'wasm',
+  'class', 'jar', 'pyc', 'pdb',
+  'woff', 'woff2', 'ttf', 'otf', 'eot',
+  'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+  'psd', 'ai', 'sketch', 'fig', 'blend',
+  'db', 'sqlite', 'sqlite3', 'dat', 'pack', 'idx',
+])
+
+function detectKind(filename: string): FileKind {
+  const ext = filename.toLowerCase().split('.').pop() ?? ''
+  if (IMAGE_EXT.has(ext)) return 'image'
+  if (PDF_EXT.has(ext)) return 'pdf'
+  if (VIDEO_EXT.has(ext)) return 'video'
+  if (AUDIO_EXT.has(ext)) return 'audio'
+  if (BINARY_EXT.has(ext)) return 'binary'
+  return 'text'
 }
 
 const EXT_TO_LANG: Record<string, string> = {
@@ -107,11 +139,17 @@ export function useEditor() {
       return
     }
 
+    const name = filePath.split(/[\\/]/).pop() ?? filePath
+    const kind = detectKind(name)
     try {
-      const { content, size, lines } = await window.api.readFileContent(filePath)
-      const name = filePath.split(/[\\/]/).pop() ?? filePath
-      const language = detectLanguage(name)
-      const file: OpenFile = { path: filePath, name, content, language, lines, size }
+      let file: OpenFile
+      if (kind === 'text') {
+        const { content, size, lines } = await window.api.readFileContent(filePath)
+        file = { path: filePath, name, content, language: detectLanguage(name), lines, size, kind }
+      } else {
+        const { dataUrl, size, mime, tooLarge } = await window.api.readFileDataUrl(filePath)
+        file = { path: filePath, name, content: '', language: 'plaintext', lines: 0, size, kind, dataUrl, mime, tooLarge }
+      }
       setOpenFiles((prev) => [...prev, file])
       setActiveFilePath(filePath)
     } catch (e: any) {
@@ -132,13 +170,15 @@ export function useEditor() {
   }, [activeFilePath])
 
   const refreshFile = useCallback(async (filePath: string) => {
+    const target = openFiles.find((f) => f.path === filePath)
+    if (target && target.kind !== 'text') return
     try {
       const { content, size, lines } = await window.api.readFileContent(filePath)
       setOpenFiles((prev) =>
         prev.map((f) => f.path === filePath ? { ...f, content, size, lines } : f)
       )
     } catch {}
-  }, [])
+  }, [openFiles])
 
   const updateFileContent = useCallback((filePath: string, content: string) => {
     setOpenFiles((prev) =>

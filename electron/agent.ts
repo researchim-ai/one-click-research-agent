@@ -1,6 +1,6 @@
 import { getBuiltinToolDefinitions, executeTool, executeToolAsync, executeCustomTool, isAsyncTool } from './tools'
 import type { AgentEvent, AgentActivity } from './types'
-import type { AppConfig } from './config'
+import type { AppConfig, GenerationMode } from './config'
 import * as config from './config'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
@@ -222,7 +222,41 @@ function doQueryActualCtxSize(): Promise<void> { return currentBridge!.queryActu
 function doIsCancelRequested(): boolean { return currentBridge!.isCancelRequested() }
 
 function getMaxIterations(): number { return doGetConfig().maxIterations || 200 }
+// Auxiliary/tool-side LLM calls (screening, sub-research, summaries) keep a low, near-deterministic
+// temperature independent of the main-response generation mode.
 function getBaseTemperature(): number { return doGetConfig().temperature ?? 0.3 }
+
+// Author-recommended sampling for Qwen3.8's two generation regimes. Applied to the MAIN model
+// responses (the agent turn), not to auxiliary tool-side LLM calls. This preset drives BOTH
+// regular chat and managed research runs (the mode is global — same agent loop).
+//   Thinking: temp 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 0,   repeat_penalty 1.0
+//   Instruct: temp 0.7, top_p 0.80, top_k 20, min_p 0, presence_penalty 0.5, repeat_penalty 1.0
+//
+// Instruct's presence_penalty is softened from the author's 1.5 → 0.5 on purpose: because the same
+// preset also runs the agentic research loop, a 1.5 flat penalty on any already-seen token is too
+// aggressive for long structured output (report prose + tool-call JSON necessarily repeat field
+// names and domain terms), which degrades tool-calling and report quality. 0.5 keeps mild
+// anti-repetition without punishing the legitimate reuse an agentic loop depends on.
+//
+// `enableThinking` toggles the Qwen chat template's <think> reasoning trace via chat_template_kwargs.
+interface SamplingPreset {
+  temperature: number
+  top_p: number
+  top_k: number
+  min_p: number
+  presence_penalty: number
+  repeat_penalty: number
+  enableThinking: boolean
+}
+const GENERATION_PRESETS: Record<GenerationMode, SamplingPreset> = {
+  thinking: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repeat_penalty: 1.0, enableThinking: true },
+  instruct: { temperature: 0.7, top_p: 0.80, top_k: 20, min_p: 0.0, presence_penalty: 0.5, repeat_penalty: 1.0, enableThinking: false },
+}
+function getGenerationMode(): GenerationMode {
+  return doGetConfig().generationMode === 'instruct' ? 'instruct' : 'thinking'
+}
+function getSamplingPreset(): SamplingPreset { return GENERATION_PRESETS[getGenerationMode()] }
+
 function getIdleTimeoutMs(): number { return (doGetConfig().idleTimeoutSec || 60) * 1000 }
 function getMaxEmptyRetries(): number { return doGetConfig().maxEmptyRetries || 3 }
 /** Whether this tool requires user approval given current config (file ops vs commands split). */
@@ -594,6 +628,13 @@ export interface SessionInfo {
   createdAt: number
   updatedAt: number
   messageCount: number
+  /**
+   * Set only for chats explicitly started/resumed as managed deep-research (see
+   * Session.researchOutputDir). The UI uses this to decide whether to show the
+   * research workflow overlay (phases/gates) — ordinary chats get the plain activity
+   * timeline instead.
+   */
+  researchOutputDir?: string | null
 }
 
 export interface Session {
@@ -606,6 +647,19 @@ export interface Session {
   updatedAt: number
   /** Workspace key (hash) so we know which folder to save to when updating from worker. */
   workspaceKey?: string
+  /**
+   * Authoritative "this chat is a managed deep-research run" marker.
+   *
+   * Set ONLY when the chat is explicitly started as research (the New Research kickoff
+   * message carries the run dir) or explicitly resumed. Once pinned it survives history
+   * pruning and worker round-trips, so managed guards/workflow apply across turns.
+   *
+   * It is deliberately NOT inferred from the model spontaneously calling a research tool
+   * with an `output_dir` — that used to hijack ordinary chats (e.g. "build an MCTS
+   * AlphaZero") into the guarded workflow. A plain chat leaves this null and stays in
+   * normal conversational mode even if the model uses search/corpus tools.
+   */
+  researchOutputDir?: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +726,7 @@ function loadSessionsForWorkspace(ws: string): void {
             createdAt: data.createdAt ?? Date.now(),
             updatedAt: data.updatedAt ?? Date.now(),
             workspaceKey: key,
+            researchOutputDir: data.researchOutputDir ?? null,
           }
           map.set(session.id, session)
         }
@@ -712,6 +767,7 @@ export function saveSession(session: Session): void {
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       workspaceKey: session.workspaceKey ?? key,
+      researchOutputDir: session.researchOutputDir ?? null,
     }), 'utf-8')
   } catch {}
 }
@@ -808,6 +864,7 @@ export function listSessions(ws: string): SessionInfo[] {
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       messageCount: s.messages.filter((m) => m.role === 'user').length,
+      researchOutputDir: s.researchOutputDir ?? null,
     }))
 }
 
@@ -1045,9 +1102,10 @@ async function streamLlmResponse(
 ): Promise<StreamResult> {
   const cleanMsgs = sanitizeMessages(msgs)
   const maxTok = (maxTokensOverride && maxTokensOverride > 0) ? maxTokensOverride : getMaxResponseTokens()
-  const temp = temperatureOverride ?? getBaseTemperature()
+  const preset = getSamplingPreset()
+  const temp = temperatureOverride ?? preset.temperature
   const msgRoles = cleanMsgs.map((m) => m.role + (m.tool_calls ? `(${m.tool_calls.length}tc)` : '')).join(', ')
-  debugLog('STREAM', `Sending request: ${cleanMsgs.length} msgs [${msgRoles}], max_tokens=${maxTok}, temp=${temp}, ctx=${ctxTokens()}, budget=${getMessageBudget()}, used=${estimateContextTokens(cleanMsgs)}`)
+  debugLog('STREAM', `Sending request: ${cleanMsgs.length} msgs [${msgRoles}], max_tokens=${maxTok}, mode=${getGenerationMode()}, temp=${temp}, top_p=${preset.top_p}, top_k=${preset.top_k}, presence_penalty=${preset.presence_penalty}, think=${preset.enableThinking}, ctx=${ctxTokens()}, budget=${getMessageBudget()}, used=${estimateContextTokens(cleanMsgs)}`)
 
   emitActivity('llm_queue', 'Загружаю контекст на GPU (llama-server)…', `${cleanMsgs.length} сообщений · ~${Math.round(estimateContextTokens(cleanMsgs) / 1024)}K токенов`)
 
@@ -1061,7 +1119,25 @@ async function streamLlmResponse(
       tools: getAllTools(),
       tool_choice: 'auto',
       temperature: temp,
+      // Full author-recommended sampling set for the active Qwen3.8 mode. top_k/min_p/repeat_penalty
+      // are llama.cpp extensions accepted by its OpenAI-compatible endpoint; presence_penalty is
+      // standard.
+      top_p: preset.top_p,
+      top_k: preset.top_k,
+      min_p: preset.min_p,
+      presence_penalty: preset.presence_penalty,
+      repeat_penalty: preset.repeat_penalty,
+      // NOTE: on current llama.cpp (≥ ~b8322) this per-request kwarg is deprecated and IGNORED — the
+      // authoritative Thinking/Instruct switch is the server's `--reasoning-budget` launch flag,
+      // applied in server-manager.ts from config.generationMode (mode change → server restart). We
+      // still send it defensively so older builds / VLLM-compatible backends that honor it stay in
+      // sync with the launch flag (both always reflect the same generationMode).
+      chat_template_kwargs: { enable_thinking: preset.enableThinking },
       max_tokens: maxTok,
+      // Explicitly keep prompt (KV prefix) caching on. It's the llama-server default, but being
+      // explicit guards against future default changes and documents intent: across turns only
+      // the newly appended tokens are evaluated, the shared system+history prefix is reused.
+      cache_prompt: true,
       stream: true,
     }),
     signal,
@@ -2426,6 +2502,17 @@ async function manageContext(
   return current
 }
 
+// Absolute ceiling (chars) for the transient research working-set tail. It is re-prefilled every
+// turn (never cached), so on very large contexts an uncapped fraction would dominate latency.
+// User-configurable via config.researchTailMaxTokens (tokens → chars via the calibrated ratio);
+// clamped to a sane range so a bad value can't zero out or blow up the working set.
+const RESEARCH_TAIL_DEFAULT_TOKENS = 12000
+function getResearchTailMaxChars(): number {
+  const tokens = doGetConfig().researchTailMaxTokens || RESEARCH_TAIL_DEFAULT_TOKENS
+  const clamped = Math.max(2000, Math.min(64000, tokens))
+  return Math.floor(clamped * calibratedRatio)
+}
+
 /**
  * Append the disk-backed research working set as a transient TAIL user message.
  *
@@ -2442,10 +2529,20 @@ function appendResearchTail(msgs: Message[]): Message[] {
   // (from corpus=0 on disk) that it still needs to search.
   let gatheredSources = 0
   try { if (activeSessionId) gatheredSources = getSourceTracker(activeSessionId).count() } catch {}
+  // The working-set tail is regenerated from disk on EVERY call (it reflects live corpus/coverage
+  // state), so it can never be prefix-cached — its full length is re-prefilled each turn. At 256k
+  // ctx the 15%-of-budget fraction balloons to ~34k tokens (~50s of prompt-eval per turn on a 27B).
+  // Cap it in absolute terms so large-ctx runs stay responsive; the fraction still governs small
+  // contexts (where it's already well under the cap). The model can always pull more detail on
+  // demand via list_selected_corpus / list_evidence / read_corpus_item.
+  const tailMaxChars = Math.min(
+    Math.floor(getMessageBudget() * calibratedRatio * 0.15),
+    getResearchTailMaxChars(),
+  )
   const tail = buildResearchTailMessage(
     workspace,
     activeResearchOutputDir,
-    Math.floor(getMessageBudget() * calibratedRatio * 0.15),
+    tailMaxChars,
     gatheredSources,
   )
   if (!tail) return msgs
@@ -2547,6 +2644,7 @@ export function resetAgent(ws: string) {
   const session = getActiveSession(ws)
   session.messages = []
   session.projectContextAdded = false
+  session.researchOutputDir = null
   session.updatedAt = Date.now()
   saveSession(session)
 }
@@ -2712,7 +2810,17 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     messages.unshift({ role: 'system', content: getSystemPrompt() })
   }
 
-  activeResearchOutputDir = resolveResearchOutputDir(ws, messages, userMessage)
+  // Managed deep-research is a PERSISTENT property of the chat, not something the model can
+  // trip into by spontaneously calling a research tool. A chat becomes managed only when it
+  // was explicitly started as research (New Research kickoff message carries the run dir) or
+  // explicitly resumed — captured once here and pinned on the session so it survives history
+  // pruning and worker round-trips. Ordinary chats keep researchOutputDir null and run in
+  // normal conversational mode even if the model uses search/corpus tools.
+  const pinnedResearchDir = session.researchOutputDir || null
+  activeResearchOutputDir = pinnedResearchDir || resolveResearchOutputDir(ws, messages, userMessage)
+  if (activeResearchOutputDir && !pinnedResearchDir) {
+    session.researchOutputDir = activeResearchOutputDir
+  }
   activeWorkspace = ws
   activeSessionId = session.id
   activeSearchPolicy = resolveActiveSearchPolicy(ws, activeResearchOutputDir, userMessage)
@@ -2779,6 +2887,8 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     const summary = researchRunProgressSummary(ws, activeResearchOutputDir ?? undefined)
     if (summary) {
       activeResearchOutputDir = summary.dir
+      // Explicit resume pins the chat as managed so subsequent turns stay in the workflow.
+      session.researchOutputDir = summary.dir
       researchContextMode = 'resume'
       emitActivity('resume_checkpoint', 'Продолжаю research run с диска', summary.detail)
       doEmit({ type: 'status', content: summary.statusLine })
@@ -3259,7 +3369,8 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
     }
 
     let streamResult: StreamResult | undefined
-    const retryTemp = emptyRetries > 0 ? getBaseTemperature() + emptyRetries * 0.2 : undefined
+    // On empty-response retries, bump temperature above the active mode's base to break the model out.
+    const retryTemp = emptyRetries > 0 ? getSamplingPreset().temperature + emptyRetries * 0.2 : undefined
     let netTransportAttempts = 0
     const maxNetTransportAttempts = 2
 
@@ -3576,9 +3687,12 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
             invalidateProjectContextCache()
             try { currentBridge!.notifyWorkspaceChanged() } catch {}
           }
-          if (toolArgs.output_dir) {
+          // Track the run dir the model targets, but ONLY inside a chat that is already a
+          // managed research run. A tool call with output_dir must NOT flip an ordinary chat
+          // into managed mode — that is what dragged plain conversations into the guarded
+          // workflow. Managed mode is decided once, up front, from the session's pinned marker.
+          if (researchContextMode !== 'off' && toolArgs.output_dir) {
             activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
-            if (researchContextMode === 'off') researchContextMode = 'active'
           }
           maybeEmitCorpusSelection(tc.name, result, workspace)
           if (researchContextMode !== 'off' && activeResearchOutputDir && isResearchContextTool(tc.name)) {
@@ -3954,14 +4068,15 @@ export async function runAgent(userMessage: string, ws: string, bridge: AgentBri
         }
       }
 
-      if (toolArgs.output_dir) {
-        activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
-        if (researchContextMode === 'off') researchContextMode = 'active'
-      } else {
-        const dirInResult = result.match(/(\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[^\s"'`]+)/)?.[1]
-        if (dirInResult) {
-          activeResearchOutputDir = dirInResult
-          if (researchContextMode === 'off') researchContextMode = 'active'
+      // Only track the run dir for an already-managed chat. A spontaneous tool call (or a
+      // `.research/...` path echoed in a tool result) must NOT promote an ordinary chat into
+      // the guarded workflow — managed mode is pinned once, up front, from the session marker.
+      if (researchContextMode !== 'off') {
+        if (toolArgs.output_dir) {
+          activeResearchOutputDir = String(toolArgs.output_dir).replace(/\\/g, '/')
+        } else {
+          const dirInResult = result.match(/(\.research\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[^\s"'`]+)/)?.[1]
+          if (dirInResult) activeResearchOutputDir = dirInResult
         }
       }
       maybeEmitCorpusSelection(toolName, result, workspace)

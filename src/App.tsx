@@ -5,6 +5,7 @@ import { Sidebar } from './components/Sidebar'
 import { EditorTabs } from './components/EditorTabs'
 import { CodeEditor } from './components/CodeEditor'
 import { MarkdownViewer } from './components/MarkdownViewer'
+import { MediaViewer } from './components/MediaViewer'
 import { Chat, type CodeReference } from './components/Chat'
 import { Terminal } from './components/Terminal'
 import { SetupWizard } from './components/SetupWizard'
@@ -56,6 +57,7 @@ export function App() {
   const [diffView, setDiffView] = useState<{ filePath: string; original: string; modified: string } | null>(null)
   const [externalLinksEnabled, setExternalLinksEnabled] = useState(true)
   const [appLanguage, setAppLanguage] = useState<'ru' | 'en'>('ru')
+  const [generationMode, setGenerationMode] = useState<'thinking' | 'instruct'>('thinking')
   const [pendingExternalUrl, setPendingExternalUrl] = useState<string | null>(null)
   const [citationHighlight, setCitationHighlight] = useState<{ n: number; token: number } | null>(null)
   const handleCitationClick = useCallback((n: number) => {
@@ -81,9 +83,16 @@ export function App() {
       .then((cfg) => {
         setExternalLinksEnabled(cfg.externalLinksEnabled ?? true)
         setAppLanguage(cfg.appLanguage ?? 'ru')
+        setGenerationMode(cfg.generationMode === 'instruct' ? 'instruct' : 'thinking')
       })
       .catch(() => setExternalLinksEnabled(true))
   }, [settingsOpen])
+
+  const toggleGenerationMode = useCallback(async () => {
+    const next = generationMode === 'thinking' ? 'instruct' : 'thinking'
+    setGenerationMode(next)
+    await window.api?.saveConfig?.({ generationMode: next }).catch(() => {})
+  }, [generationMode])
 
   useEffect(() => {
     if (!fileMenuOpen) return
@@ -505,6 +514,26 @@ export function App() {
             )}
           </div>
           <button
+            onClick={toggleGenerationMode}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] cursor-pointer transition-colors ${
+              generationMode === 'thinking'
+                ? 'text-violet-200 bg-violet-500/15 hover:bg-violet-500/25'
+                : 'text-amber-200 bg-amber-500/15 hover:bg-amber-500/25'
+            }`}
+            style={{ WebkitAppRegion: 'no-drag' } as any}
+            title={appLanguage === 'ru'
+              ? (generationMode === 'thinking'
+                ? 'Режим генерации: Thinking (рассуждение). Нажми, чтобы переключить на Instruct. Переключение перезагружает модель (~30–60 с). Сэмплинг Qwen3.8: temp 1.0 · top_p 0.95 · top_k 20 · presence 0.0'
+                : 'Режим генерации: Instruct (без рассуждения). Нажми, чтобы переключить на Thinking. Переключение перезагружает модель (~30–60 с). Сэмплинг Qwen3.8: temp 0.7 · top_p 0.80 · top_k 20 · presence 0.5')
+              : (generationMode === 'thinking'
+                ? 'Generation mode: Thinking. Click to switch to Instruct. Switching reloads the model (~30–60s). Qwen3.8 sampling: temp 1.0 · top_p 0.95 · top_k 20 · presence 0.0'
+                : 'Generation mode: Instruct. Click to switch to Thinking. Switching reloads the model (~30–60s). Qwen3.8 sampling: temp 0.7 · top_p 0.80 · top_k 20 · presence 0.5')}
+          >
+            {generationMode === 'thinking'
+              ? (<><span aria-hidden>🧠</span>Thinking</>)
+              : (<><span aria-hidden>⚡</span>Instruct</>)}
+          </button>
+          <button
             onClick={openNewResearch}
             disabled={!workspace || busy}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
@@ -575,6 +604,7 @@ export function App() {
         onClose={() => setRunActivityOpen(false)}
         workspace={workspace}
         appLanguage={appLanguage}
+        researchOutputDir={sessions.find((s) => s.id === activeSessionId)?.researchOutputDir ?? null}
         steps={runActivity.steps}
         currentPhase={runActivity.currentPhase}
         activityLabel={runActivity.activityLabel}
@@ -684,7 +714,14 @@ export function App() {
                       onCloseOthers={closeOthers}
                       appLanguage={appLanguage}
                     />
-                    {activeFile?.language === 'markdown' ? (
+                    {activeFile && activeFile.kind !== 'text' ? (
+                      <MediaViewer
+                        file={activeFile}
+                        workspace={workspace}
+                        onBreadcrumbClick={(dirPath) => setBreadcrumbExpandTo(dirPath)}
+                        appLanguage={appLanguage}
+                      />
+                    ) : activeFile?.language === 'markdown' ? (
                       <MarkdownViewer
                         file={activeFile}
                         workspace={workspace}

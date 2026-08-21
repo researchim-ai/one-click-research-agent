@@ -118,6 +118,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
   // Agent params state
   const [maxIterations, setMaxIterations] = useState(200)
   const [temperature, setTemperature] = useState(0.3)
+  const [generationMode, setGenerationMode] = useState<'thinking' | 'instruct'>('thinking')
   const [idleTimeoutSec, setIdleTimeoutSec] = useState(60)
   const [maxEmptyRetries, setMaxEmptyRetries] = useState(3)
   const [approvalForFileOps, setApprovalForFileOps] = useState(true)
@@ -180,6 +181,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
 
       setMaxIterations(c.maxIterations ?? 200)
       setTemperature(c.temperature ?? 0.3)
+      setGenerationMode(c.generationMode === 'instruct' ? 'instruct' : 'thinking')
       setIdleTimeoutSec(c.idleTimeoutSec ?? 60)
       setMaxEmptyRetries(c.maxEmptyRetries ?? 3)
       setApprovalForFileOps(c.approvalForFileOps ?? (c as any).approvalRequired ?? true)
@@ -368,6 +370,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
       setSelectedPreset(DEFAULT_PRESET_ID)
       setMaxIterations(c.maxIterations ?? 200)
       setTemperature(c.temperature ?? 0.3)
+      setGenerationMode(c.generationMode === 'instruct' ? 'instruct' : 'thinking')
       setIdleTimeoutSec(c.idleTimeoutSec ?? 60)
       setMaxEmptyRetries(c.maxEmptyRetries ?? 3)
       setApprovalForFileOps(c.approvalForFileOps ?? true)
@@ -493,6 +496,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
             <AgentTab
               maxIterations={maxIterations}
               temperature={temperature}
+              generationMode={generationMode}
               idleTimeoutSec={idleTimeoutSec}
               maxEmptyRetries={maxEmptyRetries}
               approvalForFileOps={approvalForFileOps}
@@ -506,6 +510,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
               onChange={(field, value) => {
                 if (field === 'maxIterations') setMaxIterations(value as number)
                 else if (field === 'temperature') setTemperature(value as number)
+                else if (field === 'generationMode') setGenerationMode(value as 'thinking' | 'instruct')
                 else if (field === 'idleTimeoutSec') setIdleTimeoutSec(value as number)
                 else if (field === 'maxEmptyRetries') setMaxEmptyRetries(value as number)
                 else if (field === 'approvalForFileOps') setApprovalForFileOps(value as boolean)
@@ -575,6 +580,7 @@ export function SettingsPanel({ open, onClose, initialTab }: Props) {
                 await window.api.saveConfig({
                   maxIterations,
                   temperature,
+                  generationMode,
                   idleTimeoutSec,
                   maxEmptyRetries,
                   approvalForFileOps,
@@ -723,51 +729,6 @@ function LlamaUpdateSection({ appLanguage }: { appLanguage: AppLanguage }) {
 }
 
 // ---------------------------------------------------------------------------
-// GPU keep-warm toggle (self-contained: loads/saves its own config, applies live)
-// ---------------------------------------------------------------------------
-
-function GpuKeepWarmSection({ appLanguage }: { appLanguage: AppLanguage }) {
-  const [enabled, setEnabled] = useState(true)
-  const ru = appLanguage === 'ru'
-
-  useEffect(() => {
-    window.api.getConfig().then((c) => setEnabled(c.gpuKeepWarm ?? true)).catch(() => {})
-  }, [])
-
-  const toggle = async () => {
-    const next = !enabled
-    setEnabled(next)
-    try { await window.api.saveConfig({ gpuKeepWarm: next }) } catch {}
-  }
-
-  return (
-    <SettingsSection
-      title={ru ? 'Прогрев GPU (стабильность)' : 'GPU keep-warm (stability)'}
-      description={ru
-        ? 'Не даёт видеокарте засыпать в паузах между запросами агента. Предотвращает залипание драйвера NVIDIA (ошибка «nvidia-modeset: Error while waiting for GPU progress»), из-за которого GPU зависает до перезагрузки.'
-        : 'Keeps the GPU active during idle gaps between agent requests. Prevents the NVIDIA driver hang ("nvidia-modeset: Error while waiting for GPU progress") that wedges the GPU until reboot.'}
-    >
-      <div className="flex items-center justify-between py-2">
-        <div>
-          <div className="text-sm text-zinc-300">{ru ? 'Держать GPU в тонусе' : 'Keep GPU warm'}</div>
-          <div className="text-[11px] text-zinc-600 mt-0.5">
-            {ru
-              ? 'Лёгкий фоновый пинг раз в 5 сек + persistence mode. Отключи, если хочешь минимум энергопотребления в простое.'
-              : 'A light background ping every 5s + persistence mode. Disable for minimal idle power draw.'}
-          </div>
-        </div>
-        <button
-          onClick={toggle}
-          className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer shrink-0 ${enabled ? 'bg-blue-600' : 'bg-zinc-700'}`}
-        >
-          <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${enabled ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
-        </button>
-      </div>
-    </SettingsSection>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Model & Context tab
 // ---------------------------------------------------------------------------
 
@@ -801,7 +762,6 @@ function ModelTab({
   return (
     <div className="space-y-6">
       <LlamaUpdateSection appLanguage={appLanguage} />
-      <GpuKeepWarmSection appLanguage={appLanguage} />
       {hasMultipleGpus && (
         <SettingsSection
           title={appLanguage === 'ru' ? 'GPU и размещение модели' : 'GPU & model placement'}
@@ -1019,10 +979,11 @@ function ModelTab({
 // ---------------------------------------------------------------------------
 
 function AgentTab({
-  maxIterations, temperature, idleTimeoutSec, maxEmptyRetries, approvalForFileOps, approvalForCommands, selectedPreset, externalLinksEnabled, webSearchProvider, searxngBaseUrl, webSearchStatus, appLanguage, onChange,
+  maxIterations, temperature, generationMode, idleTimeoutSec, maxEmptyRetries, approvalForFileOps, approvalForCommands, selectedPreset, externalLinksEnabled, webSearchProvider, searxngBaseUrl, webSearchStatus, appLanguage, onChange,
 }: {
   maxIterations: number
   temperature: number
+  generationMode: 'thinking' | 'instruct'
   idleTimeoutSec: number
   maxEmptyRetries: number
   approvalForFileOps: boolean
@@ -1052,8 +1013,14 @@ function AgentTab({
     genDesc: 'Ограничения на длину и характер работы агента во время одного запроса.',
     maxIter: 'Макс. итераций агента',
     maxIterHint: 'Сколько шагов агент может сделать за один запрос',
-    temp: 'Температура',
-    tempHint: 'Креативность модели',
+    temp: 'Температура (вспомогательные вызовы)',
+    tempHint: 'Температура для служебных LLM-вызовов (скрининг, суб-агенты, саммари). Ответы самой модели управляются «Режимом генерации» ниже.',
+    genModeTitle: 'Режим генерации (Qwen3.8)',
+    genModeDesc: 'Набор параметров сэмплинга для ответов модели по рекомендации авторов Qwen3.8. Управляет и режимом рассуждения: Thinking (модель размышляет в <think>) против Instruct (без размышлений, быстрее). Влияет и на обычный чат, и на deep research. Переключение перезагружает модель (~30–60 с), т.к. режим рассуждения задаётся флагом запуска llama-server.',
+    thinkingLabel: 'Thinking (рассуждение)',
+    thinkingHint: 'Модель сначала рассуждает в <think>, затем отвечает. Лучше для исследований и работы с инструментами. temp 1.0 · top_p 0.95 · top_k 20 · presence 0.0',
+    instructLabel: 'Instruct (без рассуждения)',
+    instructHint: 'Прямые ответы без блока рассуждений — быстрее. temp 0.7 · top_p 0.80 · top_k 20 · presence 0.5',
     reliabilityTitle: 'Надежность выполнения',
     reliabilityDesc: 'Таймауты и ретраи на случай пустых ответов или зависания модели.',
     idleTimeout: 'Таймаут бездействия (сек)',
@@ -1087,8 +1054,14 @@ function AgentTab({
     genDesc: 'Limits on the length and behavior of the agent during a single request.',
     maxIter: 'Max agent iterations',
     maxIterHint: 'How many steps the agent can take per request',
-    temp: 'Temperature',
-    tempHint: 'Model creativity',
+    temp: 'Temperature (auxiliary calls)',
+    tempHint: 'Temperature for helper LLM calls (screening, sub-agents, summaries). The model’s own responses are controlled by “Generation mode” below.',
+    genModeTitle: 'Generation mode (Qwen3.8)',
+    genModeDesc: 'Sampling parameter set for the model’s responses, per the Qwen3.8 authors’ recommendation. Also controls reasoning: Thinking (model reasons inside <think>) vs Instruct (no reasoning, faster). Applies to both regular chat and deep research. Switching reloads the model (~30–60s) because reasoning is set by a llama-server launch flag.',
+    thinkingLabel: 'Thinking',
+    thinkingHint: 'The model reasons inside <think> first, then answers. Best for research and tool use. temp 1.0 · top_p 0.95 · top_k 20 · presence 0.0',
+    instructLabel: 'Instruct (non-thinking)',
+    instructHint: 'Direct answers with no reasoning block — faster. temp 0.7 · top_p 0.80 · top_k 20 · presence 0.5',
     reliabilityTitle: 'Execution reliability',
     reliabilityDesc: 'Timeouts and retries for empty responses or model hangs.',
     idleTimeout: 'Idle timeout (sec)',
@@ -1290,6 +1263,37 @@ function AgentTab({
           >
             <div className={`w-4.5 h-4.5 rounded-full bg-white absolute top-[3px] transition-transform ${externalLinksEnabled ? 'translate-x-[22px]' : 'translate-x-[3px]'}`} />
           </button>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t.genModeTitle}
+        description={t.genModeDesc}
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {([
+            { id: 'thinking' as const, label: t.thinkingLabel, hint: t.thinkingHint },
+            { id: 'instruct' as const, label: t.instructLabel, hint: t.instructHint },
+          ]).map((m) => {
+            const active = generationMode === m.id
+            return (
+              <button
+                key={m.id}
+                onClick={() => onChange('generationMode', m.id)}
+                className={`text-left rounded-xl border p-3 cursor-pointer transition-colors ${
+                  active
+                    ? 'border-blue-500/60 bg-blue-500/10'
+                    : 'border-zinc-800 bg-zinc-900/40 hover:border-zinc-700 hover:bg-zinc-800/50'
+                }`}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-blue-400' : 'bg-zinc-600'}`} />
+                  <span className={`text-sm font-medium ${active ? 'text-blue-200' : 'text-zinc-200'}`}>{m.label}</span>
+                </div>
+                <div className="text-[11px] leading-snug text-zinc-500">{m.hint}</div>
+              </button>
+            )
+          })}
         </div>
       </SettingsSection>
 
@@ -1889,6 +1893,30 @@ function ResearchTab({
             <span className="text-sm text-zinc-400">{L ? 'секунд на прогон' : 'seconds per pass'}</span>
           </div>
           <span className="text-[11px] text-zinc-500">{L ? 'по умолчанию 240' : 'default 240'}</span>
+        </div>
+      </SettingsSection>
+
+      {/* Research working-set tail size */}
+      <SettingsSection
+        title={L ? 'Размер рабочего набора ресёча' : 'Research working-set size'}
+        description={L
+          ? 'Сколько токенов текущего состояния ресёча (корпус, план, покрытие) добавлять к каждому запросу к модели. Этот блок собирается заново с диска каждый ход и не кэшируется, поэтому пересчитывается целиком при каждом ходе — это главный источник задержки на больших контекстах. Меньше — заметно быстрее ходы (модель добирает детали через list_selected_corpus / list_evidence); больше — модель видит больше контекста за ход, но медленнее.'
+          : 'How many tokens of the current research state (corpus, plan, coverage) to append to every model call. This block is rebuilt from disk each turn and is never cached, so it is fully re-prefilled every turn — the main source of latency on large contexts. Lower = noticeably faster turns (the model pulls detail via list_selected_corpus / list_evidence); higher = more context per turn but slower.'}
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={2000}
+              max={64000}
+              step={1000}
+              value={cfg.researchTailMaxTokens ?? 12000}
+              onChange={(e) => saveCfg({ researchTailMaxTokens: Math.max(2000, Math.min(64000, Number(e.target.value) || 12000)) })}
+              className="w-28 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:border-blue-500 outline-none"
+            />
+            <span className="text-sm text-zinc-400">{L ? 'токенов на ход' : 'tokens per turn'}</span>
+          </div>
+          <span className="text-[11px] text-zinc-500">{L ? 'по умолчанию 12000' : 'default 12000'}</span>
         </div>
       </SettingsSection>
 

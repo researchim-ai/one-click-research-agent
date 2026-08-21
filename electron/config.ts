@@ -6,6 +6,13 @@ import type { ResearchPresetId } from '../research-presets'
 
 export type WebSearchProvider = 'disabled' | 'managed-searxng' | 'custom-searxng'
 export type AppLanguage = 'ru' | 'en'
+/**
+ * Qwen3.8 exposes two generation regimes with different author-recommended sampling settings:
+ *  - 'thinking'  — the model emits a <think> reasoning trace first (best for research/agentic work).
+ *  - 'instruct'  — non-thinking, direct answers (faster, uses a presence penalty to curb repetition).
+ * The concrete sampling parameters for each mode live in electron/agent.ts (GENERATION_PRESETS).
+ */
+export type GenerationMode = 'thinking' | 'instruct'
 
 export interface CustomTool {
   id: string
@@ -31,6 +38,12 @@ export interface AppConfig {
   summarizePrompt: string | null
   maxIterations: number
   temperature: number
+  /**
+   * Sampling regime for the model's main responses (Qwen3.8 thinking vs instruct). Drives the full
+   * recommended sampling set (temperature/top_p/top_k/min_p/penalties) and toggles the chat
+   * template's reasoning trace. See GENERATION_PRESETS in electron/agent.ts.
+   */
+  generationMode: GenerationMode
   idleTimeoutSec: number
   maxEmptyRetries: number
   /** @deprecated use approvalForFileOps/approvalForCommands */
@@ -60,13 +73,13 @@ export interface AppConfig {
    */
   semanticScreeningBudgetSec: number
   /**
-   * Keep the inference GPU "warm" while llama-server is up: a tiny periodic 1-token completion
-   * during idle gaps plus a best-effort persistence-mode enable on start. This prevents the NVIDIA
-   * driver from deep power-gating the GPU between the agent's bursty requests, which on some 5xx
-   * drivers triggers a GSP timeout ("nvidia-modeset: Error while waiting for GPU progress") that
-   * hangs the GPU until reboot. Disable if you prefer minimal idle power draw and don't hit the bug.
+   * Max size (in tokens) of the transient research working-set "tail" appended to every LLM call.
+   * It is rebuilt from disk each turn and can never be prefix-cached, so its full length is
+   * re-prefilled every turn — the dominant per-turn latency on large contexts. Higher = the model
+   * sees more live corpus/coverage detail per turn (fewer follow-up reload calls) but slower;
+   * lower = faster turns, model pulls detail on demand via list_selected_corpus / list_evidence.
    */
-  gpuKeepWarm: boolean
+  researchTailMaxTokens: number
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -84,6 +97,7 @@ const DEFAULT_CONFIG: AppConfig = {
   summarizePrompt: null,
   maxIterations: 200,
   temperature: 0.3,
+  generationMode: 'thinking',
   idleTimeoutSec: 60,
   maxEmptyRetries: 3,
   approvalForFileOps: true,
@@ -96,7 +110,7 @@ const DEFAULT_CONFIG: AppConfig = {
   crossrefMailto: null,
   semanticScholarApiKey: null,
   semanticScreeningBudgetSec: 240,
-  gpuKeepWarm: true,
+  researchTailMaxTokens: 12000,
 }
 
 export function resetToDefaults(): AppConfig {

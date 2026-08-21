@@ -57,15 +57,6 @@ function setInstalledVariant(variant: string): void {
   fs.writeFileSync(variantFile(), variant)
 }
 
-/**
- * Which llama.cpp compute backend is installed, inferred from the variant tag
- * (e.g. "ubuntu-vulkan-x64" → vulkan, "win-cuda-13.1-x64" → cuda, "ubuntu-x64" → cpu).
- * Used to gate backend-specific behaviour like the GPU keep-warm heartbeat.
- */
-function serverBackend(): 'cuda' | 'vulkan' | 'cpu' {
-  return backendOf(getInstalledVariant())
-}
-
 function backendOf(variant: string | null): 'cuda' | 'vulkan' | 'cpu' {
   const v = (variant || '').toLowerCase()
   if (v.includes('cuda')) return 'cuda'
@@ -205,6 +196,36 @@ function matchAsset(assets: ReleaseAsset[], variant: string): ReleaseAsset | nul
   return assets.find((a) => a.name.includes(`-bin-${variant}.`)) ?? null
 }
 
+/**
+ * Resolve a variant token to a concrete release asset.
+ *
+ * Most tokens map 1:1 to an asset name ("win-vulkan-x64", "win-cpu-x64", …). CUDA tokens are
+ * carried as *major-only* ("win-cuda-12-x64" / "win-cuda-13-x64") because llama.cpp bumps the CUDA
+ * minor version across releases (12.4, 13.1 → 13.3, …). A hardcoded minor would silently miss the
+ * CUDA build and cascade all the way down to the slow CPU build. So for a major-only CUDA token we
+ * pick the newest matching minor asset that actually exists in the release and report back its
+ * concrete variant (e.g. "win-cuda-13.3-x64") so cudart download + .variant stay in sync.
+ */
+function resolveAsset(assets: ReleaseAsset[], variant: string): { asset: ReleaseAsset; variant: string } | null {
+  const exact = matchAsset(assets, variant)
+  if (exact) return { asset: exact, variant }
+
+  const major = variant.match(/^win-cuda-(\d+)-x64$/)
+  if (major) {
+    const re = new RegExp(`-bin-(win-cuda-${major[1]}\\.(\\d+)-x64)\\.`)
+    let best: { asset: ReleaseAsset; variant: string; minor: number } | null = null
+    for (const a of assets) {
+      const m = a.name.match(re)
+      if (m) {
+        const minor = parseInt(m[2], 10)
+        if (!best || minor > best.minor) best = { asset: a, variant: m[1], minor }
+      }
+    }
+    if (best) return { asset: best.asset, variant: best.variant }
+  }
+  return null
+}
+
 function matchCudartAsset(assets: ReleaseAsset[], name: string): ReleaseAsset | null {
   return assets.find((a) => a.name.startsWith(name)) ?? null
 }
@@ -337,12 +358,13 @@ async function downloadAndInstallLatest(win: BrowserWindow): Promise<string> {
 
   const variants = [selection.primary, ...selection.fallbacks]
 
-  for (const variant of variants) {
-    const asset = matchAsset(release.assets, variant)
-    if (!asset) {
-      emitBuild(win, `Бинарник '${variant}' не найден, пробуем следующий…`)
+  for (const variantToken of variants) {
+    const resolved = resolveAsset(release.assets, variantToken)
+    if (!resolved) {
+      emitBuild(win, `Бинарник '${variantToken}' не найден, пробуем следующий…`)
       continue
     }
+    const { asset, variant } = resolved
 
     const sizeMb = Math.round(asset.size / (1024 * 1024))
     emitBuild(win, `Скачивание ${variant} (${sizeMb} МБ)…`)
@@ -519,13 +541,31 @@ export function start(
     '--cache-type-k', la.cacheTypeK,
     '--cache-type-v', la.cacheTypeV,
   ]
-  // Large context: bigger batch speeds up prompt ingestion (fewer steps). Default -b 2048, -ub 512.
-  if (la.ctxSize >= 131072) {
-    cmdArgs.push('--batch-size', '512', '--ubatch-size', '512')
-  } else if (la.ctxSize >= 65536) {
-    cmdArgs.push('--batch-size', '512')
-  } else if (la.ctxSize >= 32768) {
-    cmdArgs.push('--batch-size', '512')
+  // Thinking vs Instruct is controlled HERE, at server launch — not per request. On current
+  // llama.cpp (≥ ~b8322) the per-request `chat_template_kwargs.enable_thinking` is deprecated and
+  // silently ignored (see llama.cpp #20182 / discussion #23351), so the only reliable switch is the
+  // `--reasoning-budget` launch flag: 0 forces enable_thinking=false + hard sampler stop (Instruct),
+  // -1 leaves reasoning unlimited (Thinking). Changing generationMode therefore restarts the server.
+  cmdArgs.push('--reasoning-budget', cfg.generationMode === 'instruct' ? '0' : '-1')
+  // Single slot. This is a single-user desktop agent whose turns are strictly SEQUENTIAL, and the
+  // whole workflow leans hard on KV prefix reuse (stable system+history prefix + `cache_prompt`).
+  // llama.cpp defaults to 4 slots here; with 4 slots the agent's turns and the (also sequential)
+  // screening calls land on DIFFERENT slots and evict each other's KV, so the growing conversation
+  // is re-prefilled from scratch (observed prompt-eval of 40–150s for 24k–65k tokens every turn).
+  // One slot keeps the conversation KV resident across turns → only new tokens are prefilled.
+  cmdArgs.push('--parallel', '1')
+  // Prompt-processing (prefill) throughput scales with the logical batch size. In llama.cpp
+  // the compute-buffer VRAM cost is driven by the *physical* micro-batch (--ubatch-size),
+  // NOT the logical --batch-size, so a large --batch-size speeds up prefill at negligible
+  // memory cost. The previous code forced --batch-size 512 (a quarter of the 2048 default)
+  // at large contexts, which throttled prefill without saving VRAM. Restore a healthy
+  // logical batch and only scale the physical micro-batch up when there's VRAM headroom.
+  // The physical micro-batch (--ubatch-size 512) is kept at the default to bound activation
+  // VRAM (raising it yields only a marginal, usually imperceptible prefill gain). The logical
+  // --batch-size is restored to the 2048 default so large-context runs ingest prompts at full
+  // speed instead of being throttled to 512.
+  if (la.nGpuLayers > 0) {
+    cmdArgs.push('--batch-size', '2048', '--ubatch-size', '512')
   }
   // Lock model in RAM to avoid swap (consistent speed on local machine)
   if (process.platform !== 'win32') cmdArgs.push('--mlock')
@@ -538,9 +578,15 @@ export function start(
   appendServerDebug(`args=${cmdArgs.map((a) => JSON.stringify(a)).join(' ')}`)
   appendServerDebug(`gpuMode=${cfg.gpuMode}, gpuIndex=${cfg.gpuIndex}, detectedGpus=${detected.gpus.map((gpu) => `${gpu.index}:${gpu.name}:${gpu.vramFreeMb}/${gpu.vramTotalMb}MB`).join('; ')}`)
   appendServerDebug(`launch: nGpuLayers=${la.nGpuLayers}, ctx=${la.ctxSize}, threads=${la.threads}, cache=${la.cacheTypeK}/${la.cacheTypeV}, tensorSplit=${la.tensorSplit ?? '-'}, flashAttn=${la.flashAttn}`)
+  // CUDA graphs give a meaningful (~5–15%) decode speedup on a single GPU, but can be
+  // unstable across multiple GPUs (P2P). Only disable them when we're actually spanning
+  // more than one device; keep them ON for the common single-GPU case.
+  const singleGpuPinned = cfg.gpuMode === 'single' && !!selectedGpu
+  const usingMultiGpu = !singleGpuPinned && effectiveResources.gpus.length > 1
   if (win) {
     emitBuild(win, `Запуск: ${path.basename(bin)}`)
-    emitBuild(win, 'GGML_CUDA_DISABLE_GRAPHS=1 (multi-GPU stability)')
+    if (usingMultiGpu) emitBuild(win, 'GGML_CUDA_DISABLE_GRAPHS=1 (multi-GPU stability)')
+    else emitBuild(win, 'CUDA graphs: on (single-GPU)')
     if (cfg.gpuMode === 'single' && selectedGpu) {
       emitBuild(win, `GPU mode: single (GPU ${selectedGpu.index}: ${selectedGpu.name})`)
       emitBuild(win, `Visible GPU env: CUDA_VISIBLE_DEVICES=${selectedGpu.index}, GGML_VK_VISIBLE_DEVICES=${selectedGpu.index}`)
@@ -553,7 +599,9 @@ export function start(
       (la.flashAttn ? ', flash-attn: on' : ''))
   }
 
-  const spawnEnv: NodeJS.ProcessEnv = { ...process.env, GGML_CUDA_DISABLE_GRAPHS: '1' }
+  const spawnEnv: NodeJS.ProcessEnv = { ...process.env }
+  if (usingMultiGpu) spawnEnv.GGML_CUDA_DISABLE_GRAPHS = '1'
+  else delete spawnEnv.GGML_CUDA_DISABLE_GRAPHS
   if (cfg.gpuMode === 'single' && selectedGpu) {
     spawnEnv.CUDA_VISIBLE_DEVICES = String(selectedGpu.index)
     spawnEnv.GGML_VK_VISIBLE_DEVICES = String(selectedGpu.index)
@@ -587,7 +635,6 @@ export function start(
     if (win && code !== null && code !== 0) {
       emitBuild(win, `llama-server завершился с кодом ${code}`)
     }
-    stopKeepWarm()
     serverProcess = null
     // Abnormal, unrequested exit (crash / killed by driver) → try to self-heal. Intentional
     // stops/restarts set `intentionalStop`, so this only fires on genuine crashes.
@@ -598,7 +645,6 @@ export function start(
 
 export function stop(): void {
   intentionalStop = true
-  stopKeepWarm()
   if (serverProcess && serverProcess.exitCode === null) {
     serverProcess.kill('SIGTERM')
     setTimeout(() => {
@@ -689,7 +735,6 @@ export async function waitReady(timeoutSecs = 300, win?: BrowserWindow): Promise
       const body = await r.json() as any
       if (body.status === 'ok') {
         await queryActualCtxSize()
-        startKeepWarm()
         return true
       }
       if (body.status === 'loading model' && win) {
@@ -715,80 +760,5 @@ export async function health(): Promise<{ status: string }> {
     return await r.json() as { status: string }
   } catch {
     return { status: 'unreachable' }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// GPU keep-warm: prevent the NVIDIA driver from deep power-gating the inference
-// GPU during the agent's idle gaps. On some 5xx drivers a "cold -> hot" transition
-// after the GPU has power-gated makes the GSP time out ("nvidia-modeset: Error
-// while waiting for GPU progress"), wedging the GPU until reboot. Two measures:
-//   1. Best-effort persistence mode on start (keeps the driver context resident).
-//   2. A tiny 1-token completion every few seconds so the GPU never fully idles.
-// Both are gated behind the gpuKeepWarm config flag.
-// ---------------------------------------------------------------------------
-
-const KEEP_WARM_INTERVAL_MS = 5000
-let keepWarmTimer: NodeJS.Timeout | null = null
-let keepWarmInFlight = false
-
-async function keepWarmPing(): Promise<void> {
-  if (keepWarmInFlight) return // never stack pings; a busy/queued server keeps itself warm
-  if (!serverProcess || serverProcess.exitCode !== null) return
-  keepWarmInFlight = true
-  try {
-    await fetch(`${llamaApiUrl()}/completion`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // Minimal 1-token decode. cache_prompt:false so we never disturb the slot
-      // prompt-reuse cache that real agent requests rely on.
-      body: JSON.stringify({ prompt: ' ', n_predict: 1, temperature: 0, cache_prompt: false }),
-      signal: AbortSignal.timeout(4000),
-    })
-  } catch {
-    // Idle heartbeat; transient failures (busy, timeout) are expected and harmless.
-  } finally {
-    keepWarmInFlight = false
-  }
-}
-
-/** Best-effort: enable NVIDIA persistence mode so the GPU keeps its driver context between bursts. */
-function tryEnablePersistenceMode(): void {
-  if (process.platform === 'win32') return
-  const idx = config.get('gpuIndex')
-  const target = typeof idx === 'number' ? `-i ${idx} ` : ''
-  try {
-    execSync(`nvidia-smi ${target}-pm 1`, { timeout: 5000, stdio: 'pipe' })
-    appendServerDebug(`keep-warm: persistence mode enabled (${target || 'all GPUs'})`)
-  } catch (e: any) {
-    // Requires root on most desktops; failure is non-fatal — the heartbeat still covers idle gaps.
-    appendServerDebug(`keep-warm: persistence mode not set (${String(e?.message || e).split('\n')[0]})`)
-  }
-}
-
-export function startKeepWarm(): void {
-  if (keepWarmTimer) return
-  if (!config.get('gpuKeepWarm')) return
-  tryEnablePersistenceMode()
-  // The compute heartbeat (a periodic 1-token decode) exists for the NVIDIA *CUDA* backend, whose
-  // 5xx-driver GSP can power-gate the idle GPU and then time out on the next request
-  // ("nvidia-modeset: … waiting for GPU progress"). On the *Vulkan* backend the very same idle
-  // submits do the opposite — they eventually wedge the queue with `vk::Queue::submit:
-  // ErrorDeviceLost`, killing llama-server. So the decode ping only runs on CUDA; persistence mode
-  // (attempted above) is the safe, sufficient measure on Vulkan/CPU.
-  const backend = serverBackend()
-  if (backend !== 'cuda') {
-    appendServerDebug(`keep-warm: decode heartbeat disabled on ${backend} backend (persistence mode only)`)
-    return
-  }
-  appendServerDebug(`keep-warm: heartbeat every ${KEEP_WARM_INTERVAL_MS}ms`)
-  keepWarmTimer = setInterval(() => { void keepWarmPing() }, KEEP_WARM_INTERVAL_MS)
-  if (typeof keepWarmTimer.unref === 'function') keepWarmTimer.unref()
-}
-
-export function stopKeepWarm(): void {
-  if (keepWarmTimer) {
-    clearInterval(keepWarmTimer)
-    keepWarmTimer = null
   }
 }

@@ -99,6 +99,20 @@ import * as recentWorkspaces from './recent-workspaces'
 import type { ToolInfo, AgentActivity } from './types'
 import { isResearchResumeMessage, compactSessionForWorkerResume } from './research-resume'
 
+// Extensions we can preview inline as data URLs. Anything not listed here is treated
+// as opaque binary (metadata-only placeholder) or, if unknown, as editable text.
+const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', jfif: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon',
+  svg: 'image/svg+xml', avif: 'image/avif', apng: 'image/apng',
+  pdf: 'application/pdf',
+  mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  mkv: 'video/x-matroska', ogv: 'video/ogg', avi: 'video/x-msvideo',
+  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg',
+  flac: 'audio/flac', m4a: 'audio/mp4', aac: 'audio/aac', opus: 'audio/opus',
+}
+const MAX_DATA_URL_BYTES = 64 * 1024 * 1024
+
 // The agent watchdog is an INACTIVITY timeout, not a total-runtime cap. A deep
 // research run legitimately takes much longer than any fixed budget, so killing it
 // on wall-clock time aborts healthy runs mid-flight (the user sees a spurious "stopped
@@ -197,6 +211,27 @@ function rejectPendingAgentRun(message: string): void {
   if (pendingSendResolve) {
     pendingSendResolve(`Error: ${message}`)
     pendingSendResolve = null
+  }
+}
+
+/**
+ * Restart llama-server so a changed reasoning mode (Thinking/Instruct → --reasoning-budget) takes
+ * effect. Reloads the current model with the same ctx/quant. Best-effort: never throws (this is
+ * fired from the save-config handler), and surfaces progress through the normal build events.
+ */
+async function restartServerForReasoningMode(): Promise<void> {
+  try {
+    if (!serverManager.isReady()) return
+    const modelPath = modelManager.getModelPath()
+    if (!modelPath) return
+    serverManager.stop()
+    await new Promise((r) => setTimeout(r, 1500))
+    loadModelArch(modelPath)
+    const ctxSize = config.get('ctxSize')
+    serverManager.start(modelPath, mainWindow ?? undefined, undefined, modelManager.getSelectedQuant(), ctxSize)
+    await serverManager.waitReady(300, mainWindow ?? undefined)
+  } catch (err: any) {
+    console.error(`[reasoning-mode] server restart failed: ${err?.message ?? err}`)
   }
 }
 
@@ -461,6 +496,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Enables Chromium's built-in PDF viewer so the in-app MediaViewer can render
+      // PDFs in an <iframe> (data: URL) instead of forcing a download.
+      plugins: true,
     },
   })
 
@@ -524,6 +562,27 @@ app.on('before-quit', () => {
   serverManager.stop()
 })
 
+// VRAM headroom (MB) reserved for the OS/compositor/other apps when estimating capacity.
+const VRAM_OS_HEADROOM_MB = 1024
+
+/**
+ * Detect resources for the Settings model-capacity / recommended-context estimate. When OUR OWN
+ * llama-server is already running it holds the model's VRAM, so detect()'s momentary free VRAM is
+ * near-zero and the recommendation collapses to a bogus tiny value (e.g. "4K gpu+cpu"). Since
+ * changing the ctx/model restarts the server and frees that VRAM, base the estimate on each card's
+ * TOTAL capacity (minus a small OS headroom) instead of the instantaneous free amount.
+ */
+function detectForRecommendation(): ReturnType<typeof detect> {
+  const res = detect()
+  if (serverManager.isRunning()) {
+    res.gpus = res.gpus.map((g) => ({
+      ...g,
+      vramFreeMb: Math.max(g.vramFreeMb, g.vramTotalMb - VRAM_OS_HEADROOM_MB),
+    }))
+  }
+  return res
+}
+
 function registerIpcHandlers() {
   ipcMain.handle('detect-resources', () => detect())
 
@@ -532,7 +591,7 @@ function registerIpcHandlers() {
     if (modelPath) loadModelArch(modelPath)
     const cfg = config.load()
     return evaluateVariants(applyGpuPreferences(
-      detect(),
+      detectForRecommendation(),
       override?.gpuMode ?? cfg.gpuMode,
       override?.gpuIndex ?? cfg.gpuIndex,
     ))
@@ -563,14 +622,19 @@ function registerIpcHandlers() {
 
   ipcMain.handle('get-config', () => config.load())
 
-  ipcMain.handle('save-config', (_e, partial: Partial<config.AppConfig>) => {
-    const saved = config.save(partial)
-    // Apply the GPU keep-warm toggle live so the user doesn't have to restart the server.
-    if (Object.prototype.hasOwnProperty.call(partial, 'gpuKeepWarm') && serverManager.isRunning()) {
-      if (saved.gpuKeepWarm) serverManager.startKeepWarm()
-      else serverManager.stopKeepWarm()
+  ipcMain.handle('save-config', async (_e, partial: Partial<config.AppConfig>) => {
+    const prev = config.load()
+    const updated = config.save(partial)
+    // Thinking/Instruct is a llama-server LAUNCH flag (--reasoning-budget) on current llama.cpp —
+    // per-request enable_thinking is ignored — so a mode change only takes effect after a restart.
+    // Restart automatically when it's safe (server up, no agent run in flight). If a run is active
+    // the change stays persisted and applies at the next natural (re)start.
+    const modeChanged =
+      partial.generationMode !== undefined && partial.generationMode !== prev.generationMode
+    if (modeChanged && serverManager.isRunning() && !agentRunInFlight) {
+      void restartServerForReasoningMode()
     }
-    return saved
+    return updated
   })
 
   ipcMain.handle('get-tools', (): ToolInfo[] => {
@@ -843,6 +907,8 @@ function registerIpcHandlers() {
           write(String(session.updatedAt))
           write(',"workspaceKey":')
           write(JSON.stringify(session.workspaceKey ?? ''))
+          write(',"researchOutputDir":')
+          write(JSON.stringify(session.researchOutputDir ?? null))
           write('}')
           await new Promise<void>((res, rej) => { stream.once('finish', res); stream.once('error', rej); stream.end() })
           emitAgentActivity({ phase: 'starting', label: 'Worker запущен — передаю управление агенту…' })
@@ -1289,6 +1355,33 @@ function registerIpcHandlers() {
     const dir = path.dirname(filePath)
     fs.mkdirSync(dir, { recursive: true })
     await fs.promises.writeFile(filePath, content, 'utf-8')
+  })
+
+  // Read a media/binary file as a base64 data URL for in-app preview (images, pdf,
+  // audio, video). For non-previewable/oversized files we return metadata only so the
+  // renderer can show a placeholder instead of dumping raw bytes into the code editor.
+  ipcMain.handle('read-file-data-url', async (_e, filePath: string) => {
+    try {
+      const stat = await fs.promises.stat(filePath)
+      const ext = (filePath.split('.').pop() ?? '').toLowerCase()
+      const mime = MIME_BY_EXT[ext] ?? 'application/octet-stream'
+      // No preview for unknown binary types; skip reading the body entirely.
+      if (mime === 'application/octet-stream') {
+        return { dataUrl: null, size: stat.size, mime, tooLarge: false }
+      }
+      if (stat.size > MAX_DATA_URL_BYTES) {
+        return { dataUrl: null, size: stat.size, mime, tooLarge: true }
+      }
+      const buf = await fs.promises.readFile(filePath)
+      return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, size: stat.size, mime, tooLarge: false }
+    } catch (e: any) {
+      throw new Error(`Cannot read file: ${e.message}`)
+    }
+  })
+
+  // Open a file with the OS default application.
+  ipcMain.handle('open-path', async (_e, targetPath: string) => {
+    return shell.openPath(targetPath)
   })
 
   ipcMain.handle('ts-get-definition', (_e, workspacePath: string, filePath: string, fileContent: string, line: number, column: number) => {

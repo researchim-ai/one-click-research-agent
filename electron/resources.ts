@@ -111,16 +111,20 @@ export function pickBinaryVariant(res: SystemResources): BinarySelection {
       // "CUDA Version:" here — on some laptop/driver combos the plain `nvidia-smi` header parse
       // fails and cudaVersion comes back null, which previously dropped the whole selection to the
       // CPU build (win-cpu-x64) with no fallback, silently running on CPU. Instead always pick a
-      // CUDA build (default to the broadly-compatible 12.4 when the version is unknown) and only
-      // fall back to the other CUDA build → Vulkan → CPU as a last resort.
+      // CUDA build (default to the broadly-compatible major 12 when the version is unknown) and
+      // only fall back to the other CUDA major → Vulkan → CPU as a last resort.
+      //
+      // The tokens carry the CUDA *major* only (e.g. "win-cuda-12-x64"); the installer resolves
+      // the actual minor build from the release assets (e.g. "win-cuda-12.4-x64",
+      // "win-cuda-13.3-x64"). Hardcoding a minor is brittle — llama.cpp bumps it every few releases
+      // (13.1 → 13.3 → …), and a stale minor would silently miss the CUDA build.
       const major = cudaVersion ? parseFloat(cudaVersion) : 0
-      const primary = major >= 13 ? 'win-cuda-13.1-x64' : 'win-cuda-12.4-x64'
-      const cudaFallback = major >= 13 ? 'win-cuda-12.4-x64' : 'win-cuda-13.1-x64'
+      const primary = major >= 13 ? 'win-cuda-13-x64' : 'win-cuda-12-x64'
+      const cudaFallback = major >= 13 ? 'win-cuda-12-x64' : 'win-cuda-13-x64'
       return {
         primary,
         fallbacks: [cudaFallback, 'win-vulkan-x64', 'win-cpu-x64'],
         needsCudart: true,
-        cudartAsset: `cudart-llama-bin-${primary}`,
       }
     }
     if (hasAmdGpu) {
@@ -263,8 +267,8 @@ export const MODEL_VARIANTS: ModelVariant[] = [
 
   // --- Qwen3.8-27B (dense, рекомендуемая по умолчанию для нормальных систем) ---
   // Highest quality tier so the auto-selector defaults capable systems to this family.
-  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_XXS',  bits: 2, label: '27B IQ2_XXS — минимальный',    sizeMb: 8593,  quality: 22, repoId: REPO_27B },
-  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_M',    bits: 2, label: '27B IQ2_M',                    sizeMb: 9842,  quality: 23, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_XXS',  bits: 2, label: '27B IQ2_XXS — минимальный',    sizeMb: 7444,  quality: 22, repoId: REPO_27B },
+  { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ2_S',    bits: 2, label: '27B IQ2_S',                    sizeMb: 8570,  quality: 23, repoId: REPO_27B },
   { family: FAMILY_QWEN38_27B, quant: '27-UD-Q2_K_XL',  bits: 2, label: '27B Q2_K_XL',                  sizeMb: 10182, quality: 24, repoId: REPO_27B },
   { family: FAMILY_QWEN38_27B, quant: '27-UD-IQ3_XXS',  bits: 3, label: '27B IQ3_XXS',                  sizeMb: 11362, quality: 25, repoId: REPO_27B },
   { family: FAMILY_QWEN38_27B, quant: '27-UD-Q3_K_XL',  bits: 3, label: '27B Q3_K_XL',                  sizeMb: 12818, quality: 26, repoId: REPO_27B },

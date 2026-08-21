@@ -26,7 +26,6 @@ export interface BinarySelection {
   primary: string
   fallbacks: string[]
   needsCudart: boolean
-  cudartAsset?: string
 }
 
 export interface ServerLaunchArgs {

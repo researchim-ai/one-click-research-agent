@@ -51,6 +51,10 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('git-file-at-head', workspace, relativePath),
   readFileContent: (filePath: string): Promise<{ content: string; size: number; lines: number }> =>
     ipcRenderer.invoke('read-file-content', filePath),
+  readFileDataUrl: (filePath: string): Promise<{ dataUrl: string | null; size: number; mime: string; tooLarge: boolean }> =>
+    ipcRenderer.invoke('read-file-data-url', filePath),
+  openPath: (targetPath: string): Promise<string> =>
+    ipcRenderer.invoke('open-path', targetPath),
   writeFile: (filePath: string, content: string): Promise<void> =>
     ipcRenderer.invoke('write-file', filePath, content),
   tsGetDefinition: (workspacePath: string, filePath: string, fileContent: string, line: number, column: number) =>
